@@ -1,0 +1,4 @@
+# Template for Makefile.config
+# Secrets go here
+
+# KEY := Value

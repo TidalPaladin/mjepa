@@ -1,0 +1,73 @@
+version: 2.1
+
+
+orbs:
+  codecov: codecov/codecov@3.2.4
+
+
+jobs:
+    check_code_quality:
+        docker:
+            - image: cimg/python:3.11-node
+        steps:
+            - checkout
+            - restore_cache:
+                keys:
+                  - v1-dependencies-{{ checksum "pdm.lock" }}
+            - run:
+                name: Install pdm
+                command: pip install --user pdm
+            - run:
+                name: Install dependencies
+                command: pdm install -G quality --no-default --no-self
+            - save_cache:
+                paths:
+                  - ~/.cache/pip
+                  - ~/.cache/pdm
+                key: v1-dependencies-{{ checksum "pdm.lock" }}
+            - run: 
+                name: Run quality tests
+                command: make quality
+
+    run_tests:
+        docker:
+            - image: cimg/python:3.11-node
+        steps:
+            - checkout
+            - restore_cache:
+                keys:
+                  - v1-dependencies-{{ checksum "pdm.lock" }}
+            - run:
+                name: Install dependencies
+                command: make init
+            - save_cache:
+                paths:
+                  - ~/.cache/pip
+                  - ~/.cache/pdm
+                key: v1-dependencies-{{ checksum "pdm.lock" }}
+            - run:
+                name: Run tests
+                command: make test-ci
+            - run:
+                name: Install static type checker
+                command: npm ci
+            - run:
+                name: Run static type checking
+                command: make types
+            - codecov/upload:
+                file: coverage.xml
+
+
+workflow_filters: &workflow_filters
+    filters:
+        branches:
+            only:
+                - master
+                - feat/circleci
+
+
+workflows:
+    build_and_test:
+        jobs:
+            - check_code_quality
+            - run_tests
