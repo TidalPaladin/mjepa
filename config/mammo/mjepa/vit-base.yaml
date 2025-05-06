@@ -1,0 +1,67 @@
+# Config for training ViT-B/16 using MJEPA on mammography.
+trainer: !!python/object:mjepa.TrainerConfig
+  batch_size: 128
+  num_workers: 24 
+  num_epochs: 500
+  accumulate_grad_batches: 4
+
+backbone: !!python/object:vit.ViTConfig
+  in_channels: 1
+  hidden_size: 768
+  ffn_hidden_size: 3072
+  patch_size: [16, 16]
+  depth: 12
+  num_attention_heads: 12
+  activation: "srelu"
+  bias: false
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
+  drop_path_rate: 0.1
+  normalization: "RMSNorm"
+  backend: te
+  checkpoint: true
+  num_cls_tokens: 0
+  num_register_tokens: 16
+
+augmentations: !!python/object:mjepa.AugmentationConfig
+  mixup_prob: 0.1
+  mixup_alpha: 1.0
+  use_noise: true
+  noise_prob: 0.1
+  noise_clip: true
+  invert_prob: 0.5
+  solarize_prob: 0.1
+  solarize_threshold: 0.5
+  posterize_prob: 0.1
+  posterize_bits: 6
+
+jepa: !!python/object:mjepa.JEPAConfig
+  loss_fn: "cosine"
+  momentum: 0.99
+  predictor_depth: 5
+  context_ratio: 0.5
+  target_ratio: 0.25
+  scale: 4
+
+optimizer: !!python/object:mjepa.OptimizerConfig
+  lr: 0.0005
+  weight_decay: 0.05
+  betas: [0.85, 0.95]
+  fused: true
+  pct_start: 0.1
+  base_momentum: 0.85
+  max_momentum: 0.95
+  div_factor: 100
+  final_div_factor: 10000
+  parameter_groups:
+    - params:
+        - "cls_tokens"
+        - "register_tokens"
+        - "bias"
+        - "layer_norm_weight"
+        - "layer_norm_bias"
+      weight_decay: 0.0
+    - params:
+        - "predictor_proj"
+        - "probe"
+      weight_decay: 1.0

@@ -3,13 +3,26 @@ requires = ["pdm-pep517>=1.0"]
 build-backend = "pdm.pep517.api"
 
 [project]
-name = "python-template"
+name = "mjepa"
 description = ""
 requires-python = ">=3.11"
 authors = [
-    {name = "Scott Chase Waggener", email = "tidalpaladin@protonmail.com"},
+    {name = "Scott Chase Waggener", email = "chase.waggener@icloud.com"},
 ]
-dependencies = []
+dependencies = [
+  "torch",
+  "torchvision",
+  "einops",
+  "ninja",
+  "pyyaml",
+  "torchmetrics",
+  "pandas",
+  "pyarrow",
+  "safetensors",
+  "vit @ git+https://github.com/TidalPaladin/vit.git",
+  "convnext @ git+https://github.com/TidalPaladin/convnext.git",
+  "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
+]
 readme = "README.md"
 license = {text = "Apache"}
 dynamic = ["version"]
@@ -40,14 +53,14 @@ multi_line_output = 3
 use_parentheses = false
 
 [tool.pyright]
-include = ["project", "tests"]
+include = ["mjepa", "tests", "trainers"]
 exclude = [
   "**/node_modules",
   "**/__pycache__",
   "**/.pytest_cache",
 ]
 ignore = ["src/oldstuff"]
-pythonVersion = "3.11"
+pythonVersion = "3.12"
 pythonPlatform = "Linux"
 
 [tool.pdm]
@@ -72,6 +85,7 @@ quality = [
 [tool.pytest.ini_options]
 markers = [
   "ci_skip",
+  "cuda",
 ]
 filterwarnings = []
 

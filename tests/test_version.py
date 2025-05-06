@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from project import __version__
+from mjepa import __version__
 
 
 def test_version():

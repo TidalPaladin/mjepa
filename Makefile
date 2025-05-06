@@ -1,14 +1,9 @@
 .PHONY: clean clean-env check quality style tag-version test env upload upload-test
 
-PROJECT=project
-QUALITY_DIRS=$(PROJECT) tests
-CLEAN_DIRS=$(PROJECT) tests
+PROJECT=mjepa
+QUALITY_DIRS=$(PROJECT) tests trainers
+CLEAN_DIRS=$(PROJECT) tests trainers
 PYTHON=pdm run python
-
-CONFIG_FILE := config.mk
-ifneq ($(wildcard $(CONFIG_FILE)),)
-include $(CONFIG_FILE)
-endif
 
 check: ## run quality checks and unit tests
 	$(MAKE) style
@@ -25,20 +20,12 @@ clean: ## remove cache files
 	find $(CLEAN_DIRS) -name '*.orig' -type f -delete
 
 clean-env: ## remove the virtual environment directory
-	pdm venv remove $(PROJECT)
-
-
-deploy: ## installs from lockfile
-	git submodule update --init --recursive
-	which pdm || pip install --user pdm
-	pdm venv create -n $(PROJECT)-deploy
-	pdm install --production --no-lock
-
+	pdm venv remove in-project
 
 init: ## pulls submodules and initializes virtual environment
 	git submodule update --init --recursive
 	which pdm || pip install --user pdm
-	pdm venv create -n $(PROJECT)
+	pdm venv create --with-pip
 	pdm install -d
 
 node_modules: 
@@ -58,6 +45,7 @@ style:
 	$(PYTHON) -m isort $(QUALITY_DIRS)
 	$(PYTHON) -m autopep8 -a $(QUALITY_DIRS)
 	$(PYTHON) -m black $(QUALITY_DIRS)
+	find csrc/ -type f \( -name "*.cu" -o -name "*.cuh" \) -exec clang-format -i {} +
 
 test: ## run unit tests
 	$(PYTHON) -m pytest \
@@ -82,7 +70,7 @@ test-ci: ## runs CI-only tests
 		--cov-report=term \
 		./tests/
 
-types: node_modules
+types: node_modules ## run pyright type checking
 	pdm run npx --no-install pyright tests $(PROJECT)
 
 help: ## display this help message
