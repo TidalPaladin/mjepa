@@ -48,20 +48,8 @@ optimizer: !!python/object:mjepa.OptimizerConfig
   weight_decay: 0.05
   betas: [0.85, 0.95]
   fused: true
-  pct_start: 0.1
+  pct_start: 0.05
   base_momentum: 0.85
   max_momentum: 0.95
   div_factor: 100
   final_div_factor: 10000
-  parameter_groups:
-    - params:
-        - "cls_tokens"
-        - "register_tokens"
-        - "bias"
-        - "layer_norm_weight"
-        - "layer_norm_bias"
-      weight_decay: 0.0
-    - params:
-        - "predictor_proj"
-        - "probe"
-      weight_decay: 1.0

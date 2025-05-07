@@ -1,5 +1,4 @@
 import logging
-import torchmetrics as tm
 import os
 import random
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torchmetrics as tm
 import yaml
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
@@ -104,7 +104,7 @@ def rank_zero_only(fn: Callable) -> Callable:
 
 
 @rank_zero_only
-def rank_zero_print(message: str, tqdm_safe: bool = False) -> None:
+def rank_zero_print(message: str, tqdm_safe: bool = True) -> None:
     """Print a message if the current rank is zero.
 
     Args:
@@ -118,7 +118,7 @@ def rank_zero_print(message: str, tqdm_safe: bool = False) -> None:
 
 
 @rank_zero_only
-def rank_zero_info(message: str, tqdm_safe: bool = False) -> None:
+def rank_zero_info(message: str, tqdm_safe: bool = True) -> None:
     """Log an info message if the current rank is zero.
 
     Args:

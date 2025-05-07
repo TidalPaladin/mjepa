@@ -1,11 +1,6 @@
-import os
-from pathlib import Path
-
-import torch
 import pytest
-import torch.nn as nn
-
-from vit import ViT, ViTConfig
+import torch
+from vit import ViTConfig
 
 
 def cuda_available():

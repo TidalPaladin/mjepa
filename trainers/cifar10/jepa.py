@@ -53,13 +53,13 @@ from mjepa.trainer import (
     calculate_total_steps,
     count_parameters,
     format_large_number,
+    format_pbar_description,
     ignore_warnings,
     is_rank_zero,
     rank_zero_info,
     save_checkpoint,
     setup_logdir,
     should_step_optimizer,
-    format_pbar_description,
 )
 
 
@@ -128,8 +128,6 @@ def get_val_dataloader(root: Path, batch_size: int, num_workers: int, local_rank
             drop_last=False,
             persistent_workers=True,
         )
-
-
 
 
 def train(

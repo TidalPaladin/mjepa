@@ -19,6 +19,7 @@ dependencies = [
   "pandas",
   "pyarrow",
   "safetensors",
+  "tqdm",
   "vit @ git+https://github.com/TidalPaladin/vit.git",
   "convnext @ git+https://github.com/TidalPaladin/convnext.git",
   "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
@@ -26,6 +27,11 @@ dependencies = [
 readme = "README.md"
 license = {text = "Apache"}
 dynamic = ["version"]
+
+[[tool.pdm.source]]
+name = "PyTorch"
+url = "https://download.pytorch.org/whl/cu128"
+include_packages = ["torch", "torchvision"]
 
 [project.optional-dependencies]
 

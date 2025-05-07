@@ -1,16 +1,14 @@
 import os
-import torch.nn.functional as F
-import warnings
 from argparse import ArgumentParser, Namespace
 from copy import deepcopy
-from datetime import datetime
 from pathlib import Path
 from typing import Final, Tuple, cast
-import safetensors.torch as st
 
+import safetensors.torch as st
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import torchmetrics as tm
 import yaml
 from torch import Tensor
@@ -18,21 +16,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, DistributedSampler
-from torchvision.transforms.v2 import (
-    ColorJitter,
-    Compose,
-    RandomHorizontalFlip,
-    RandomResizedCrop,
-    RandomRotation,
-    RandomVerticalFlip,
-)
+from torchvision.transforms.v2 import ColorJitter, Compose, RandomHorizontalFlip, RandomResizedCrop, RandomVerticalFlip
 from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
 from mjepa.augmentation import AugmentationConfig, apply_invert, apply_mixup, apply_noise, apply_posterize
 from mjepa.data import PreprocessedTIFFDataset
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, update_teacher, get_momentum
+from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher
+from mjepa.logging import CSVLogger, SaveImage
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
     TrainerConfig,
@@ -40,27 +32,27 @@ from mjepa.trainer import (
     calculate_total_steps,
     count_parameters,
     format_large_number,
+    format_pbar_description,
     ignore_warnings,
     is_rank_zero,
     rank_zero_info,
     save_checkpoint,
     setup_logdir,
     should_step_optimizer,
-    format_pbar_description,
 )
 
 
 WINDOW: Final[int] = 5
 DEFAULT_SIZE: Final[Tuple[int, int]] = (384, 256)
+LOG_INTERVAL: Final[int] = 50
 
 
 def get_train_transforms(size: Tuple[int, int]) -> Compose:
     return Compose(
         [
+            RandomResizedCrop(size=size, scale=(0.1, 1.0), ratio=(0.75, 1.33)),
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.5),
-            RandomResizedCrop(size=size, scale=(0.1, 1.0), ratio=(0.75, 1.33)),
-            RandomRotation(degrees=15),
             ColorJitter(brightness=0.2, contrast=0.2),
         ]
     )
@@ -124,10 +116,15 @@ def train(
     rank_zero_info(
         f"Batch size: {trainer_config.batch_size}, Microbatch accumulation: {trainer_config.accumulate_grad_batches}"
     )
-    
 
+    # Metrics and logging
     train_loss = tm.RunningMean(window=WINDOW).cuda()
     train_loss_epoch = tm.MeanMetric().cuda()
+    logger = CSVLogger(
+        log_dir / "train.csv", interval=LOG_INTERVAL, accumulate_grad_batches=trainer_config.accumulate_grad_batches
+    )
+    image_saver = SaveImage(log_dir / "first_batch.png", max_save_images=8)
+
     img: Tensor
     for epoch in range(last_epoch + 1, trainer_config.num_epochs):
         modules.train()
@@ -135,6 +132,8 @@ def train(
         pbar = tqdm(train_dataloader, desc=desc, disable=not is_rank_zero(), leave=False)
         for img in pbar:
             img = img.cuda()
+            if microbatch == 0:
+                image_saver(img)
 
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
@@ -168,7 +167,7 @@ def train(
             assert not loss.isnan()
             loss.backward()
             assert_all_trainable_params_have_grad(modules, microbatch)
-            microbatch += 1
+            logger.log(epoch, step, microbatch, loss=train_loss.compute().item())
 
             # Optimizer update and teacher update
             if should_step_optimizer(microbatch, trainer_config.accumulate_grad_batches):
@@ -179,6 +178,7 @@ def train(
                 update_teacher(backbone, teacher, current_momentum)
                 step += 1
 
+            microbatch += 1
             desc = format_pbar_description(step, microbatch, epoch, loss=train_loss)
             pbar.set_description(desc)
 
@@ -191,6 +191,7 @@ def train(
                 path=log_dir / f"checkpoint.pt",
                 backbone=backbone,
                 predictor=predictor,
+                probe=None,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 step=step,

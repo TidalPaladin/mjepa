@@ -27,6 +27,7 @@ init: ## pulls submodules and initializes virtual environment
 	which pdm || pip install --user pdm
 	pdm venv create --with-pip
 	pdm install -d
+	$(PYTHON) -m pip install pybind11 "transformer-engine[torch]" --no-build-isolation
 
 node_modules: 
 ifeq (, $(shell which npm))
