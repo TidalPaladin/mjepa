@@ -29,17 +29,29 @@ class CrossAttentionPredictor(nn.Module):
 
     def __init__(self, backbone: ViT, depth: int, out_dim: int | None = None):
         super().__init__()
-        self.pos_enc = RelativeFactorizedPosition(
+        # Query positional encoding
+        self.query_pos_enc = RelativeFactorizedPosition(
             2,
             backbone.config.hidden_size,
             backbone.config.ffn_hidden_size,
             activation=backbone.config.activation,
             normalization=backbone.config.normalization,
-            bias=True,
             backend=backbone.config.backend,
         )
+
+        # Context positional encoding and normalization
+        self.context_pos_enc = RelativeFactorizedPosition(
+            2,
+            backbone.config.hidden_size,
+            backbone.config.ffn_hidden_size,
+            activation=backbone.config.activation,
+            normalization=backbone.config.normalization,
+            backend=backbone.config.backend,
+        )
+        self.context_norm = backbone.create_norm(backbone.config.isotropic_output_dim)
+
+        # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer(i) for i in range(depth)])
-        self.norm = backbone.create_norm(backbone.config.isotropic_output_dim)
         self.predictor_proj = backbone.create_head(bias=True, out_dim=out_dim)
         self.checkpoint = backbone.config.checkpoint
 
@@ -47,13 +59,17 @@ class CrossAttentionPredictor(nn.Module):
         self,
         tokenized_size: Tuple[int, int],
         context: Tensor,
+        context_mask: Tensor,
         target_mask: Tensor,
     ) -> Tensor:
-        context = self.norm(context)
-
-        # Prepare positional encoding for target queries
+        # Normalize context
         B = target_mask.shape[0]
-        query = self.pos_enc(tokenized_size).expand(B, -1, -1)
+        context_pos = self.context_pos_enc(tokenized_size).expand(B, -1, -1)
+        context = context + apply_mask(context_mask, context_pos, fill_value=None)
+        context = self.context_norm(context)
+
+        # Create target queries from average teacher output and positional encoding
+        query = self.query_pos_enc(tokenized_size).expand(B, -1, -1)
         query = apply_mask(target_mask, query, fill_value=None)
 
         # Run query and context through predictor

@@ -155,7 +155,7 @@ def train(
                 )
                 context, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], backbone(img, mask=context_mask))
                 tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
-                pred: Tensor = predictor(tokenized_size, context, target_mask)
+                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)

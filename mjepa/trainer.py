@@ -329,7 +329,7 @@ class TrainerConfig:
     batch_size: int
     num_workers: int
     num_epochs: int
-    accumulate_grad_batches: int
+    accumulate_grad_batches: int = 1
     log_interval: int = 50
     check_val_every_n_epoch: int = 1
 
