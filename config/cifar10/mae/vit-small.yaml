@@ -31,14 +31,15 @@ mae: !!python/object:mjepa.MAEConfig
   scale: 2
 
 optimizer: !!python/object:mjepa.OptimizerConfig
+  optimizer: "soap"
   lr: 0.0005
   weight_decay: 0.05
   betas: [0.85, 0.95]
-  fused: true
-  pct_start: 0.1
+  precondition_frequency: 10
+  pct_start: 0.01
   base_momentum: 0.85
   max_momentum: 0.95
-  div_factor: 100
+  div_factor: 10
   final_div_factor: 1000
   parameter_groups:
     - params:

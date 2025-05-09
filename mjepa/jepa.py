@@ -39,15 +39,7 @@ class CrossAttentionPredictor(nn.Module):
             backend=backbone.config.backend,
         )
 
-        # Context positional encoding and normalization
-        self.context_pos_enc = RelativeFactorizedPosition(
-            2,
-            backbone.config.hidden_size,
-            backbone.config.ffn_hidden_size,
-            activation=backbone.config.activation,
-            normalization=backbone.config.normalization,
-            backend=backbone.config.backend,
-        )
+        # Context normalization
         self.context_norm = backbone.create_norm(backbone.config.isotropic_output_dim)
 
         # Predictor blocks and output projection
@@ -59,16 +51,13 @@ class CrossAttentionPredictor(nn.Module):
         self,
         tokenized_size: Tuple[int, int],
         context: Tensor,
-        context_mask: Tensor,
         target_mask: Tensor,
     ) -> Tensor:
         # Normalize context
-        B = target_mask.shape[0]
-        context_pos = self.context_pos_enc(tokenized_size).expand(B, -1, -1)
-        context = context + apply_mask(context_mask, context_pos, fill_value=None)
         context = self.context_norm(context)
 
         # Create target queries from average teacher output and positional encoding
+        B = target_mask.shape[0]
         query = self.query_pos_enc(tokenized_size).expand(B, -1, -1)
         query = apply_mask(target_mask, query, fill_value=None)
 

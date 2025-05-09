@@ -89,6 +89,7 @@ def parse_args() -> Namespace:
     parser.add_argument("-s", "--size", type=int, nargs=2, default=(512, 384), help="Image size")
     parser.add_argument("-c", "--crop", action="store_true", help="Crop image to model input size instead of resizing")
     parser.add_argument("-o", "--offset", type=int, default=0, help="Offset of the principal components to visualize")
+    parser.add_argument("-r", "--raw", action="store_true", help="Do not apply PCA, visualize raw features")
     return parser.parse_args()
 
 
@@ -136,7 +137,10 @@ def main(args: Namespace) -> None:
     features = rearrange(features, "n (ht wt) d -> n ht wt d", ht=Ht, wt=Wt)
 
     # Compute PCA and scale to [0,255] range
-    pca: Tensor = pca_top3(features, args.offset)
+    if args.raw:
+        pca: Tensor = rearrange(features[..., args.offset:args.offset+3], "n h w c -> n c h w")
+    else:
+        pca: Tensor = pca_top3(features, args.offset)
     pca = F.interpolate(pca, size=(H, W), mode="nearest")
 
     # Save original image and PCA image side by side

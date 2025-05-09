@@ -5,6 +5,7 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Final, Tuple, cast
 
+import safetensors.torch as st
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -37,7 +38,20 @@ from vit.tokens import apply_mask
 from mjepa.jepa import CrossAttentionPredictor, generate_masks
 from mjepa.mae import MAEConfig
 from mjepa.optimizer import OptimizerConfig
-from mjepa.trainer import TrainerConfig, assert_all_params_have_grad
+from mjepa.trainer import (
+    TrainerConfig,
+    assert_all_trainable_params_have_grad,
+    calculate_total_steps,
+    count_parameters,
+    format_large_number,
+    format_pbar_description,
+    ignore_warnings,
+    is_rank_zero,
+    rank_zero_info,
+    save_checkpoint,
+    setup_logdir,
+    should_step_optimizer,
+)
 
 
 NUM_CLASSES: Final[int] = 10
@@ -120,23 +134,37 @@ def get_val_dataloader(root: Path, batch_size: int, num_workers: int, local_rank
 
 
 def train(
-    wrapper: Wrapper,
+    modules: nn.ModuleDict,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     mae_config: MAEConfig,
     trainer_config: TrainerConfig,
+    log_dir: Path | None = None,
     last_epoch: int = -1,
 ) -> None:
-    rank = os.environ.get("RANK", 0)
+    # Module setup
+    rank_zero_info(f"Starting training, logging to {log_dir if log_dir else 'console only'}")
     optimizer.zero_grad()
-    backbone = wrapper.backbone
-    predictor = wrapper.predictor
-    probe = wrapper.probe
-    step = (last_epoch + 1) * len(train_dataloader) // trainer_config.accumulate_grad_batches
-    len(train_dataloader) * trainer_config.num_epochs // trainer_config.accumulate_grad_batches
+    backbone: ViT = modules["backbone"]
+    predictor: CrossAttentionPredictor = modules["predictor"]
+    probe: nn.Module = modules["probe"]
+    rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
+    rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
+    rank_zero_info(f"Probe params: {format_large_number(count_parameters(probe))}")
 
+    microbatch = (last_epoch + 1) * len(train_dataloader)
+    step = microbatch // trainer_config.accumulate_grad_batches
+    total_steps = calculate_total_steps(
+        train_dataloader, trainer_config.num_epochs, trainer_config.accumulate_grad_batches
+    )
+    rank_zero_info(f"Training for {trainer_config.num_epochs} epochs = {total_steps} steps")
+    rank_zero_info(
+        f"Batch size: {trainer_config.batch_size}, Microbatch accumulation: {trainer_config.accumulate_grad_batches}"
+    )
+
+    # Metric setup
     train_loss = tm.RunningMean(window=WINDOW).cuda()
     train_acc = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
     val_acc = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
@@ -144,16 +172,12 @@ def train(
     img: Tensor
     label: Tensor
     for epoch in range(last_epoch + 1, trainer_config.num_epochs):
-        backbone.train()
-        predictor.train()
-        probe.train()
-
-        pbar = tqdm(train_dataloader, desc=f"Epoch: {epoch}", disable=rank != 0, leave=False)
+        modules.train()
+        desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
+        pbar = tqdm(train_dataloader, desc=desc, disable=not is_rank_zero(), leave=False)
         for img, label in pbar:
-            img.shape[0]
             img = img.cuda()
             label = label.cuda()
-            current_lr = optimizer.param_groups[-1]["lr"]
 
             # Fold the image to create the target
             hp, wp = backbone.config.patch_size
@@ -180,36 +204,31 @@ def train(
                 # Combine losses
                 loss = mae_loss + probe_loss
 
-            if rank == 0:
-                pbar.set_description(
-                    f"Epoch: {epoch} [lr={current_lr:.2e}, loss={train_loss.compute():.4f}, acc={train_acc.compute():.4f}]"
-                )
-
             with torch.no_grad():
                 train_acc.update(probe_pred, label)
 
             # Backward
             assert not loss.isnan()
             loss.backward()
-            if step == 0:
-                assert_all_params_have_grad(wrapper)
+            assert_all_trainable_params_have_grad(modules, microbatch)
+            microbatch += 1
 
             # Optimizer update and teacher update
-            if (step + 1) % trainer_config.accumulate_grad_batches == 0:
+            if should_step_optimizer(microbatch, trainer_config.accumulate_grad_batches):
                 scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
 
+            desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
+            pbar.set_description(desc)
+
         # Validation
         pbar.close()
         if (epoch + 1) % trainer_config.check_val_every_n_epoch == 0:
-            backbone.eval()
-            predictor.eval()
-            probe.eval()
+            modules.eval()
             val_acc.reset()
-            for img, label in tqdm(val_dataloader, desc=f"Validating: ", disable=rank != 0, leave=False):
-                img.shape[0]
+            for img, label in tqdm(val_dataloader, desc=f"Validating: ", disable=not is_rank_zero(), leave=False):
                 img = img.cuda()
                 label = label.cuda()
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -217,8 +236,32 @@ def train(
                     probe_pred = probe(full_output.mean(1))
                     val_acc.update(probe_pred, label)
 
-            with tqdm.external_write_mode():
-                print(f"Epoch: {epoch}, Val Acc: {val_acc.compute()}")
+            # Validation epoch end
+            rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
+
+        # Save checkpoint
+        if log_dir:
+            save_checkpoint(
+                path=log_dir / f"checkpoint.pt",
+                backbone=backbone,
+                predictor=predictor,
+                probe=probe,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=step,
+                epoch=epoch,
+            )
+            st.save_file(
+                {k: v for k, v in backbone.state_dict().items() if isinstance(v, torch.Tensor)},
+                str(log_dir / f"backbone.safetensors"),
+            )
+
+    # Save final checkpoint
+    if log_dir:
+        st.save_file(
+            {k: v for k, v in backbone.state_dict().items() if isinstance(v, torch.Tensor)},
+            str(log_dir / f"backbone.safetensors"),
+        )
 
 
 def ddp_setup() -> None:
@@ -227,26 +270,33 @@ def ddp_setup() -> None:
 
 def parse_args() -> Namespace:
     parser = ArgumentParser()
-    parser.add_argument(
-        "config", type=lambda p: yaml.full_load(Path(p).read_text()), help="Path to YAML configuration file"
-    )
+    parser.add_argument("config", type=Path, help="Path to YAML configuration file")
     parser.add_argument("data", type=Path)
-    parser.add_argument("--log-dir", type=Path, default=None, help="Directory to save logs")
+    parser.add_argument(
+        "-n", "--name", type=str, default=None, help="Name of the run. Will be appended to the log subdirectory."
+    )
+    parser.add_argument("-l", "--log-dir", type=Path, default=None, help="Directory to save logs")
     parser.add_argument("--local-rank", type=int, default=1, help="Local rank / device")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to checkpoint to load")
     return parser.parse_args()
 
 
 def main(args: Namespace) -> None:
+    if not (config_path := Path(args.config)).is_file():
+        raise FileNotFoundError(config_path)
+    config = yaml.full_load(config_path.read_text())
+
     # Extract instantiated dataclasses from config
-    backbone_config = args.config["backbone"]
-    mae_config = args.config["mae"]
-    optimizer_config = args.config["optimizer"]
-    trainer_config = args.config["trainer"]
+    backbone_config = config["backbone"]
+    mae_config = config["mae"]
+    optimizer_config = config["optimizer"]
+    trainer_config = config["trainer"]
     assert isinstance(backbone_config, ViTConfig)
     assert isinstance(mae_config, MAEConfig)
     assert isinstance(optimizer_config, OptimizerConfig)
     assert isinstance(trainer_config, TrainerConfig)
+    if args.log_dir and not args.log_dir.is_dir():
+        raise NotADirectoryError(args.log_dir)
 
     # Determine distributed training parameters
     world_size = os.environ.get("WORLD_SIZE", 1)
@@ -260,14 +310,13 @@ def main(args: Namespace) -> None:
     out_dim = math.prod(backbone.config.patch_size) * backbone.config.in_channels
     predictor = CrossAttentionPredictor(backbone, mae_config.predictor_depth, out_dim)
     probe = backbone.create_head(NUM_CLASSES, bias=True)
-    wrapper = Wrapper(backbone, predictor, probe).cuda()
-
+    wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
     nn.init.trunc_normal_(predictor.predictor_proj[0].weight, std=0.001)
     nn.init.constant_(predictor.predictor_proj[0].bias, 0.5)
 
     # Wrap in DDP for distributed training
     if world_size > 1:
-        dist.init_process_group(backend="nccl")
+        ddp_setup()
         wrapper = DDP(wrapper, device_ids=[local_rank])
 
     # Instantiate dataloaders
@@ -279,18 +328,19 @@ def main(args: Namespace) -> None:
     )
 
     # Instantiate optimizer and scheduler
-    total_steps = trainer_config.num_epochs * len(train_dataloader) // trainer_config.accumulate_grad_batches
+    total_steps = calculate_total_steps(
+        train_dataloader, trainer_config.num_epochs, trainer_config.accumulate_grad_batches
+    )
     optimizer, scheduler = optimizer_config.instantiate(wrapper, total_steps=total_steps)
 
-    train(
-        wrapper,
-        train_dataloader,
-        val_dataloader,
-        optimizer,
-        scheduler,
-        mae_config,
-        trainer_config,
-    )
+    # Create log subdirectory with timestamp
+    if args.log_dir:
+        log_dir = setup_logdir(args.log_dir, config_path, name=args.name)
+    else:
+        log_dir = None
+
+    ignore_warnings()
+    train(wrapper, train_dataloader, val_dataloader, optimizer, scheduler, mae_config, trainer_config, log_dir)
 
 
 def entrypoint() -> None:

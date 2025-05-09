@@ -1,8 +1,9 @@
 import os
+import math
 from argparse import ArgumentParser, Namespace
-from copy import deepcopy
 from pathlib import Path
 from typing import Final, Tuple, cast
+from einops import rearrange
 
 import safetensors.torch as st
 import torch
@@ -21,10 +22,10 @@ from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
-from mjepa.augmentation import AugmentationConfig, apply_invert, apply_mixup, apply_noise, apply_posterize
 from mjepa.data import PreprocessedTIFFDataset
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher
+from mjepa.jepa import CrossAttentionPredictor, generate_masks
 from mjepa.logging import CSVLogger, SaveImage
+from mjepa.mae import MAEConfig
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
     TrainerConfig,
@@ -88,8 +89,7 @@ def train(
     train_dataloader: DataLoader,
     optimizer: Optimizer,
     scheduler: LRScheduler,
-    jepa_config: JEPAConfig,
-    augmentation_config: AugmentationConfig,
+    mae_config: MAEConfig,
     trainer_config: TrainerConfig,
     log_dir: Path | None = None,
     last_epoch: int = -1,
@@ -101,11 +101,6 @@ def train(
     predictor: CrossAttentionPredictor = modules["predictor"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
-
-    # Teacher setup
-    teacher = deepcopy(backbone)
-    teacher.requires_grad_(False)
-    teacher.eval()
 
     microbatch = (last_epoch + 1) * len(train_dataloader)
     step = microbatch // trainer_config.accumulate_grad_batches
@@ -135,31 +130,22 @@ def train(
             if microbatch == 0:
                 image_saver(img)
 
-            # Teacher forward pass (unaugmented)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
-                assert not teacher.training
-                teacher_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], teacher(img))
-            teacher_output = teacher_output.clone()
-
-            # Apply augmentations
-            with torch.no_grad():
-                img = apply_noise(augmentation_config, img)
-                _, (img, teacher_output) = apply_mixup(augmentation_config, img, teacher_output)
-                img = apply_invert(augmentation_config, img)[0]
-                img = apply_posterize(augmentation_config, img)[0]
+            # Fold the image to create the target
+            hp, wp = backbone.config.patch_size
+            target = rearrange(img, "b c (h hp) (w wp) -> b (h w) (hp wp c)", hp=hp, wp=wp)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Masked forward through student and predictor
                 context_mask, target_mask = generate_masks(
-                    backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
+                    backbone, img, mae_config.context_ratio, mae_config.target_ratio, mae_config.scale
                 )
                 context, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], backbone(img, mask=context_mask))
                 tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
                 pred: Tensor = predictor(tokenized_size, context, target_mask)
 
-                # Compute JEPA loss
-                target = apply_mask(target_mask, teacher_output, fill_value=None)
-                loss = (1 - F.cosine_similarity(pred, target, dim=-1, eps=1e-5)).mean()
+                # Compute MAE loss
+                target = apply_mask(target_mask, target, fill_value=None)
+                loss = F.l1_loss(pred, target)
                 train_loss.update(loss)
                 train_loss_epoch.update(loss)
 
@@ -174,8 +160,6 @@ def train(
                 scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
-                current_momentum = get_momentum(step, total_steps, jepa_config.momentum)
-                update_teacher(backbone, teacher, current_momentum)
                 step += 1
 
             microbatch += 1
@@ -237,13 +221,11 @@ def main(args: Namespace) -> None:
 
     # Extract instantiated dataclasses from config
     backbone_config = config["backbone"]
-    jepa_config = config["jepa"]
-    augmentation_config = config["augmentations"]
+    mae_config = config["mae"]
     optimizer_config = config["optimizer"]
     trainer_config = config["trainer"]
     assert isinstance(backbone_config, ViTConfig)
-    assert isinstance(jepa_config, JEPAConfig)
-    assert isinstance(augmentation_config, AugmentationConfig)
+    assert isinstance(mae_config, MAEConfig)
     assert isinstance(optimizer_config, OptimizerConfig)
     assert isinstance(trainer_config, TrainerConfig)
     if args.log_dir and not args.log_dir.is_dir():
@@ -258,7 +240,8 @@ def main(args: Namespace) -> None:
 
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
-    predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
+    out_dim = math.prod(backbone.config.patch_size) * backbone.config.in_channels
+    predictor = CrossAttentionPredictor(backbone, mae_config.predictor_depth, out_dim)
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor}).cuda()
 
     # Wrap in DDP for distributed training
@@ -297,8 +280,7 @@ def main(args: Namespace) -> None:
         train_dataloader,
         optimizer,
         scheduler,
-        jepa_config,
-        augmentation_config,
+        mae_config,
         trainer_config,
         log_dir,
     )

@@ -1,9 +1,10 @@
 from dataclasses import dataclass, field
 from os import PathLike
-from typing import Any, Dict, Iterator, List, Set, Tuple
+from typing import Any, Dict, Iterator, List, Literal, Set, Tuple
 
 import torch.nn as nn
 import yaml
+from pytorch_optimizer import SOAP
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LRScheduler, OneCycleLR
 
@@ -17,6 +18,8 @@ class OptimizerConfig:
     fused: bool | None = True
     foreach: bool | None = None
     eps: float = 1e-8
+    precondition_frequency: int = 10
+    optimizer: Literal["adamw", "soap"] = "adamw"
 
     # Scheduler
     pct_start: float = 0.05
@@ -29,16 +32,13 @@ class OptimizerConfig:
     parameter_groups: List[Dict[str, Any]] = field(default_factory=list)
 
     def instantiate(self, model: nn.Module, total_steps: int) -> Tuple[Optimizer, LRScheduler]:
-        parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
-        optimizer = AdamW(
-            parameter_groups,
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-            betas=self.betas,
-            fused=self.fused,
-            foreach=self.foreach,
-            eps=self.eps,
-        )
+        match self.optimizer:
+            case "adamw":
+                optimizer = self._instantiate_adamw(model)
+            case "soap":
+                optimizer = self._instantiate_soap(model)
+            case _:
+                raise ValueError(f"Invalid optimizer: {self.optimizer}")
         scheduler = OneCycleLR(
             optimizer,
             max_lr=self.lr,
@@ -50,6 +50,29 @@ class OptimizerConfig:
             final_div_factor=self.final_div_factor,
         )
         return optimizer, scheduler
+
+    def _instantiate_adamw(self, model: nn.Module) -> Tuple[Optimizer, LRScheduler]:
+        parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
+        return AdamW(
+            parameter_groups,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            betas=self.betas,
+            fused=self.fused,
+            foreach=self.foreach,
+            eps=self.eps,
+        )
+
+    def _instantiate_soap(self, model: nn.Module) -> Tuple[Optimizer, LRScheduler]:
+        parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
+        return SOAP(
+            parameter_groups,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            betas=self.betas,
+            precondition_frequency=self.precondition_frequency,
+            eps=self.eps,
+        )
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "OptimizerConfig":
