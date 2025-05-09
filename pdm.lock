@@ -1205,10 +1205,10 @@ files = [
 
 [[package]]
 name = "vit"
-version = "0.1.dev25"
+version = "0.1.dev26"
 requires_python = ">=3.10"
 git = "https://github.com/TidalPaladin/vit.git"
-revision = "b54acf57f9c4ec3f7e5c573798a0b35aa33904b4"
+revision = "7a8075e5e4941f609b173cc3576b648cc0c75465"
 summary = ""
 dependencies = [
     "einops",

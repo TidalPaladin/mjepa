@@ -12,22 +12,26 @@ from dicom_preprocessing import load_tiff_f32
 from einops import rearrange, reduce
 from PIL import Image
 from torchvision.utils import make_grid, save_image
+from torchvision.transforms.v2.functional import center_crop
 
 from mjepa import *
 
 
-def load_image(path: Path, size: Tuple[int, int]) -> Tensor:
+def load_image(path: Path, size: Tuple[int, int], crop: bool = False) -> Tensor:
     if path.suffix.lower() in (".tiff", ".tif"):
         img = load_tiff_f32(path)
         img = rearrange(img, "n h w c -> n c h w")
         img = torch.from_numpy(img)
-        img = F.interpolate(img, size=size, mode="bilinear", align_corners=False)
+        if crop:
+            img = center_crop(img, size)
+        else:
+            img = F.interpolate(img, size=size, mode="bilinear", align_corners=False)
         return img
     else:
         raise NotImplementedError(f"Unsupported image type: {path.suffix}")
 
 
-def pca_top3(features: Tensor) -> Tensor:
+def pca_top3(features: Tensor, offset: int = 0) -> Tensor:
     r"""Find the top 3 principal components of the features and return the corresponding RGB image.
 
     Args:
@@ -57,7 +61,7 @@ def pca_top3(features: Tensor) -> Tensor:
     eigenvalues, eigenvectors = torch.linalg.eigh(cov)
 
     # Get top 3 principal components
-    top3_indices: Tensor = torch.argsort(eigenvalues, descending=True)[:3]
+    top3_indices: Tensor = torch.argsort(eigenvalues, descending=True)[offset:offset+3]
     top3_components: Tensor = eigenvectors[:, top3_indices]
 
     # Project features onto top 3 components
@@ -65,8 +69,8 @@ def pca_top3(features: Tensor) -> Tensor:
     projected = projected.reshape(n, h, w, 3)
 
     # Normalize to [0,1] range for each component
-    projected = projected - projected.amin(dim=(1,2), keepdim=True)[0]
-    projected = projected / projected.amax(dim=(1,2), keepdim=True)[0]
+    projected = projected - projected.amin(dim=(1,2, 3), keepdim=True)[0]
+    projected = projected / projected.amax(dim=(1,2, 3), keepdim=True)[0]
 
     # Rearrange to NCHW format
     projected = rearrange(projected, "n h w c -> n c h w")
@@ -83,6 +87,8 @@ def parse_args() -> Namespace:
     parser.add_argument("output", type=Path, help="Path to output PNG file")
     parser.add_argument("-d", "--device", default="cpu", help="Device to run the model on")
     parser.add_argument("-s", "--size", type=int, nargs=2, default=(512, 384), help="Image size")
+    parser.add_argument("-c", "--crop", action="store_true", help="Crop image to model input size instead of resizing")
+    parser.add_argument("-o", "--offset", type=int, default=0, help="Offset of the principal components to visualize")
     return parser.parse_args()
 
 
@@ -91,6 +97,8 @@ def main(args: Namespace) -> None:
         raise FileNotFoundError(args.config)
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
+    if len(args.image) == 1 and args.image[0].is_dir():
+        args.image = list(args.image[0].glob("*.tiff"))
     if not all(image.is_file() for image in args.image):
         raise FileNotFoundError(args.image)
     if not args.output.parent.is_dir():
@@ -100,7 +108,7 @@ def main(args: Namespace) -> None:
     # Load images
     imgs = []
     for image in args.image:
-        img = load_image(image, args.size)
+        img = load_image(image, args.size, args.crop)
         img = img.to(device)
         imgs.append(img)
     img = torch.cat(imgs, dim=0)
@@ -128,7 +136,7 @@ def main(args: Namespace) -> None:
     features = rearrange(features, "n (ht wt) d -> n ht wt d", ht=Ht, wt=Wt)
 
     # Compute PCA and scale to [0,255] range
-    pca: Tensor = pca_top3(features)
+    pca: Tensor = pca_top3(features, args.offset)
     pca = F.interpolate(pca, size=(H, W), mode="nearest")
 
     # Save original image and PCA image side by side
