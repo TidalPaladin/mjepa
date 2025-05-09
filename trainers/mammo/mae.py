@@ -1,9 +1,8 @@
-import os
 import math
+import os
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Final, Tuple, cast
-from einops import rearrange
 
 import safetensors.torch as st
 import torch
@@ -12,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics as tm
 import yaml
+from einops import rearrange
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
@@ -141,7 +141,7 @@ def train(
                 )
                 context, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], backbone(img, mask=context_mask))
                 tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
-                pred: Tensor = predictor(tokenized_size, context, target_mask)
+                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
 
                 # Compute MAE loss
                 target = apply_mask(target_mask, target, fill_value=None)

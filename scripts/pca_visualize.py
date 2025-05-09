@@ -3,7 +3,7 @@ import yaml
 import safetensors.torch as st
 import torch.nn.functional as F
 from dataclasses import replace
-from typing import Tuple, cast
+from typing import Tuple, cast, List
 from argparse import ArgumentParser, Namespace
 from vit import ViTConfig, ViT
 from pathlib import Path
@@ -90,6 +90,7 @@ def parse_args() -> Namespace:
     parser.add_argument("-c", "--crop", action="store_true", help="Crop image to model input size instead of resizing")
     parser.add_argument("-o", "--offset", type=int, default=0, help="Offset of the principal components to visualize")
     parser.add_argument("-r", "--raw", action="store_true", help="Do not apply PCA, visualize raw features")
+    parser.add_argument("-n", "--num-components", type=int, default=1, help="Number of 3-channel principal component groups to visualize")
     return parser.parse_args()
 
 
@@ -132,19 +133,25 @@ def main(args: Namespace) -> None:
 
     # Run forward pass
     H, W = img.shape[-2:]
-    features, _, registers = cast(Tuple[Tensor, Tensor | None, Tensor | None], model(img))
+    with torch.autocast(device.type, dtype=torch.bfloat16):
+        features, _, registers = cast(Tuple[Tensor, Tensor | None, Tensor | None], model(img))
+    features = features.to(torch.float32)
     Ht, Wt = model.stem.tokenized_size((H, W))
     features = rearrange(features, "n (ht wt) d -> n ht wt d", ht=Ht, wt=Wt)
 
     # Compute PCA and scale to [0,255] range
-    if args.raw:
-        pca: Tensor = rearrange(features[..., args.offset:args.offset+3], "n h w c -> n c h w")
-    else:
-        pca: Tensor = pca_top3(features, args.offset)
-    pca = F.interpolate(pca, size=(H, W), mode="nearest")
+    pca_tensors: List[Tensor] =[]
+    for i in range(args.num_components):
+        if args.raw:
+            pca: Tensor = rearrange(features[..., args.offset + i * 3:args.offset + (i + 1) * 3], "n h w c -> n c h w")
+        else:
+            pca: Tensor = pca_top3(features, args.offset + i * 3)
+        pca = F.interpolate(pca, size=(H, W), mode="nearest")
+        pca_tensors.append(pca)
+    pca = torch.cat(pca_tensors, dim=-1)
 
     # Save original image and PCA image side by side
-    img = img.expand_as(pca)
+    img = img.expand(-1, 3, -1, -1)
     elements = torch.cat([img, pca], dim=-1)
     grid = make_grid(elements, nrow=2)
     save_image(grid, args.output)
