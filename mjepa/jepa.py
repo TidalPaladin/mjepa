@@ -30,7 +30,6 @@ class CrossAttentionPredictor(nn.Module):
     def __init__(self, backbone: ViT, depth: int, out_dim: int | None = None):
         super().__init__()
         # Shared positional encoding and normalizers
-        self.query = nn.Parameter(torch.randn(backbone.config.hidden_size))
         self.pos_enc = RelativeFactorizedPosition(
             2,
             backbone.config.hidden_size,
@@ -39,8 +38,7 @@ class CrossAttentionPredictor(nn.Module):
             normalization=backbone.config.normalization,
             backend=backbone.config.backend,
         )
-        self.pos_norm_context = backbone.create_norm(backbone.config.hidden_size)
-        self.pos_norm_query = backbone.create_norm(backbone.config.hidden_size)
+        self.pos_norm = backbone.create_norm(backbone.config.hidden_size)
 
         # Context normalization
         self.context_norm = backbone.create_norm(backbone.config.isotropic_output_dim)
@@ -60,15 +58,10 @@ class CrossAttentionPredictor(nn.Module):
         # Normalize context
         context = self.context_norm(context)
 
-        # Create query and context positional encodings
+        # Create query 
         B = target_mask.shape[0]
-        pos = self.pos_enc(tokenized_size).expand(B, -1, -1)
-        pos_query = self.pos_norm_query(apply_mask(target_mask, pos, fill_value=None))
-        pos_context = self.pos_norm_context(apply_mask(context_mask, pos, fill_value=None))
-
-        # Add positional encodings to query and context
-        context = context + pos_context
-        query = self.query + pos_query
+        query = self.pos_norm(self.pos_enc(tokenized_size)).expand(B, -1, -1)
+        query = apply_mask(target_mask, query, fill_value=None)
 
         # Run query and context through predictor
         for block in self.blocks:

@@ -120,7 +120,7 @@ def main(args: Namespace) -> None:
     assert isinstance(config, ViTConfig)
     if config.backend == "te" and device.type == "cpu":
         print("Warning: TE backend requires GPU. Switching to torch backend.")
-        config = replace(config, backend="torch")
+        config = replace(config, backend="pytorch")
     model = config.instantiate()
     model = model.to(device)
     model.eval()
