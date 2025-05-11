@@ -6,7 +6,6 @@ import torch.nn as nn
 import yaml
 from torch import Tensor
 from vit import ViT
-from vit.pos_enc import RelativeFactorizedPosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
 
 
@@ -29,14 +28,8 @@ class CrossAttentionPredictor(nn.Module):
 
     def __init__(self, backbone: ViT, depth: int, out_dim: int | None = None):
         super().__init__()
-        self.pos_enc = RelativeFactorizedPosition(
-            2,
-            backbone.config.hidden_size,
-            backbone.config.ffn_hidden_size,
-            activation=backbone.config.activation,
-            normalization=backbone.config.normalization,
-            backend=backbone.config.backend,
-        )
+        self.pos_enc = backbone.stem.pos_enc
+        self.query = nn.Parameter(torch.randn(backbone.config.hidden_size))
         self.context_norm = backbone.create_norm(backbone.config.isotropic_output_dim)
 
         # Predictor blocks and output projection
@@ -56,6 +49,7 @@ class CrossAttentionPredictor(nn.Module):
         B = target_mask.shape[0]
         query = self.pos_enc(tokenized_size).expand(B, -1, -1)
         query = apply_mask(target_mask, query, fill_value=None)
+        query = query + self.query.view(1, 1, -1).expand(B, -1, -1)
 
         # Run query and context through predictor
         for block in self.blocks:

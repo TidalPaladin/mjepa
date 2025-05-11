@@ -159,7 +159,7 @@ def train(
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                loss = (1 - F.cosine_similarity(pred, target, dim=-1, eps=1e-5)).mean()
+                loss = (1 - F.cosine_similarity(pred, target, dim=-1)).mean()
                 train_loss.update(loss)
                 train_loss_epoch.update(loss)
 
