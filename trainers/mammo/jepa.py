@@ -119,7 +119,9 @@ def train(
 
     # Metrics and logging
     train_loss = tm.RunningMean(window=WINDOW).cuda()
+    contrast = tm.RunningMean(window=WINDOW).cuda()
     train_loss_epoch = tm.MeanMetric().cuda()
+    contrast_epoch = tm.MeanMetric().cuda()
     logger = CSVLogger(
         log_dir / "train.csv", interval=LOG_INTERVAL, accumulate_grad_batches=trainer_config.accumulate_grad_batches
     )
@@ -138,8 +140,12 @@ def train(
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
-                teacher_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], teacher(img))
+                inp = torch.cat([torch.zeros_like(img[0:1]), img], dim=0)
+                teacher_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], teacher(inp))
+                teacher_output_null = teacher_output[0:1]
+                teacher_output = teacher_output[1:]
             teacher_output = teacher_output.clone()
+            teacher_output_null = teacher_output_null.clone()
 
             # Apply augmentations
             with torch.no_grad():
@@ -159,15 +165,21 @@ def train(
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
+                target = target - apply_mask(target_mask, teacher_output_null.expand_as(teacher_output), fill_value=None)
                 loss = (1 - F.cosine_similarity(pred, target, dim=-1, eps=1e-5)).mean()
+                null_target = apply_mask(target_mask, teacher_output_null.expand_as(teacher_output), fill_value=None)
+                contrastive_loss = F.cosine_similarity(pred, null_target, dim=-1, eps=1e-5).mean()
                 train_loss.update(loss)
+                contrast.update(contrastive_loss)
                 train_loss_epoch.update(loss)
+                contrast_epoch.update(contrastive_loss)
+                loss = loss + contrastive_loss
 
             # Backward
             assert not loss.isnan()
             loss.backward()
             assert_all_trainable_params_have_grad(modules, microbatch)
-            logger.log(epoch, step, microbatch, loss=train_loss.compute().item())
+            logger.log(epoch, step, microbatch, loss=train_loss.compute().item(), cont=contrast.compute().item())
 
             # Optimizer update and teacher update
             if should_step_optimizer(microbatch, trainer_config.accumulate_grad_batches):
@@ -179,10 +191,10 @@ def train(
                 step += 1
 
             microbatch += 1
-            desc = format_pbar_description(step, microbatch, epoch, loss=train_loss)
+            desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, cont=contrast)
             pbar.set_description(desc)
 
-        rank_zero_info(f"Epoch: {epoch}, Loss: {train_loss_epoch.compute():.4f}")
+        rank_zero_info(f"Epoch: {epoch}, Loss: {train_loss_epoch.compute():.4f}, Contrast: {contrast_epoch.compute():.4f}")
         train_loss_epoch.reset()
 
         # Save checkpoint

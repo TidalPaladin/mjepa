@@ -168,7 +168,8 @@ def train(
     )
 
     # Metric setup
-    train_loss = tm.RunningMean(window=WINDOW).cuda()
+    train_jepa_loss = tm.RunningMean(window=WINDOW).cuda()
+    train_contrastive_loss = tm.RunningMean(window=WINDOW).cuda()
     train_acc = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
     val_acc = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
 
@@ -176,7 +177,7 @@ def train(
     label: Tensor
     for epoch in range(last_epoch + 1, trainer_config.num_epochs):
         modules.train()
-        desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
+        desc = format_pbar_description(step, microbatch, epoch, loss=train_jepa_loss, cont=train_contrastive_loss, acc=train_acc)
         pbar = tqdm(train_dataloader, desc=desc, disable=not is_rank_zero(), leave=False)
         for img, label in pbar:
             B = img.shape[0]
@@ -186,8 +187,12 @@ def train(
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
-                teacher_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], teacher(img))
+                inp = torch.cat([torch.zeros_like(img[0:1]), img], dim=0)
+                teacher_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], teacher(inp))
+                teacher_output_null = teacher_output[0:1]
+                teacher_output = teacher_output[1:]
             teacher_output = teacher_output.clone()
+            teacher_output_null = teacher_output_null.clone()
 
             # Apply augmentations
             with torch.no_grad():
@@ -208,7 +213,11 @@ def train(
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
                 jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1, eps=1e-5)).mean()
-                train_loss.update(jepa_loss)
+                null_target = apply_mask(target_mask, teacher_output_null.expand_as(teacher_output), fill_value=None)
+                contrastive_loss = F.cosine_similarity(pred, null_target, dim=-1, eps=1e-5).mean()
+                train_jepa_loss.update(jepa_loss)
+                train_contrastive_loss.update(contrastive_loss)
+                jepa_loss = jepa_loss + contrastive_loss
 
                 # Compute linear probe loss
                 probe_pred = probe(reduce(teacher_output, "b l d -> b d", "mean"))
@@ -240,7 +249,7 @@ def train(
                 update_teacher(backbone, teacher, current_momentum)
                 step += 1
 
-            desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
+            desc = format_pbar_description(step, microbatch, epoch, loss=train_jepa_loss, cont=train_contrastive_loss, acc=train_acc)
             pbar.set_description(desc)
 
         # Validation
