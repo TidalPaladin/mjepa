@@ -29,7 +29,6 @@ class CrossAttentionPredictor(nn.Module):
 
     def __init__(self, backbone: ViT, depth: int, out_dim: int | None = None):
         super().__init__()
-        # Shared positional encoding and normalizers
         self.pos_enc = RelativeFactorizedPosition(
             2,
             backbone.config.hidden_size,
@@ -38,9 +37,6 @@ class CrossAttentionPredictor(nn.Module):
             normalization=backbone.config.normalization,
             backend=backbone.config.backend,
         )
-        self.pos_norm = backbone.create_norm(backbone.config.hidden_size)
-
-        # Context normalization
         self.context_norm = backbone.create_norm(backbone.config.isotropic_output_dim)
 
         # Predictor blocks and output projection
@@ -55,12 +51,10 @@ class CrossAttentionPredictor(nn.Module):
         context_mask: Tensor,
         target_mask: Tensor,
     ) -> Tensor:
-        # Normalize context
         context = self.context_norm(context)
 
-        # Create query 
         B = target_mask.shape[0]
-        query = self.pos_norm(self.pos_enc(tokenized_size)).expand(B, -1, -1)
+        query = self.pos_enc(tokenized_size).expand(B, -1, -1)
         query = apply_mask(target_mask, query, fill_value=None)
 
         # Run query and context through predictor

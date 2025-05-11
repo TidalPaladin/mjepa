@@ -22,6 +22,7 @@ backbone: !!python/object:vit.ViTConfig
   checkpoint: true
   num_cls_tokens: 0
   num_register_tokens: 8
+  pos_scale: 0.001
 
 augmentations: !!python/object:mjepa.AugmentationConfig
   mixup_prob: 0.2
