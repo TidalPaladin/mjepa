@@ -7,6 +7,7 @@ import yaml
 from torch import Tensor
 from vit import ViT
 from vit.tokens import apply_mask, generate_non_overlapping_mask
+from vit.attention import AttentivePool
 
 
 class CrossAttentionPredictor(nn.Module):
@@ -15,7 +16,8 @@ class CrossAttentionPredictor(nn.Module):
 
     The predictor consists of the following components:
         - A positional encoding layer using relative factorized position encoding with a MLP to
-          initialize the target queries.
+          initialize the target queries. This is the same as the positional encoding used in the
+          backbone.
         - A series of cross-attention layers between the target queries and the context.
         - A linear projection head to create the final output.
 
@@ -29,13 +31,13 @@ class CrossAttentionPredictor(nn.Module):
     def __init__(self, backbone: ViT, depth: int, out_dim: int | None = None):
         super().__init__()
         self.pos_enc = backbone.stem.pos_enc
+
         self.query = nn.Parameter(torch.randn(backbone.config.hidden_size))
-        self.context_norm = backbone.create_norm(backbone.config.isotropic_output_dim)
+        self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
 
         # Predictor blocks and output projection
-        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer(i) for i in range(depth)])
-        self.predictor_proj = backbone.create_head(bias=True, out_dim=out_dim)
-        self.checkpoint = backbone.config.checkpoint
+        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for i in range(depth)])
+        self.predictor_proj = nn.Linear(backbone.config.hidden_size, out_dim or backbone.config.hidden_size)
 
     def forward(
         self,
@@ -53,9 +55,23 @@ class CrossAttentionPredictor(nn.Module):
 
         # Run query and context through predictor
         for block in self.blocks:
-            query = block(query, encoder_output=context, checkpoint_core_attention=self.checkpoint)
+            query = block(query, context)
 
         return self.predictor_proj(query)
+
+
+class AttentiveProbe(nn.Module):
+
+    def __init__(self, hidden_size: int, out_dim: int, num_attention_heads: int):
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden_size)
+        self.pool = AttentivePool(hidden_size, num_attention_heads)
+        self.proj = nn.Linear(hidden_size, out_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(x)
+        x = self.pool(x)
+        return self.proj(x)
 
 
 @torch.no_grad()

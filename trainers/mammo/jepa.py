@@ -138,7 +138,7 @@ def train(
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
-                teacher_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], teacher(img))
+                teacher_output = cast(Tensor, teacher(img))
             teacher_output = teacher_output.clone()
 
             # Apply augmentations
@@ -153,7 +153,7 @@ def train(
                 context_mask, target_mask = generate_masks(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
                 )
-                context, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], backbone(img, mask=context_mask))
+                context = cast(Tensor, backbone(img, mask=context_mask))
                 tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
                 pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
 

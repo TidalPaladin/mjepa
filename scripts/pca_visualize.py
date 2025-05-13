@@ -118,23 +118,18 @@ def main(args: Namespace) -> None:
     # Load model and move to device
     config = yaml.full_load(args.config.read_text())["backbone"]
     assert isinstance(config, ViTConfig)
-    if config.backend == "te" and device.type == "cpu":
-        print("Warning: TE backend requires GPU. Switching to torch backend.")
-        config = replace(config, backend="pytorch")
     model = config.instantiate()
     model = model.to(device)
     model.eval()
 
     # Load checkpoint
     state_dict = st.load_file(args.checkpoint)
-    if config.backend == "pytorch":
-        state_dict = {k: v for k, v in state_dict.items() if not k.endswith("_extra_state")}
     model.load_state_dict(state_dict)
 
     # Run forward pass
     H, W = img.shape[-2:]
     with torch.autocast(device.type, dtype=torch.bfloat16):
-        features, _, registers = cast(Tuple[Tensor, Tensor | None, Tensor | None], model(img))
+        features = cast(Tensor, model(img))
     features = features.to(torch.float32)
     Ht, Wt = model.stem.tokenized_size((H, W))
     features = rearrange(features, "n (ht wt) d -> n ht wt d", ht=Ht, wt=Wt)
@@ -153,7 +148,7 @@ def main(args: Namespace) -> None:
     # Save original image and PCA image side by side
     img = img.expand(-1, 3, -1, -1)
     elements = torch.cat([img, pca], dim=-1)
-    grid = make_grid(elements, nrow=2)
+    grid = make_grid(elements, nrow=1)
     save_image(grid, args.output)
 
     

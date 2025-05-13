@@ -35,6 +35,7 @@ from torchvision.transforms.v2 import (
 from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
+from vit.fused import NormLinear
 
 from mjepa.augmentation import (
     AugmentationConfig,
@@ -45,7 +46,7 @@ from mjepa.augmentation import (
     cross_entropy_mixup,
     is_mixed,
 )
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher
+from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher, AttentiveProbe
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
     TrainerConfig,
@@ -182,11 +183,12 @@ def train(
             B = img.shape[0]
             img = img.cuda()
             label = label.cuda()
+            tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
 
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
-                teacher_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], teacher(img))
+                teacher_output = cast(Tensor, teacher(img))
             teacher_output = teacher_output.clone()
 
             # Apply augmentations
@@ -201,8 +203,7 @@ def train(
                 context_mask, target_mask = generate_masks(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
                 )
-                context, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], backbone(img, mask=context_mask))
-                tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
+                context = cast(Tensor, backbone(img, mask=context_mask))
                 pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
 
                 # Compute JEPA loss
@@ -211,7 +212,7 @@ def train(
                 train_loss.update(jepa_loss)
 
                 # Compute linear probe loss
-                probe_pred = probe(reduce(teacher_output, "b l d -> b d", "mean"))
+                probe_pred = probe(teacher_output)
                 probe_loss = cross_entropy_mixup(
                     probe_pred, label, mixup_seed, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
                 ).mean()
@@ -253,8 +254,8 @@ def train(
                 img = img.cuda()
                 label = label.cuda()
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    teacher_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], teacher(img))
-                    probe_pred = probe(teacher_output.mean(1))
+                    teacher_output = cast(Tensor, teacher(img))
+                    probe_pred = probe(teacher_output)
                     mask = is_mixed(
                         B, augmentation_config.mixup_prob, augmentation_config.mixup_alpha, mixup_seed
                     ).logical_not_()
@@ -335,7 +336,7 @@ def main(args: Namespace) -> None:
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
     predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
-    probe = backbone.create_head(NUM_CLASSES, bias=True)
+    probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
 
     # Wrap in DDP for distributed training
