@@ -3,7 +3,7 @@ import os
 import warnings
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
-from typing import Final, Tuple, cast
+from typing import Final, cast
 
 import safetensors.torch as st
 import torch
@@ -35,7 +35,7 @@ from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
-from mjepa.jepa import CrossAttentionPredictor, generate_masks
+from mjepa.jepa import AttentiveProbe, CrossAttentionPredictor, generate_masks
 from mjepa.mae import MAEConfig
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
@@ -188,7 +188,7 @@ def train(
                 context_mask, target_mask = generate_masks(
                     backbone, img, mae_config.context_ratio, mae_config.target_ratio, mae_config.scale
                 )
-                context, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], backbone(img, mask=context_mask))
+                context = cast(Tensor, backbone(img, mask=context_mask))
                 tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
                 pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
 
@@ -198,7 +198,7 @@ def train(
                 train_loss.update(mae_loss)
 
                 # Compute linear probe loss
-                probe_pred = probe(context.detach().mean(1))
+                probe_pred = probe(context.detach())
                 probe_loss = F.cross_entropy(probe_pred, label)
 
                 # Combine losses
@@ -232,8 +232,8 @@ def train(
                 img = img.cuda()
                 label = label.cuda()
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    full_output, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], backbone(img))
-                    probe_pred = probe(full_output.mean(1))
+                    full_output = cast(Tensor, backbone(img))
+                    probe_pred = probe(full_output)
                     val_acc.update(probe_pred, label)
 
             # Validation epoch end
@@ -308,11 +308,12 @@ def main(args: Namespace) -> None:
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
     out_dim = math.prod(backbone.config.patch_size) * backbone.config.in_channels
-    predictor = CrossAttentionPredictor(backbone, mae_config.predictor_depth, out_dim)
-    probe = backbone.create_head(NUM_CLASSES, bias=True)
+    predictor = CrossAttentionPredictor(
+        backbone, mae_config.predictor_depth, mae_config.context_pos_emb, mae_config.shared_pos_emb, out_dim
+    )
+    probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
-    nn.init.trunc_normal_(predictor.predictor_proj[0].weight, std=0.001)
-    nn.init.constant_(predictor.predictor_proj[0].bias, 0.5)
+    nn.init.constant_(predictor.predictor_proj.bias, 0.5)
 
     # Wrap in DDP for distributed training
     if world_size > 1:

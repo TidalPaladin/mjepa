@@ -78,7 +78,7 @@ def format_large_number(count: int) -> str:
         A string of the form "1.200M" or "1.200B" etc.
     """
     if count < 1_000:
-        return count
+        return str(count)
     elif count < 1_000_000:
         return f"{count / 1_000:.4f}K"
     elif count < 1_000_000_000:

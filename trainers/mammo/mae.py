@@ -241,7 +241,9 @@ def main(args: Namespace) -> None:
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
     out_dim = math.prod(backbone.config.patch_size) * backbone.config.in_channels
-    predictor = CrossAttentionPredictor(backbone, mae_config.predictor_depth, out_dim)
+    predictor = CrossAttentionPredictor(
+        backbone, mae_config.predictor_depth, mae_config.context_pos_emb, mae_config.shared_pos_emb, out_dim
+    )
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor}).cuda()
 
     # Wrap in DDP for distributed training

@@ -3,7 +3,7 @@ import os
 from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 from pathlib import Path
-from typing import Final, Tuple, cast
+from typing import Final, cast
 
 import safetensors.torch as st
 import torch
@@ -12,7 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics as tm
 import yaml
-from einops import reduce
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
@@ -35,7 +34,6 @@ from torchvision.transforms.v2 import (
 from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
-from vit.fused import NormLinear
 
 from mjepa.augmentation import (
     AugmentationConfig,
@@ -46,7 +44,14 @@ from mjepa.augmentation import (
     cross_entropy_mixup,
     is_mixed,
 )
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher, AttentiveProbe
+from mjepa.jepa import (
+    AttentiveProbe,
+    CrossAttentionPredictor,
+    JEPAConfig,
+    generate_masks,
+    get_momentum,
+    update_teacher,
+)
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
     TrainerConfig,
@@ -335,7 +340,9 @@ def main(args: Namespace) -> None:
 
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
-    predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
+    predictor = CrossAttentionPredictor(
+        backbone, jepa_config.predictor_depth, jepa_config.context_pos_emb, jepa_config.shared_pos_emb
+    )
     probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
 

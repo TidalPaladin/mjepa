@@ -14,12 +14,17 @@ class MAEConfig:
         scale: Integer scale at which to sample contiguous blocks of context tokens.
             Increasing this ensures more adjacent tokens appear together in the context.
         predictor_depth: Depth of the predictor network.
+        context_pos_emb: Whether to introduce positional encoding to the context
+            as part of the predictor network.
+        shared_pos_emb: Whether to use the backbone's positional encoding in the predictor.
     """
 
     context_ratio: float = 0.5
     target_ratio: float = 0.25
     scale: int = 4
     predictor_depth: int = 4
+    context_pos_emb: bool = False
+    shared_pos_emb: bool = True
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:

@@ -51,7 +51,7 @@ class OptimizerConfig:
         )
         return optimizer, scheduler
 
-    def _instantiate_adamw(self, model: nn.Module) -> Tuple[Optimizer, LRScheduler]:
+    def _instantiate_adamw(self, model: nn.Module) -> Optimizer:
         parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
         return AdamW(
             parameter_groups,
@@ -63,7 +63,7 @@ class OptimizerConfig:
             eps=self.eps,
         )
 
-    def _instantiate_soap(self, model: nn.Module) -> Tuple[Optimizer, LRScheduler]:
+    def _instantiate_soap(self, model: nn.Module) -> Optimizer:
         parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
         return SOAP(
             parameter_groups,

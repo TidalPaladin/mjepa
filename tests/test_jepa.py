@@ -131,7 +131,6 @@ class TestJEPAConfig:
         assert config.scale == 4
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
-        assert config.loss_fn == "cosine"
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -141,14 +140,12 @@ class TestJEPAConfig:
             scale=8,
             momentum=0.95,
             predictor_depth=6,
-            loss_fn="smooth_l1",
         )
         assert config.context_ratio == 0.6
         assert config.target_ratio == 0.3
         assert config.scale == 8
         assert config.momentum == 0.95
         assert config.predictor_depth == 6
-        assert config.loss_fn == "smooth_l1"
 
     def test_invalid_context_ratio(self):
         """Test invalid context ratio."""
@@ -166,11 +163,6 @@ class TestJEPAConfig:
         with pytest.raises(ValueError):
             JEPAConfig(target_ratio=1.1)
 
-    def test_invalid_loss_fn(self):
-        """Test invalid loss function."""
-        with pytest.raises(ValueError):
-            JEPAConfig(loss_fn="invalid")
-
 
 class TestYAMLConfig:
     def test_config_constructor(self, mocker):
@@ -186,7 +178,6 @@ class TestYAMLConfig:
             "scale": 16,
             "momentum": 0.98,
             "predictor_depth": 8,
-            "loss_fn": "smooth_l1",
         }
         loader.construct_mapping.return_value = config_dict
 
@@ -200,7 +191,6 @@ class TestYAMLConfig:
         assert config.scale == 16
         assert config.momentum == 0.98
         assert config.predictor_depth == 8
-        assert config.loss_fn == "smooth_l1"
 
         # Verify the loader was called correctly
         loader.construct_mapping.assert_called_once_with(node, deep=True)
@@ -237,7 +227,6 @@ class TestYAMLConfig:
         scale: 12
         momentum: 0.97
         predictor_depth: 5
-        loss_fn: smooth_l1
         """
 
         # Load the YAML
@@ -250,4 +239,3 @@ class TestYAMLConfig:
         assert config.scale == 12
         assert config.momentum == 0.97
         assert config.predictor_depth == 5
-        assert config.loss_fn == "smooth_l1"

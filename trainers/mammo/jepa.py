@@ -258,7 +258,9 @@ def main(args: Namespace) -> None:
 
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
-    predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
+    predictor = CrossAttentionPredictor(
+        backbone, jepa_config.predictor_depth, jepa_config.context_pos_emb, jepa_config.shared_pos_emb
+    )
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor}).cuda()
 
     # Wrap in DDP for distributed training

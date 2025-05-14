@@ -1,13 +1,14 @@
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 import yaml
 from torch import Tensor
 from vit import ViT
-from vit.tokens import apply_mask, generate_non_overlapping_mask
 from vit.attention import AttentivePool
+from vit.tokens import apply_mask, generate_non_overlapping_mask
 
 
 class CrossAttentionPredictor(nn.Module):
@@ -24,13 +25,27 @@ class CrossAttentionPredictor(nn.Module):
     Args:
         backbone: Backbone model with a :meth:`create_cross_attention_layer` method.
         depth: Depth of the predictor network.
+        context_pos_emb: Whether to introduce positional encoding to the context.
+        shared_pos_emb: Whether to use the backbone's positional encoding in the predictor.
         out_dim: Output dimension of the predictor.
             If ``None``, the output dimension will be the same as the input dimension.
     """
 
-    def __init__(self, backbone: ViT, depth: int, out_dim: int | None = None):
+    def __init__(
+        self,
+        backbone: ViT,
+        depth: int,
+        context_pos_emb: bool = False,
+        shared_pos_emb: bool = True,
+        out_dim: int | None = None,
+    ):
         super().__init__()
-        self.pos_enc = backbone.stem.pos_enc
+        self.pos_enc = backbone.stem.pos_enc if shared_pos_emb else deepcopy(backbone.stem.pos_enc)
+        if context_pos_emb:
+            self.context_pos_proj = nn.Linear(backbone.config.hidden_size, backbone.config.hidden_size)
+            nn.init.trunc_normal_(self.context_pos_proj.weight, std=0.02)
+        else:
+            self.context_pos_proj = None
 
         self.query = nn.Parameter(torch.randn(backbone.config.hidden_size))
         self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
@@ -46,12 +61,21 @@ class CrossAttentionPredictor(nn.Module):
         context_mask: Tensor,
         target_mask: Tensor,
     ) -> Tensor:
-        context = self.context_norm(context)
-
+        # Create positional encodings
         B = target_mask.shape[0]
-        query = self.pos_enc(tokenized_size).expand(B, -1, -1)
-        query = apply_mask(target_mask, query, fill_value=None)
-        query = query + self.query.view(1, 1, -1).expand(B, -1, -1)
+        pos = self.pos_enc(tokenized_size)
+
+        # Mask positional encodings and project context positional encoding if needed
+        query_pos = apply_mask(target_mask, pos.expand(B, -1, -1))
+        context_pos = (
+            apply_mask(context_mask, self.context_pos_proj(pos).expand(B, -1, -1))
+            if self.context_pos_proj is not None
+            else None
+        )
+
+        # Combine positional encodings with context and query
+        context = self.context_norm(context + context_pos if context_pos is not None else context)
+        query = self.query + query_pos
 
         # Run query and context through predictor
         for block in self.blocks:
@@ -146,7 +170,9 @@ class JEPAConfig:
         momentum: The base momentum for the EMA update. Momentum will be linearly annealed
             from this value to 1.0 over the course of training.
         predictor_depth: Depth of the predictor network.
-        loss_fn: Loss function to use for the JEPA loss. Can be ``smooth_l1`` or ``cosine``.
+        context_pos_emb: Whether to introduce positional encoding to the context
+            as part of the predictor network.
+        shared_pos_emb: Whether to use the backbone's positional encoding in the predictor.
     """
 
     context_ratio: float = 0.5
@@ -154,15 +180,14 @@ class JEPAConfig:
     scale: int = 4
     momentum: float = 0.99
     predictor_depth: int = 4
-    loss_fn: Literal["smooth_l1", "cosine"] = "cosine"
+    context_pos_emb: bool = False
+    shared_pos_emb: bool = True
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:
             raise ValueError("target_ratio must be in the range (0, 1]")
-        if self.loss_fn not in ["smooth_l1", "cosine"]:
-            raise ValueError("loss_fn must be one of ['smooth_l1', 'cosine']")
 
 
 def config_constructor(loader, node):
