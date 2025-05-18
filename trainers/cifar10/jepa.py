@@ -1,5 +1,6 @@
 import logging
 import os
+import gc
 from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 from pathlib import Path
@@ -46,6 +47,7 @@ from mjepa.augmentation import (
 )
 from mjepa.jepa import (
     AttentiveProbe,
+    LinearProbe,
     CrossAttentionPredictor,
     JEPAConfig,
     generate_masks,
@@ -156,7 +158,7 @@ def train(
     probe: nn.Module = modules["probe"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
-    rank_zero_info(f"Probe params: {format_large_number(count_parameters(probe))}")
+    rank_zero_info(f"{jepa_config.probe_type.capitalize()} probe params: {format_large_number(count_parameters(probe))}")
 
     # Teacher setup
     teacher = deepcopy(backbone)
@@ -209,7 +211,7 @@ def train(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
                 )
                 context = cast(Tensor, backbone(img, mask=context_mask))
-                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
+                pred: Tensor = predictor(tokenized_size, context, target_mask)
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
@@ -268,6 +270,10 @@ def train(
 
             # Validation epoch end
             rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
+
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         # Save checkpoint
         if log_dir:
@@ -341,9 +347,15 @@ def main(args: Namespace) -> None:
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
     predictor = CrossAttentionPredictor(
-        backbone, jepa_config.predictor_depth, jepa_config.context_pos_emb, jepa_config.shared_pos_emb
+        backbone, jepa_config.predictor_depth, jepa_config.shared_pos_emb
     )
-    probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
+    match jepa_config.probe_type:
+        case "attentive":
+            probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
+        case "linear":
+            probe = LinearProbe(backbone.config.hidden_size, NUM_CLASSES)
+        case _:
+            raise ValueError(f"Invalid probe type: {jepa_config.probe_type}")
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
 
     # Wrap in DDP for distributed training

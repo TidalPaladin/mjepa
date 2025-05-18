@@ -1,6 +1,6 @@
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Literal, Tuple
 
 import torch
 import torch.nn as nn
@@ -9,7 +9,7 @@ from torch import Tensor
 from vit import ViT
 from vit.attention import AttentivePool
 from vit.tokens import apply_mask, generate_non_overlapping_mask
-
+from vit.pos_enc import create_grid, LearnablePosition, RelativeFactorizedPosition, LearnableFourierFeatures
 
 class CrossAttentionPredictor(nn.Module):
     r"""
@@ -35,18 +35,11 @@ class CrossAttentionPredictor(nn.Module):
         self,
         backbone: ViT,
         depth: int,
-        context_pos_emb: bool = False,
-        shared_pos_emb: bool = True,
+        shared_pos_emb: bool = False,
         out_dim: int | None = None,
     ):
         super().__init__()
         self.pos_enc = backbone.stem.pos_enc if shared_pos_emb else deepcopy(backbone.stem.pos_enc)
-        if context_pos_emb:
-            self.context_pos_proj = nn.Linear(backbone.config.hidden_size, backbone.config.hidden_size)
-            nn.init.trunc_normal_(self.context_pos_proj.weight, std=0.02)
-        else:
-            self.context_pos_proj = None
-
         self.query = nn.Parameter(torch.randn(backbone.config.hidden_size))
         self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
 
@@ -58,24 +51,15 @@ class CrossAttentionPredictor(nn.Module):
         self,
         tokenized_size: Tuple[int, int],
         context: Tensor,
-        context_mask: Tensor,
         target_mask: Tensor,
     ) -> Tensor:
         # Create positional encodings
-        B = target_mask.shape[0]
-        pos = self.pos_enc(tokenized_size)
-
-        # Mask positional encodings and project context positional encoding if needed
-        query_pos = apply_mask(target_mask, pos.expand(B, -1, -1))
-        context_pos = (
-            apply_mask(context_mask, self.context_pos_proj(pos).expand(B, -1, -1))
-            if self.context_pos_proj is not None
-            else None
-        )
+        B, L = target_mask.shape
+        pos = apply_mask(target_mask, self.pos_enc(tokenized_size).expand(B, -1, -1))
 
         # Combine positional encodings with context and query
-        context = self.context_norm(context + context_pos if context_pos is not None else context)
-        query = self.query + query_pos
+        context = self.context_norm(context)
+        query = pos + self.query
 
         # Run query and context through predictor
         for block in self.blocks:
@@ -95,6 +79,19 @@ class AttentiveProbe(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = self.norm(x)
         x = self.pool(x)
+        return self.proj(x)
+
+
+class LinearProbe(nn.Module):
+
+    def __init__(self, hidden_size: int, out_dim: int):
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden_size)
+        self.proj = nn.Linear(hidden_size, out_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.mean(dim=1)
+        x = self.norm(x)
         return self.proj(x)
 
 
@@ -170,6 +167,7 @@ class JEPAConfig:
         momentum: The base momentum for the EMA update. Momentum will be linearly annealed
             from this value to 1.0 over the course of training.
         predictor_depth: Depth of the predictor network.
+        probe_type: Type of probe to use (linear or attentive)
         context_pos_emb: Whether to introduce positional encoding to the context
             as part of the predictor network.
         shared_pos_emb: Whether to use the backbone's positional encoding in the predictor.
@@ -180,6 +178,7 @@ class JEPAConfig:
     scale: int = 4
     momentum: float = 0.99
     predictor_depth: int = 4
+    probe_type: Literal["attentive", "linear"] = "linear"
     context_pos_emb: bool = False
     shared_pos_emb: bool = True
 

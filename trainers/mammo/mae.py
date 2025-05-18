@@ -139,7 +139,7 @@ def train(
                 context_mask, target_mask = generate_masks(
                     backbone, img, mae_config.context_ratio, mae_config.target_ratio, mae_config.scale
                 )
-                context, _, _ = cast(Tuple[Tensor, Tensor | None, Tensor | None], backbone(img, mask=context_mask))
+                context = cast(Tensor, backbone(img, mask=context_mask))
                 tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
                 pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
 
