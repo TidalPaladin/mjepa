@@ -211,7 +211,7 @@ def train(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
                 )
                 context = cast(Tensor, backbone(img, mask=context_mask))
-                pred: Tensor = predictor(tokenized_size, context, target_mask)
+                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
@@ -346,9 +346,7 @@ def main(args: Namespace) -> None:
 
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
-    predictor = CrossAttentionPredictor(
-        backbone, jepa_config.predictor_depth, jepa_config.shared_pos_emb
-    )
+    predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
     match jepa_config.probe_type:
         case "attentive":
             probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)

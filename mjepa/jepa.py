@@ -9,8 +9,7 @@ from torch import Tensor
 from vit import ViT
 from vit.attention import AttentivePool
 from vit.tokens import apply_mask, generate_non_overlapping_mask
-from vit.pos_enc import create_grid, LearnablePosition, RelativeFactorizedPosition, LearnableFourierFeatures
-
+from vit.pos_enc import create_grid, LearnablePosition
 class CrossAttentionPredictor(nn.Module):
     r"""
     Predicts targets from context embeddings.
@@ -26,7 +25,6 @@ class CrossAttentionPredictor(nn.Module):
         backbone: Backbone model with a :meth:`create_cross_attention_layer` method.
         depth: Depth of the predictor network.
         context_pos_emb: Whether to introduce positional encoding to the context.
-        shared_pos_emb: Whether to use the backbone's positional encoding in the predictor.
         out_dim: Output dimension of the predictor.
             If ``None``, the output dimension will be the same as the input dimension.
     """
@@ -35,11 +33,14 @@ class CrossAttentionPredictor(nn.Module):
         self,
         backbone: ViT,
         depth: int,
-        shared_pos_emb: bool = False,
         out_dim: int | None = None,
     ):
         super().__init__()
-        self.pos_enc = backbone.stem.pos_enc if shared_pos_emb else deepcopy(backbone.stem.pos_enc)
+        spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
+        self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
+        self.pos_enc_context = LearnablePosition(backbone.config.hidden_size, spatial_size)
+        self.attn_bias = backbone.config.attn_bias
+
         self.query = nn.Parameter(torch.randn(backbone.config.hidden_size))
         self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
 
@@ -51,19 +52,32 @@ class CrossAttentionPredictor(nn.Module):
         self,
         tokenized_size: Tuple[int, int],
         context: Tensor,
+        context_mask: Tensor,
         target_mask: Tensor,
     ) -> Tensor:
         # Create positional encodings
         B, L = target_mask.shape
-        pos = apply_mask(target_mask, self.pos_enc(tokenized_size).expand(B, -1, -1))
+        pos_context = apply_mask(context_mask, self.pos_enc_context(tokenized_size).expand(B, -1, -1))
+        pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
 
-        # Combine positional encodings with context and query
-        context = self.context_norm(context)
-        query = pos + self.query
+        # Prepare inputs
+        context = self.context_norm(context + pos_context)
+        query = self.query + pos_target
+
+        # Prepare position grids if using relative position encoding
+        if self.attn_bias:
+            pos = create_grid(tokenized_size, device=context.device, dtype=context.dtype).expand(B, -1, -1)
+            qpos = apply_mask(target_mask, pos)
+            kpos = apply_mask(context_mask, pos)
+        else:
+            qpos = kpos = None
 
         # Run query and context through predictor
         for block in self.blocks:
-            query = block(query, context)
+            if self.attn_bias:
+                query = block(query, context, qpos, kpos)
+            else:
+                query = block(query, context)
 
         return self.predictor_proj(query)
 
