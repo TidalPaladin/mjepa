@@ -1,4 +1,3 @@
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
@@ -8,8 +7,10 @@ import yaml
 from torch import Tensor
 from vit import ViT
 from vit.attention import AttentivePool
+from vit.pos_enc import LearnablePosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
-from vit.pos_enc import create_grid, LearnablePosition
+
+
 class CrossAttentionPredictor(nn.Module):
     r"""
     Predicts targets from context embeddings.
@@ -37,12 +38,15 @@ class CrossAttentionPredictor(nn.Module):
     ):
         super().__init__()
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
-        self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
-        self.pos_enc_context = LearnablePosition(backbone.config.hidden_size, spatial_size)
-        self.attn_bias = backbone.config.attn_bias
-
-        self.query = nn.Parameter(torch.randn(backbone.config.hidden_size))
+        self.pos_enc_target = LearnablePosition(
+            backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
+        )
+        self.pos_enc_context = LearnablePosition(
+            backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
+        )
+        self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
         self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
+        nn.init.trunc_normal_(self.query, std=0.02)
 
         # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for i in range(depth)])
@@ -64,20 +68,9 @@ class CrossAttentionPredictor(nn.Module):
         context = self.context_norm(context + pos_context)
         query = self.query + pos_target
 
-        # Prepare position grids if using relative position encoding
-        if self.attn_bias:
-            pos = create_grid(tokenized_size, device=context.device, dtype=context.dtype).expand(B, -1, -1)
-            qpos = apply_mask(target_mask, pos)
-            kpos = apply_mask(context_mask, pos)
-        else:
-            qpos = kpos = None
-
         # Run query and context through predictor
         for block in self.blocks:
-            if self.attn_bias:
-                query = block(query, context, qpos, kpos)
-            else:
-                query = block(query, context)
+            query = block(query, context)
 
         return self.predictor_proj(query)
 
@@ -116,6 +109,7 @@ def generate_masks(
     context_ratio: float,
     target_ratio: float,
     scale: int,
+    roll: bool = True,
 ) -> Tuple[Tensor, Tensor]:
     r"""Generate non-overlapping and non-ragged context and target masks.
 
@@ -130,7 +124,7 @@ def generate_masks(
         Tuple of context and target masks.
     """
     # generate context mask - will always be non-ragged
-    context_mask = backbone.create_mask(x, context_ratio, scale)
+    context_mask = backbone.create_mask(x, context_ratio, scale, roll=roll)
 
     # generate target mask - select non-ragged target mask from locations not in context mask
     target_mask = generate_non_overlapping_mask(context_mask, context_ratio, target_ratio)

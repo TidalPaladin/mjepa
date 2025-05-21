@@ -1,6 +1,6 @@
+import gc
 import logging
 import os
-import gc
 from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 from pathlib import Path
@@ -47,9 +47,9 @@ from mjepa.augmentation import (
 )
 from mjepa.jepa import (
     AttentiveProbe,
-    LinearProbe,
     CrossAttentionPredictor,
     JEPAConfig,
+    LinearProbe,
     generate_masks,
     get_momentum,
     update_teacher,
@@ -158,7 +158,9 @@ def train(
     probe: nn.Module = modules["probe"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
-    rank_zero_info(f"{jepa_config.probe_type.capitalize()} probe params: {format_large_number(count_parameters(probe))}")
+    rank_zero_info(
+        f"{jepa_config.probe_type.capitalize()} probe params: {format_large_number(count_parameters(probe))}"
+    )
 
     # Teacher setup
     teacher = deepcopy(backbone)
