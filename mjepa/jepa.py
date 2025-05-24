@@ -68,7 +68,7 @@ class CrossAttentionPredictor(nn.Module):
             query = self.query + pos_target
             posq = posk = None
         else:
-            pos = create_grid(tokenized_size, device=context.device).expand(B, -1, -1)
+            pos = create_grid(tokenized_size, device=context.device, normalize=False).expand(B, -1, -1)
             posq = apply_mask(target_mask, pos)
             posk = apply_mask(context_mask, pos)
             query = self.query.view(1, 1, -1).expand(B, posq.shape[1], -1)
