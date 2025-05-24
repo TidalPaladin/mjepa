@@ -40,6 +40,7 @@ from mjepa.trainer import (
     save_checkpoint,
     setup_logdir,
     should_step_optimizer,
+    seed_everything,
 )
 
 
@@ -215,6 +216,7 @@ def parse_args() -> Namespace:
 
 
 def main(args: Namespace) -> None:
+    seed_everything(0)
     if not (config_path := Path(args.config)).is_file():
         raise FileNotFoundError(config_path)
     config = yaml.full_load(config_path.read_text())

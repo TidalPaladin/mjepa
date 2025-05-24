@@ -1,4 +1,5 @@
 import math
+import gc
 import os
 import warnings
 from argparse import ArgumentParser, Namespace
@@ -35,7 +36,7 @@ from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
-from mjepa.jepa import AttentiveProbe, CrossAttentionPredictor, generate_masks
+from mjepa.jepa import AttentiveProbe, CrossAttentionPredictor, generate_masks, LinearProbe
 from mjepa.mae import MAEConfig
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
@@ -50,6 +51,7 @@ from mjepa.trainer import (
     rank_zero_info,
     save_checkpoint,
     setup_logdir,
+    seed_everything,
     should_step_optimizer,
 )
 
@@ -239,6 +241,10 @@ def train(
             # Validation epoch end
             rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
 
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         # Save checkpoint
         if log_dir:
             save_checkpoint(
@@ -282,6 +288,7 @@ def parse_args() -> Namespace:
 
 
 def main(args: Namespace) -> None:
+    seed_everything(0)
     if not (config_path := Path(args.config)).is_file():
         raise FileNotFoundError(config_path)
     config = yaml.full_load(config_path.read_text())
@@ -309,9 +316,15 @@ def main(args: Namespace) -> None:
     backbone = backbone_config.instantiate()
     out_dim = math.prod(backbone.config.patch_size) * backbone.config.in_channels
     predictor = CrossAttentionPredictor(
-        backbone, mae_config.predictor_depth, mae_config.context_pos_emb, mae_config.shared_pos_emb, out_dim
+        backbone, mae_config.predictor_depth, out_dim
     )
-    probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
+    match mae_config.probe_type:
+        case "attentive":
+            probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
+        case "linear":
+            probe = LinearProbe(backbone.config.hidden_size, NUM_CLASSES)
+        case _:
+            raise ValueError(f"Invalid probe type: {mae_config.probe_type}")
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
     nn.init.constant_(predictor.predictor_proj.bias, 0.5)
 

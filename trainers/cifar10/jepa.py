@@ -53,6 +53,8 @@ from mjepa.jepa import (
     generate_masks,
     get_momentum,
     update_teacher,
+    compute_koleo_regularizer,
+    create_probe,
 )
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
@@ -68,6 +70,7 @@ from mjepa.trainer import (
     save_checkpoint,
     setup_logdir,
     should_step_optimizer,
+    seed_everything,
 )
 
 
@@ -217,7 +220,7 @@ def train(
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1, eps=1e-5)).mean()
+                jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1)).mean()
                 train_loss.update(jepa_loss)
 
                 # Compute linear probe loss
@@ -321,6 +324,7 @@ def parse_args() -> Namespace:
 
 
 def main(args: Namespace) -> None:
+    seed_everything(0)
     if not (config_path := Path(args.config)).is_file():
         raise FileNotFoundError(config_path)
     config = yaml.full_load(config_path.read_text())
@@ -349,13 +353,7 @@ def main(args: Namespace) -> None:
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
     predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
-    match jepa_config.probe_type:
-        case "attentive":
-            probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
-        case "linear":
-            probe = LinearProbe(backbone.config.hidden_size, NUM_CLASSES)
-        case _:
-            raise ValueError(f"Invalid probe type: {jepa_config.probe_type}")
+    probe = create_probe(backbone, jepa_config.probe_type, NUM_CLASSES)
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
 
     # Wrap in DDP for distributed training

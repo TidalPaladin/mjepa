@@ -1,14 +1,16 @@
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Literal, Tuple, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from torch import Tensor
 from vit import ViT
 from vit.attention import AttentivePool
 from vit.pos_enc import LearnablePosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
+from vit.pos_enc import create_grid
 
 
 class CrossAttentionPredictor(nn.Module):
@@ -38,15 +40,13 @@ class CrossAttentionPredictor(nn.Module):
     ):
         super().__init__()
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
-        self.pos_enc_target = LearnablePosition(
-            backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
-        )
-        self.pos_enc_context = LearnablePosition(
-            backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
-        )
-        self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
+        if backbone.config.use_rope:
+            self.pos_enc_target = self.pos_enc_context = None
+        else:
+            self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
+            self.pos_enc_context = LearnablePosition(backbone.config.hidden_size, spatial_size)
+        self.query = nn.Parameter(torch.randn(backbone.config.hidden_size))
         self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
-        nn.init.trunc_normal_(self.query, std=0.02)
 
         # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for i in range(depth)])
@@ -61,29 +61,50 @@ class CrossAttentionPredictor(nn.Module):
     ) -> Tensor:
         # Create positional encodings
         B, L = target_mask.shape
-        pos_context = apply_mask(context_mask, self.pos_enc_context(tokenized_size).expand(B, -1, -1))
-        pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
-
-        # Prepare inputs
-        context = self.context_norm(context + pos_context)
-        query = self.query + pos_target
+        if self.pos_enc_context is not None:
+            pos_context = apply_mask(context_mask, self.pos_enc_context(tokenized_size).expand(B, -1, -1))
+            pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
+            context = self.context_norm(context + pos_context)
+            query = self.query + pos_target
+            posq = posk = None
+        else:
+            pos = create_grid(tokenized_size, device=context.device).expand(B, -1, -1)
+            posq = apply_mask(target_mask, pos)
+            posk = apply_mask(context_mask, pos)
+            query = self.query.view(1, 1, -1).expand(B, posq.shape[1], -1)
+            context = self.context_norm(context)
 
         # Run query and context through predictor
         for block in self.blocks:
-            query = block(query, context)
+            query = block(query, context, posq, posk)
 
         return self.predictor_proj(query)
 
 
 class AttentiveProbe(nn.Module):
 
-    def __init__(self, hidden_size: int, out_dim: int, num_attention_heads: int):
+    def __init__(
+        self, 
+        hidden_size: int, 
+        out_dim: int, 
+        num_attention_heads: int,
+        pos_emb: bool = False,
+        tokenized_size: Sequence[int] | None = None,
+    ):
         super().__init__()
         self.norm = nn.RMSNorm(hidden_size)
         self.pool = AttentivePool(hidden_size, num_attention_heads)
         self.proj = nn.Linear(hidden_size, out_dim)
+        if pos_emb:
+            if tokenized_size is None:
+                raise ValueError("tokenized_size is required when pos_emb is True")
+            self.pos_enc = LearnablePosition(hidden_size, tokenized_size)
+        else:
+            self.pos_enc = None
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.pos_enc is not None:
+            x = x + self.pos_enc(self.pos_enc.spatial_size)
         x = self.norm(x)
         x = self.pool(x)
         return self.proj(x)
@@ -91,15 +112,57 @@ class AttentiveProbe(nn.Module):
 
 class LinearProbe(nn.Module):
 
-    def __init__(self, hidden_size: int, out_dim: int):
+    def __init__(
+        self, 
+        hidden_size: int, 
+        out_dim: int, 
+        pos_emb: bool = False, 
+        tokenized_size: Sequence[int] | None = None,
+    ):
         super().__init__()
         self.norm = nn.RMSNorm(hidden_size)
         self.proj = nn.Linear(hidden_size, out_dim)
+        if pos_emb:
+            if tokenized_size is None:
+                raise ValueError("tokenized_size is required when pos_emb is True")
+            self.pos_enc = LearnablePosition(hidden_size, tokenized_size)
+        else:
+            self.pos_enc = None
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.pos_enc is not None:
+            x = x + self.pos_enc(self.pos_enc.spatial_size)
         x = x.mean(dim=1)
         x = self.norm(x)
         return self.proj(x)
+
+
+def create_probe(
+    backbone: ViT,
+    probe_type: Literal["attentive", "linear"],
+    num_classes: int,
+) -> nn.Module:
+    use_probe_pos_emb = backbone.config.pos_emb == "none"
+    tokenized_size = backbone.stem.tokenized_size(backbone.config.img_size)
+    match probe_type:
+        case "attentive":
+            probe = AttentiveProbe(
+                backbone.config.hidden_size, 
+                num_classes, 
+                backbone.config.num_attention_heads,
+                pos_emb=use_probe_pos_emb,
+                tokenized_size=tokenized_size,
+            )
+        case "linear":
+            probe = LinearProbe(
+                backbone.config.hidden_size, 
+                num_classes, 
+                pos_emb=use_probe_pos_emb,
+                tokenized_size=tokenized_size,
+            )
+        case _:
+            raise ValueError(f"Invalid probe type: {probe_type}")
+    return probe
 
 
 @torch.no_grad()
@@ -162,6 +225,34 @@ def get_momentum(step: int, total_steps: int, momentum: float) -> float:
     return momentum + (1 - momentum) * (step / total_steps)
 
 
+@torch.compile
+def compute_koleo_regularizer(x: Tensor, eps: float = 1e-8) -> Tensor:
+    r"""Computes the KoLeo regularizer, which encourages a uniform span of the features
+    within a batch. Used in DinoV2
+
+    Args:
+        x: Feature tensor of shape (B, L, D)
+        eps: Epsilon value for numerical stability
+
+    Returns:
+        KoLeo regularizer tensor of shape (B, B)
+    """
+    B, L, _ = x.shape
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        x = F.normalize(x, p=2, dim=-1, eps=eps)
+        x = x.movedim(1, 0)
+        dots = x @ x.mT
+        dots.view(L, -1)[..., ::(B + 1)].fill_(-1) 
+        _, I = torch.max(dots, dim=-1)  # noqa: E741
+
+        loss = x.new_zeros(1)
+        for i in range(L):
+            distances = F.pairwise_distance(x[i], x[i][I[i]], p=2)
+            loss += -torch.log(distances + eps).mean()
+    return loss.flatten()
+        
+
+
 @dataclass
 class JEPAConfig:
     """
@@ -176,9 +267,6 @@ class JEPAConfig:
             from this value to 1.0 over the course of training.
         predictor_depth: Depth of the predictor network.
         probe_type: Type of probe to use (linear or attentive)
-        context_pos_emb: Whether to introduce positional encoding to the context
-            as part of the predictor network.
-        shared_pos_emb: Whether to use the backbone's positional encoding in the predictor.
     """
 
     context_ratio: float = 0.5
@@ -187,8 +275,6 @@ class JEPAConfig:
     momentum: float = 0.99
     predictor_depth: int = 4
     probe_type: Literal["attentive", "linear"] = "linear"
-    context_pos_emb: bool = False
-    shared_pos_emb: bool = True
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
