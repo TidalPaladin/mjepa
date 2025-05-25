@@ -217,7 +217,7 @@ def train(
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1, eps=1e-5)).mean()
+                jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1)).mean()
                 train_loss.update(jepa_loss)
 
                 # Compute linear probe loss
@@ -265,10 +265,7 @@ def train(
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     teacher_output = cast(Tensor, teacher(img))
                     probe_pred = probe(teacher_output)
-                    mask = is_mixed(
-                        B, augmentation_config.mixup_prob, augmentation_config.mixup_alpha, mixup_seed
-                    ).logical_not_()
-                    val_acc.update(probe_pred[mask], label[mask])
+                    val_acc.update(probe_pred, label)
 
             # Validation epoch end
             rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")

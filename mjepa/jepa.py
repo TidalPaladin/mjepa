@@ -7,7 +7,7 @@ import yaml
 from torch import Tensor
 from vit import ViT
 from vit.attention import AttentivePool
-from vit.pos_enc import LearnablePosition
+from vit.pos_enc import LearnablePosition, LearnableFourierFeatures
 from vit.tokens import apply_mask, generate_non_overlapping_mask
 
 
@@ -41,12 +41,9 @@ class CrossAttentionPredictor(nn.Module):
         self.pos_enc_target = LearnablePosition(
             backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
         )
-        self.pos_enc_context = LearnablePosition(
-            backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
-        )
         self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
         self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
-        nn.init.trunc_normal_(self.query, std=0.02)
+        nn.init.normal_(self.query)
 
         # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for i in range(depth)])
@@ -61,11 +58,10 @@ class CrossAttentionPredictor(nn.Module):
     ) -> Tensor:
         # Create positional encodings
         B, L = target_mask.shape
-        pos_context = apply_mask(context_mask, self.pos_enc_context(tokenized_size).expand(B, -1, -1))
         pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
 
         # Prepare inputs
-        context = self.context_norm(context + pos_context)
+        context = self.context_norm(context)
         query = self.query + pos_target
 
         # Run query and context through predictor
