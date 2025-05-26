@@ -10,19 +10,16 @@ backbone: !!python/object:vit.ViTConfig
   hidden_size: 384
   ffn_hidden_size: 1536
   patch_size: [4, 4]
+  img_size: [32, 32]
   depth: 12
   num_attention_heads: 12
-  activation: "srelu"
+  activation: "swiglu"
   bias: false
   attention_dropout: 0.1
   hidden_dropout: 0.1
   drop_path_rate: 0.1
-  normalization: "RMSNorm"
-  backend: te
-  checkpoint: true
-  num_cls_tokens: 0
   num_register_tokens: 8
-  pos_scale: 0.001
+  pos_emb: "fourier"
 
 augmentations: !!python/object:mjepa.AugmentationConfig
   mixup_prob: 0.2
@@ -37,19 +34,19 @@ augmentations: !!python/object:mjepa.AugmentationConfig
   posterize_bits: 6
 
 jepa: !!python/object:mjepa.JEPAConfig
-  loss_fn: "cosine"
   momentum: 0.99
   predictor_depth: 4
   context_ratio: 0.5
   target_ratio: 0.25
   scale: 2
+  probe_type: "linear"
 
 optimizer: !!python/object:mjepa.OptimizerConfig
-  optimizer: "soap"
+  optimizer: "adamw"
   lr: 0.0005
   weight_decay: 0.05
   betas: [0.85, 0.95]
-  precondition_frequency: 10
+  fused: true
   pct_start: 0.01
   base_momentum: 0.85
   max_momentum: 0.95

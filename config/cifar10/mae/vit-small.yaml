@@ -3,7 +3,6 @@ trainer: !!python/object:mjepa.TrainerConfig
   batch_size: 1024
   num_workers: 24 
   num_epochs: 1500
-  accumulate_grad_batches: 1
   check_val_every_n_epoch: 10
 
 backbone: !!python/object:vit.ViTConfig
@@ -11,45 +10,32 @@ backbone: !!python/object:vit.ViTConfig
   hidden_size: 384
   ffn_hidden_size: 1536
   patch_size: [4, 4]
+  img_size: [32, 32]
   depth: 12
   num_attention_heads: 12
-  activation: "srelu"
+  activation: "swiglu"
   bias: false
   attention_dropout: 0.1
   hidden_dropout: 0.1
   drop_path_rate: 0.1
-  normalization: "RMSNorm"
-  backend: te
-  checkpoint: true
-  num_cls_tokens: 0
   num_register_tokens: 8
+  pos_emb: "fourier"
 
 mae: !!python/object:mjepa.MAEConfig
   predictor_depth: 4
   context_ratio: 0.5
   target_ratio: 0.25
   scale: 2
+  probe_type: linear
 
 optimizer: !!python/object:mjepa.OptimizerConfig
-  optimizer: "soap"
+  optimizer: "adamw"
   lr: 0.0005
   weight_decay: 0.05
   betas: [0.85, 0.95]
-  precondition_frequency: 10
+  fused: true
   pct_start: 0.01
   base_momentum: 0.85
   max_momentum: 0.95
   div_factor: 10
-  final_div_factor: 1000
-  parameter_groups:
-    - params:
-        - "cls_tokens"
-        - "register_tokens"
-        - "bias"
-        - "layer_norm_weight"
-        - "layer_norm_bias"
-      weight_decay: 0.0
-    - params:
-        - "predictor_proj"
-        - "probe"
-      weight_decay: 1.0
+  final_div_factor: 10000
