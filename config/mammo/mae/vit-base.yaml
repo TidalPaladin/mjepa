@@ -17,11 +17,10 @@ backbone: !!python/object:vit.ViTConfig
   attention_dropout: 0.1
   hidden_dropout: 0.1
   drop_path_rate: 0.1
-  normalization: "RMSNorm"
   backend: te
   checkpoint: true
-  num_cls_tokens: 0
   num_register_tokens: 16
+  pos_emb: "fourier"
 
 mae: !!python/object:mjepa.MAEConfig
   predictor_depth: 5
