@@ -1,8 +1,8 @@
 .PHONY: clean clean-env check quality style tag-version test env upload upload-test
 
 PROJECT=mjepa
-QUALITY_DIRS=$(PROJECT) tests trainers
-CLEAN_DIRS=$(PROJECT) tests trainers
+QUALITY_DIRS=$(PROJECT) tests trainers scripts
+CLEAN_DIRS=$(PROJECT) tests trainers scripts
 PYTHON=pdm run python
 
 check: ## run quality checks and unit tests
