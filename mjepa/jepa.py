@@ -7,7 +7,7 @@ import yaml
 from torch import Tensor
 from vit import ViT
 from vit.attention import AttentivePool
-from vit.pos_enc import LearnablePosition, LearnableFourierFeatures
+from vit.pos_enc import LearnablePosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
 
 
@@ -16,9 +16,7 @@ class CrossAttentionPredictor(nn.Module):
     Predicts targets from context embeddings.
 
     The predictor consists of the following components:
-        - A positional encoding layer using relative factorized position encoding with a MLP to
-          initialize the target queries. This is the same as the positional encoding used in the
-          backbone.
+        - Separate learnable position encodings for both context and target embeddings
         - A series of cross-attention layers between the target queries and the context.
         - A linear projection head to create the final output.
 
@@ -41,6 +39,9 @@ class CrossAttentionPredictor(nn.Module):
         self.pos_enc_target = LearnablePosition(
             backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
         )
+        self.pos_enc_context = LearnablePosition(
+            backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
+        )
         self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
         self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
         nn.init.normal_(self.query)
@@ -57,11 +58,13 @@ class CrossAttentionPredictor(nn.Module):
         target_mask: Tensor,
     ) -> Tensor:
         # Create positional encodings
+        # NOTE: Introducing positional encoding to the context seems to be helpful.
         B, L = target_mask.shape
         pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
+        pos_context = apply_mask(context_mask, self.pos_enc_context(tokenized_size).expand(B, -1, -1))
 
         # Prepare inputs
-        context = self.context_norm(context)
+        context = self.context_norm(context + pos_context)
         query = self.query + pos_target
 
         # Run query and context through predictor
@@ -172,9 +175,6 @@ class JEPAConfig:
             from this value to 1.0 over the course of training.
         predictor_depth: Depth of the predictor network.
         probe_type: Type of probe to use (linear or attentive)
-        context_pos_emb: Whether to introduce positional encoding to the context
-            as part of the predictor network.
-        shared_pos_emb: Whether to use the backbone's positional encoding in the predictor.
     """
 
     context_ratio: float = 0.5
@@ -183,8 +183,6 @@ class JEPAConfig:
     momentum: float = 0.99
     predictor_depth: int = 4
     probe_type: Literal["attentive", "linear"] = "linear"
-    context_pos_emb: bool = False
-    shared_pos_emb: bool = True
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
