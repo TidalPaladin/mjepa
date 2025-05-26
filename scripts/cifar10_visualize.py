@@ -1,31 +1,22 @@
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
-from typing import List, Tuple, cast
+from typing import List, cast
 
 import safetensors.torch as st
 import torch
 import torch.nn.functional as F
 import yaml
-from dicom_preprocessing import load_tiff_f32
 from einops import rearrange, reduce
 from torch import Tensor
-from torchvision.transforms.v2.functional import center_crop
+from torchvision.datasets import CIFAR10
+from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 from torchvision.utils import make_grid, save_image
 from vit import ViTConfig
 
 
-def load_image(path: Path, size: Tuple[int, int], crop: bool = False) -> Tensor:
-    if path.suffix.lower() in (".tiff", ".tif"):
-        img = load_tiff_f32(path)
-        img = rearrange(img, "n h w c -> n c h w")
-        img = torch.from_numpy(img)
-        if crop:
-            img = center_crop(img, size)
-        else:
-            img = F.interpolate(img, size=size, mode="bilinear", align_corners=False)
-        return img
-    else:
-        raise NotImplementedError(f"Unsupported image type: {path.suffix}")
+def load_image(dataset: CIFAR10, index: int) -> Tensor:
+    img, _ = dataset[index]
+    return rearrange(img, "c h w -> () c h w")
 
 
 def pca_top3(features: Tensor, offset: int = 0) -> Tensor:
@@ -66,8 +57,8 @@ def pca_top3(features: Tensor, offset: int = 0) -> Tensor:
     projected = projected.reshape(n, h, w, 3)
 
     # Normalize to [0,1] range for each component
-    projected = projected - projected.amin()
-    projected = projected / projected.amax()
+    projected = projected - projected.amin(dim=(1, 2, 3), keepdim=True)[0]
+    projected = projected / projected.amax(dim=(1, 2, 3), keepdim=True)[0]
 
     # Rearrange to NCHW format
     projected = rearrange(projected, "n h w c -> n c h w")
@@ -79,7 +70,7 @@ def parse_args() -> Namespace:
     parser = ArgumentParser(prog="pca-visualize", description="Visualize PCA ViT output features")
     parser.add_argument("config", type=Path, help="Path to model YAML configuration file")
     parser.add_argument("checkpoint", type=Path, help="Path to safetensors checkpoint")
-    parser.add_argument("image", type=Path, nargs="+", help="Path to input image")
+    parser.add_argument("path", type=Path, help="Path to CIFAR10 dataset")
     parser.add_argument("output", type=Path, help="Path to output PNG file")
     parser.add_argument("-d", "--device", default="cpu", help="Device to run the model on")
     parser.add_argument("-s", "--size", type=int, nargs=2, default=(512, 384), help="Image size")
@@ -101,18 +92,18 @@ def main(args: Namespace) -> None:
         raise FileNotFoundError(args.config)
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
-    if len(args.image) == 1 and args.image[0].is_dir():
-        args.image = list(args.image[0].glob("*.tiff"))
-    if not all(image.is_file() for image in args.image):
-        raise FileNotFoundError(args.image)
+    if not args.path.is_dir():
+        raise NotADirectoryError(args.path)
     if not args.output.parent.is_dir():
         raise NotADirectoryError(args.output.parent)
     device = torch.device(args.device)
 
     # Load images
     imgs = []
-    for image in args.image:
-        img = load_image(image, args.size, args.crop)
+    transform = Compose([ToImage(), ToDtype(torch.float32, scale=True)])
+    dataset = CIFAR10(args.path, download=True, train=False, transform=transform)
+    for i in range(4):
+        img = load_image(dataset, i)
         img = img.to(device)
         imgs.append(img)
     img = torch.cat(imgs, dim=0)
