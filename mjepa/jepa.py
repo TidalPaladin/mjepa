@@ -179,13 +179,10 @@ def compute_jepa_loss(pred: Tensor, target: Tensor, eps: float = 1e-8, alpha: fl
     Returns:
         The JEPA loss.
     """
-    loss = 1 - F.cosine_similarity(pred, target, dim=-1, eps=eps)
-    assert alpha >= 0, f"alpha must be non-negative, got {alpha}"
-    if alpha > 0:
-        with torch.no_grad():
-            scale = target.norm(dim=-1, p=2).mul_(-alpha).exp_()
-        loss = loss * scale
-    return loss.mean()
+    sim_loss = 1 - F.cosine_similarity(pred, target, dim=-1, eps=eps).mean()
+    l2_norm = pred.norm(dim=-1, p=2)
+    norm_loss = torch.log(l2_norm + 1).mean()
+    return sim_loss + alpha * norm_loss
 
 
 @dataclass
