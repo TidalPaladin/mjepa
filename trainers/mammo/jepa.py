@@ -8,7 +8,6 @@ import safetensors.torch as st
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import torchmetrics as tm
 import yaml
 from torch import Tensor
@@ -23,7 +22,14 @@ from vit.tokens import apply_mask
 
 from mjepa.augmentation import AugmentationConfig, apply_invert, apply_mixup, apply_noise, apply_posterize
 from mjepa.data import PreprocessedTIFFDataset
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher
+from mjepa.jepa import (
+    CrossAttentionPredictor,
+    JEPAConfig,
+    compute_jepa_loss,
+    generate_masks,
+    get_momentum,
+    update_teacher,
+)
 from mjepa.logging import CSVLogger, SaveImage
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
@@ -159,7 +165,7 @@ def train(
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                loss = (1 - F.cosine_similarity(pred, target, dim=-1)).mean()
+                loss = compute_jepa_loss(pred, target, alpha=jepa_config.decay_alpha)
                 train_loss.update(loss)
                 train_loss_epoch.update(loss)
 

@@ -10,7 +10,6 @@ import safetensors.torch as st
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import torchmetrics as tm
 import yaml
 from torch import Tensor
@@ -50,6 +49,7 @@ from mjepa.jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
     LinearProbe,
+    compute_jepa_loss,
     generate_masks,
     get_momentum,
     update_teacher,
@@ -217,7 +217,7 @@ def train(
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1)).mean()
+                jepa_loss = compute_jepa_loss(pred, target, alpha=jepa_config.decay_alpha)
                 train_loss.update(jepa_loss)
 
                 # Compute linear probe loss

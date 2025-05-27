@@ -3,6 +3,7 @@ from typing import Literal, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from torch import Tensor
 from vit import ViT
@@ -161,6 +162,32 @@ def get_momentum(step: int, total_steps: int, momentum: float) -> float:
     return momentum + (1 - momentum) * (step / total_steps)
 
 
+@torch.compile(fullgraph=True)
+def compute_jepa_loss(pred: Tensor, target: Tensor, eps: float = 1e-8, alpha: float = 0) -> Tensor:
+    r"""Computes the JEPA loss.
+
+    The JEPA loss is a cosine similarity loss with an optional exponential decay term for L2-norm.
+    The exponential decay component is designed to mitigate the effect of high-norm global context tokens
+    that may appear in the absence of register tokens.
+
+    Args:
+        pred: Predicted logits.
+        target: Target logits.
+        eps: Small constant for numerical stability
+        alpha: Weight for exponential decay term for L2-norm
+
+    Returns:
+        The JEPA loss.
+    """
+    loss = 1 - F.cosine_similarity(pred, target, dim=-1, eps=eps)
+    assert alpha >= 0, f"alpha must be non-negative, got {alpha}"
+    if alpha > 0:
+        with torch.no_grad():
+            scale = target.norm(dim=-1, p=2).mul_(-alpha).exp_()
+        loss = loss * scale
+    return loss.mean()
+
+
 @dataclass
 class JEPAConfig:
     """
@@ -175,6 +202,7 @@ class JEPAConfig:
             from this value to 1.0 over the course of training.
         predictor_depth: Depth of the predictor network.
         probe_type: Type of probe to use (linear or attentive)
+        decay_alpha: Weight for exponential decay term for L2-norm
     """
 
     context_ratio: float = 0.5
@@ -183,12 +211,15 @@ class JEPAConfig:
     momentum: float = 0.99
     predictor_depth: int = 4
     probe_type: Literal["attentive", "linear"] = "linear"
+    decay_alpha: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:
             raise ValueError("target_ratio must be in the range (0, 1]")
+        if not 0 <= self.decay_alpha:
+            raise ValueError("decay_alpha must be non-negative")
 
 
 def config_constructor(loader, node):
