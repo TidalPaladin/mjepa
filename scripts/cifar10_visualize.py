@@ -13,6 +13,11 @@ from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 from torchvision.utils import make_grid, save_image
 from vit import ViTConfig
 
+from mjepa.jepa import register_constructors
+
+
+register_constructors()
+
 
 def load_image(dataset: CIFAR10, index: int) -> Tensor:
     img, _ = dataset[index]
