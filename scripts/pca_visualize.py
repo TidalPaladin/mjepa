@@ -13,6 +13,11 @@ from torchvision.transforms.v2.functional import center_crop
 from torchvision.utils import make_grid, save_image
 from vit import ViTConfig
 
+from mjepa.jepa import register_constructors
+
+
+register_constructors()
+
 
 def load_image(path: Path, size: Tuple[int, int], crop: bool = False) -> Tensor:
     if path.suffix.lower() in (".tiff", ".tif"):
@@ -86,6 +91,7 @@ def parse_args() -> Namespace:
     parser.add_argument("-c", "--crop", action="store_true", help="Crop image to model input size instead of resizing")
     parser.add_argument("-o", "--offset", type=int, default=0, help="Offset of the principal components to visualize")
     parser.add_argument("-r", "--raw", action="store_true", help="Do not apply PCA, visualize raw features")
+    parser.add_argument("-i", "--invert", action="store_true", help="Also process an inverted image")
     parser.add_argument(
         "-n",
         "--num-components",
@@ -115,6 +121,8 @@ def main(args: Namespace) -> None:
         img = load_image(image, args.size, args.crop)
         img = img.to(device)
         imgs.append(img)
+        if args.invert:
+            imgs.append(1 - img)
     img = torch.cat(imgs, dim=0)
 
     # Load model and move to device
@@ -135,7 +143,6 @@ def main(args: Namespace) -> None:
     features = features.to(torch.float32)
     Ht, Wt = model.stem.tokenized_size((H, W))
     features = rearrange(features, "n (ht wt) d -> n ht wt d", ht=Ht, wt=Wt)
-    features = F.layer_norm(features, features.shape[-1:])
 
     # Compute PCA and scale to [0,255] range
     pca_tensors: List[Tensor] = []
