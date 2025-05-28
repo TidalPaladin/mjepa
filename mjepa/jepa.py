@@ -36,18 +36,14 @@ class CrossAttentionPredictor(nn.Module):
     ):
         super().__init__()
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
-        self.pos_enc_target = LearnablePosition(
-            backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
-        )
-        self.pos_enc_context = LearnablePosition(
-            backbone.config.hidden_size, spatial_size, dropout=backbone.config.hidden_dropout
-        )
+        self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
+        self.pos_enc_context = LearnablePosition(backbone.config.hidden_size, spatial_size)
         self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
         self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
         nn.init.normal_(self.query)
 
         # Predictor blocks and output projection
-        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for i in range(depth)])
+        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for _ in range(depth)])
         self.predictor_proj = nn.Linear(backbone.config.hidden_size, out_dim or backbone.config.hidden_size)
 
     def forward(
@@ -62,6 +58,16 @@ class CrossAttentionPredictor(nn.Module):
         B, L = target_mask.shape
         pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
         pos_context = apply_mask(context_mask, self.pos_enc_context(tokenized_size).expand(B, -1, -1))
+
+        # Pad pos_context to account for leading register tokens
+        Lpos = pos_context.shape[1]
+        Lcontext = context.shape[1]
+        if Lpos != Lcontext:
+            padding = pos_context.new_zeros(B, Lcontext - Lpos, pos_context.shape[-1])
+            pos_context = torch.cat([padding, pos_context], dim=1)
+        assert (
+            pos_context.shape == context.shape
+        ), f"pos_context.shape: {pos_context.shape}, context.shape: {context.shape}"
 
         # Prepare inputs
         context = self.context_norm(context + pos_context)
