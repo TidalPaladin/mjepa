@@ -1213,10 +1213,10 @@ files = [
 
 [[package]]
 name = "vit"
-version = "0.1.dev35"
+version = "0.1.dev36"
 requires_python = ">=3.10"
 git = "https://github.com/TidalPaladin/vit.git"
-revision = "23c9e61e072ab6b752f396560f10fdf2b2e058c0"
+revision = "c5418a8fd9b62a9320bc4f43b62cc56ba0e45bb7"
 summary = ""
 dependencies = [
     "numpy",

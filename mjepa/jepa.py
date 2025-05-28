@@ -39,7 +39,9 @@ class CrossAttentionPredictor(nn.Module):
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
         self.pos_enc_context = LearnablePosition(backbone.config.hidden_size, spatial_size)
         self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
-        self.context_norm = nn.RMSNorm(backbone.config.hidden_size)
+        self.context_norm = (
+            nn.RMSNorm(backbone.config.hidden_size) if not backbone.config.output_norm else nn.Identity()
+        )
         nn.init.normal_(self.query)
 
         # Predictor blocks and output projection
