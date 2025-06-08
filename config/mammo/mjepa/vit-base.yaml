@@ -1,0 +1,54 @@
+# Config for training ViT-B/16 using MJEPA on mammography.
+trainer: !!python/object:mjepa.TrainerConfig
+  batch_size: 64
+  num_workers: 24 
+  num_epochs: 500
+  accumulate_grad_batches: 8
+
+backbone: !!python/object:vit.ViTConfig
+  in_channels: 1
+  hidden_size: 768
+  ffn_hidden_size: 3072
+  patch_size: [16, 16]
+  img_size: [512, 384]
+  depth: 12
+  num_attention_heads: 12
+  activation: "swiglu"
+  bias: false
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
+  drop_path_rate: 0.1
+  num_register_tokens: 16
+  pos_emb: "fourier"
+
+augmentations: !!python/object:mjepa.AugmentationConfig
+  mixup_prob: 0.1
+  mixup_alpha: 1.0
+  use_noise: true
+  noise_prob: 0.1
+  noise_clip: true
+  invert_prob: 0.5
+  solarize_prob: 0.1
+  solarize_threshold: 0.5
+  posterize_prob: 0.1
+  posterize_bits: 6
+
+jepa: !!python/object:mjepa.JEPAConfig
+  momentum: 0.99
+  predictor_depth: 5
+  context_ratio: 0.5
+  target_ratio: 0.25
+  scale: 4
+  probe_type: "linear"
+
+optimizer: !!python/object:mjepa.OptimizerConfig
+  optimizer: "adamw"
+  lr: 0.0005
+  weight_decay: 0.05
+  betas: [0.85, 0.95]
+  fused: true
+  pct_start: 0.01
+  base_momentum: 0.85
+  max_momentum: 0.95
+  div_factor: 10
+  final_div_factor: 10000
