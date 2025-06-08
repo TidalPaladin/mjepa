@@ -5,6 +5,7 @@ from typing import cast
 import matplotlib.pyplot as plt
 import safetensors.torch as st
 import torch
+import torch.nn as nn
 import yaml
 from einops import rearrange
 from torch import Tensor
@@ -31,6 +32,7 @@ def parse_args() -> Namespace:
     parser.add_argument("output", type=Path, help="Path to output plot")
     parser.add_argument("-d", "--device", default="cpu", help="Device to run the model on")
     parser.add_argument("-s", "--size", type=int, nargs=2, default=(512, 384), help="Image size")
+    parser.add_argument("-p", "--pre-norm", action="store_true", help="Use pre-norm outputs (for ViT with output norm)")
     return parser.parse_args()
 
 
@@ -65,6 +67,10 @@ def main(args: Namespace) -> None:
     # Load checkpoint
     state_dict = st.load_file(args.checkpoint)
     model.load_state_dict(state_dict)
+
+    # Replace output norm with identity if needed
+    if args.pre_norm:
+        model.output_norm = nn.Identity()
 
     # Run forward pass
     H, W = img.shape[-2:]
