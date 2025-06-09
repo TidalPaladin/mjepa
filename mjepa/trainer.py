@@ -6,11 +6,8 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from shutil import copyfile
-from typing import Callable, Tuple, overload, Sequence, Literal
+from typing import Callable, Literal, Sequence, Tuple, overload
 from warnings import filterwarnings
-from vit.pos_enc import LearnablePosition
-from vit import ViT
-from .jepa import CrossAttentionPredictor
 
 import numpy as np
 import torch
@@ -22,6 +19,10 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from vit import ViT
+from vit.pos_enc import LearnablePosition
+
+from .jepa import CrossAttentionPredictor
 
 
 def seed_everything(seed: int) -> None:
@@ -180,7 +181,7 @@ def resize_learnable_pos_enc(model: nn.Module, tokenized_size: Sequence[int]) ->
     for name, module in model.named_modules():
         if isinstance(module, LearnablePosition):
             try:
-                module.expand_positions(tokenized_size)
+                module.expand_positions(tokenized_size) # type: ignore
                 module.spatial_size = tokenized_size
                 rank_zero_info(f"Expanded positional encodings for {name} to {tokenized_size}")
             except ValueError:
@@ -241,9 +242,9 @@ def load_checkpoint(
         resize_learnable_pos_enc(predictor, new_tokenized_size)
     if teacher:
         pass
-        #resize_learnable_pos_enc(teacher, old_tokenized_size)
-        #teacher.load_state_dict(data["teacher"], strict=strict)
-        #resize_learnable_pos_enc(teacher, new_tokenized_size)
+        # resize_learnable_pos_enc(teacher, old_tokenized_size)
+        # teacher.load_state_dict(data["teacher"], strict=strict)
+        # resize_learnable_pos_enc(teacher, new_tokenized_size)
 
     # Load optimizer and scheduler if resuming.
     if mode == "resume":

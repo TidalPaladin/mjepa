@@ -6,7 +6,6 @@ import torch.nn as nn
 import yaml
 from torch import Tensor
 from vit import ViT
-from vit.attention import AttentivePool
 from vit.pos_enc import LearnablePosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
 

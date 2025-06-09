@@ -35,7 +35,7 @@ from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
-from mjepa.jepa import AttentiveProbe, CrossAttentionPredictor, generate_masks
+from mjepa.jepa import CrossAttentionPredictor, generate_masks
 from mjepa.mae import MAEConfig
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
@@ -149,10 +149,8 @@ def train(
     optimizer.zero_grad()
     backbone: ViT = modules["backbone"]
     predictor: CrossAttentionPredictor = modules["predictor"]
-    probe: nn.Module = modules["probe"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
-    rank_zero_info(f"Probe params: {format_large_number(count_parameters(probe))}")
 
     microbatch = (last_epoch + 1) * len(train_dataloader)
     step = microbatch // trainer_config.accumulate_grad_batches
@@ -198,7 +196,7 @@ def train(
                 train_loss.update(mae_loss)
 
                 # Compute linear probe loss
-                probe_pred = probe(context.detach())
+                probe_pred = backbone.heads["cls"](context.detach())
                 probe_loss = F.cross_entropy(probe_pred, label)
 
                 # Combine losses
@@ -233,7 +231,7 @@ def train(
                 label = label.cuda()
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     full_output = cast(Tensor, backbone(img))
-                    probe_pred = probe(full_output)
+                    probe_pred = backbone.heads["cls"](full_output)
                     val_acc.update(probe_pred, label)
 
             # Validation epoch end
@@ -245,7 +243,7 @@ def train(
                 path=log_dir / f"checkpoint.pt",
                 backbone=backbone,
                 predictor=predictor,
-                probe=probe,
+                teacher=None,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 step=step,
@@ -309,8 +307,7 @@ def main(args: Namespace) -> None:
     backbone = backbone_config.instantiate()
     out_dim = math.prod(backbone.config.patch_size) * backbone.config.in_channels
     predictor = CrossAttentionPredictor(backbone, mae_config.predictor_depth, out_dim)
-    probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
-    wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
+    wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor}).cuda()
     nn.init.constant_(predictor.predictor_proj.bias, 0.5)
 
     # Wrap in DDP for distributed training
