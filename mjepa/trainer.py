@@ -6,8 +6,11 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from shutil import copyfile
-from typing import Callable, Tuple, overload
+from typing import Callable, Tuple, overload, Sequence, Literal
 from warnings import filterwarnings
+from vit.pos_enc import LearnablePosition
+from vit import ViT
+from .jepa import CrossAttentionPredictor
 
 import numpy as np
 import torch
@@ -134,9 +137,9 @@ def rank_zero_info(message: str, tqdm_safe: bool = True) -> None:
 @rank_zero_only
 def save_checkpoint(
     path: os.PathLike,
-    backbone: nn.Module | None,
-    predictor: nn.Module | None,
-    probe: nn.Module | None,
+    backbone: ViT,
+    predictor: CrossAttentionPredictor | None,
+    teacher: ViT | None,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     step: int,
@@ -150,11 +153,12 @@ def save_checkpoint(
         path: Path to save the checkpoint.
         backbone: Backbone model or ``None`` if not present.
         predictor: Predictor model or ``None`` if not present.
-        probe: Probe model or ``None`` if not present.
+        teacher: Teacher model or ``None`` if not present.
         optimizer: Optimizer.
         scheduler: Scheduler.
         step: Current step.
         epoch: Current epoch.
+        img_size: Image size used during training.
     """
     path = Path(path)
     if not path.parent.is_dir():
@@ -162,23 +166,37 @@ def save_checkpoint(
     data = dict(
         backbone=backbone.state_dict() if backbone else None,
         predictor=predictor.state_dict() if predictor else None,
-        probe=probe.state_dict() if probe else None,
+        teacher=teacher.state_dict() if teacher else None,
         optimizer=optimizer.state_dict(),
         scheduler=scheduler.state_dict(),
         step=step,
         epoch=epoch,
+        img_size=backbone.config.img_size if hasattr(backbone.config, "img_size") else None,
     )
     torch.save(data, path)
 
 
+def resize_learnable_pos_enc(model: nn.Module, tokenized_size: Sequence[int]) -> None:
+    for name, module in model.named_modules():
+        if isinstance(module, LearnablePosition):
+            try:
+                module.expand_positions(tokenized_size)
+                module.spatial_size = tokenized_size
+                rank_zero_info(f"Expanded positional encodings for {name} to {tokenized_size}")
+            except ValueError:
+                rank_zero_info(f"Could not expand positional encodings for {name} to {tokenized_size}")
+                raise
+
+
 def load_checkpoint(
     path: os.PathLike,
-    backbone: nn.Module | None,
-    predictor: nn.Module | None,
-    probe: nn.Module | None,
+    backbone: ViT,
+    predictor: CrossAttentionPredictor | None,
+    teacher: ViT | None,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     strict: bool = True,
+    mode: Literal["resume", "fresh"] = "resume",
 ) -> Tuple[int, int]:
     r"""Load a checkpoint.
 
@@ -186,26 +204,52 @@ def load_checkpoint(
 
     Args:
         path: Path to load the checkpoint.
+        img_size: Image size currently used for training.
         backbone: Backbone model or ``None`` if not present.
         predictor: Predictor model or ``None`` if not present.
+        teacher: Teacher model or ``None`` if not present.
         probe: Probe model or ``None`` if not present.
         optimizer: Optimizer.
         scheduler: Scheduler.
         strict: If ``True``, raise an error if any keys are missing in the checkpoint.
+        mode: Whether to resume training from a checkpoint or start a fresh run using only the loaded weights.
 
     Returns:
-        Tuple of current step and epoch.
+        Tuple of current step, epoch.
     """
     data = torch.load(path)
+    old_img_size = (256, 256)
+    old_tokenized_size = backbone.stem.tokenized_size(old_img_size)
+    new_tokenized_size = backbone.stem.tokenized_size(backbone.config.img_size)
+    step = int(data["step"])
+    epoch = int(data["epoch"])
+
+    # Validate image size
+    if mode == "resume" and old_img_size != backbone.config.img_size:
+        raise ValueError(f"Image size mismatch on resume: {old_img_size} != {backbone.config.img_size}")
+
+    # Load weights, resizing positional encodings if necessary.
+    # Positional encodings are first resized to match the old checkpoint, then weights are loaded,
+    # then resized again to match the new checkpoint.
     if backbone:
+        resize_learnable_pos_enc(backbone, old_tokenized_size)
         backbone.load_state_dict(data["backbone"], strict=strict)
+        resize_learnable_pos_enc(backbone, new_tokenized_size)
     if predictor:
+        resize_learnable_pos_enc(predictor, old_tokenized_size)
         predictor.load_state_dict(data["predictor"], strict=strict)
-    if probe:
-        probe.load_state_dict(data["probe"], strict=strict)
-    optimizer.load_state_dict(data["optimizer"])
-    scheduler.load_state_dict(data["scheduler"])
-    return data["step"], data["epoch"]
+        resize_learnable_pos_enc(predictor, new_tokenized_size)
+    if teacher:
+        pass
+        #resize_learnable_pos_enc(teacher, old_tokenized_size)
+        #teacher.load_state_dict(data["teacher"], strict=strict)
+        #resize_learnable_pos_enc(teacher, new_tokenized_size)
+
+    # Load optimizer and scheduler if resuming.
+    if mode == "resume":
+        optimizer.load_state_dict(data["optimizer"])
+        scheduler.load_state_dict(data["scheduler"])
+    return step, epoch
 
 
 @overload
