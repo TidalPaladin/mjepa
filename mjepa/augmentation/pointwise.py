@@ -103,7 +103,7 @@ def apply_mixup(
         )
         torch.cuda.nvtx.range_pop()
     else:
-        mixup_seed = None
+        mixup_seed = 0
     return mixup_seed, tuple(tensors)
 
 

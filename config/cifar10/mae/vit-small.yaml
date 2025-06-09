@@ -20,13 +20,18 @@ backbone: !!python/object:vit.ViTConfig
   drop_path_rate: 0.1
   num_register_tokens: 8
   pos_emb: "fourier"
+  output_norm: true
+  heads:
+    cls: !!python/object:vit.HeadConfig
+      head_type: "linear"
+      pool_type: "avg"
+      out_dim: 10
 
 mae: !!python/object:mjepa.MAEConfig
   predictor_depth: 4
   context_ratio: 0.5
   target_ratio: 0.25
   scale: 2
-  probe_type: linear
 
 optimizer: !!python/object:mjepa.OptimizerConfig
   optimizer: "adamw"

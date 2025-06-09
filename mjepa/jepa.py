@@ -6,7 +6,6 @@ import torch.nn as nn
 import yaml
 from torch import Tensor
 from vit import ViT
-from vit.attention import AttentivePool
 from vit.pos_enc import LearnablePosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
 
@@ -80,33 +79,6 @@ class CrossAttentionPredictor(nn.Module):
             query = block(query, context)
 
         return self.predictor_proj(query)
-
-
-class AttentiveProbe(nn.Module):
-
-    def __init__(self, hidden_size: int, out_dim: int, num_attention_heads: int):
-        super().__init__()
-        self.norm = nn.RMSNorm(hidden_size)
-        self.pool = AttentivePool(hidden_size, num_attention_heads)
-        self.proj = nn.Linear(hidden_size, out_dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.norm(x)
-        x = self.pool(x)
-        return self.proj(x)
-
-
-class LinearProbe(nn.Module):
-
-    def __init__(self, hidden_size: int, out_dim: int):
-        super().__init__()
-        self.norm = nn.RMSNorm(hidden_size)
-        self.proj = nn.Linear(hidden_size, out_dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = x.mean(dim=1)
-        x = self.norm(x)
-        return self.proj(x)
 
 
 @torch.no_grad()

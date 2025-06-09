@@ -45,15 +45,7 @@ from mjepa.augmentation import (
     cross_entropy_mixup,
     is_mixed,
 )
-from mjepa.jepa import (
-    AttentiveProbe,
-    CrossAttentionPredictor,
-    JEPAConfig,
-    LinearProbe,
-    generate_masks,
-    get_momentum,
-    update_teacher,
-)
+from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
     TrainerConfig,
@@ -155,12 +147,8 @@ def train(
     optimizer.zero_grad()
     backbone: ViT = modules["backbone"]
     predictor: CrossAttentionPredictor = modules["predictor"]
-    probe: nn.Module = modules["probe"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
-    rank_zero_info(
-        f"{jepa_config.probe_type.capitalize()} probe params: {format_large_number(count_parameters(probe))}"
-    )
 
     # Teacher setup
     teacher = deepcopy(backbone)
@@ -221,7 +209,7 @@ def train(
                 train_loss.update(jepa_loss)
 
                 # Compute linear probe loss
-                probe_pred = probe(teacher_output)
+                probe_pred = backbone.heads["cls"](teacher_output)
                 probe_loss = cross_entropy_mixup(
                     probe_pred, label, mixup_seed, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
                 ).mean()
@@ -264,7 +252,7 @@ def train(
                 label = label.cuda()
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     teacher_output = cast(Tensor, teacher(img))
-                    probe_pred = probe(teacher_output)
+                    probe_pred = backbone.heads["cls"](teacher_output)
                     val_acc.update(probe_pred, label)
 
             # Validation epoch end
@@ -280,7 +268,7 @@ def train(
                 path=log_dir / f"checkpoint.pt",
                 backbone=backbone,
                 predictor=predictor,
-                probe=probe,
+                teacher=teacher,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 step=step,
@@ -346,14 +334,7 @@ def main(args: Namespace) -> None:
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
     predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
-    match jepa_config.probe_type:
-        case "attentive":
-            probe = AttentiveProbe(backbone.config.hidden_size, NUM_CLASSES, backbone.config.num_attention_heads)
-        case "linear":
-            probe = LinearProbe(backbone.config.hidden_size, NUM_CLASSES)
-        case _:
-            raise ValueError(f"Invalid probe type: {jepa_config.probe_type}")
-    wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor, "probe": probe}).cuda()
+    wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor}).cuda()
 
     # Wrap in DDP for distributed training
     if world_size > 1:
