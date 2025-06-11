@@ -1,7 +1,9 @@
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
+from time import time
 from typing import List, Tuple, cast
 
+import matplotlib.pyplot as plt
 import safetensors.torch as st
 import torch
 import torch.nn.functional as F
@@ -33,11 +35,13 @@ def load_image(path: Path, size: Tuple[int, int], crop: bool = False) -> Tensor:
         raise NotImplementedError(f"Unsupported image type: {path.suffix}")
 
 
-def pca_top3(features: Tensor, offset: int = 0) -> Tensor:
+def pca_topk(features: Tensor, offset: int = 0, k: int = 3) -> Tensor:
     r"""Find the top 3 principal components of the features and return the corresponding RGB image.
 
     Args:
         features: Input features
+        offset: Offset of the principal components to visualize
+        k: Number of principal components to visualize
 
     Shapes:
         - features: :math:`(n, h, w, d)`
@@ -62,13 +66,13 @@ def pca_top3(features: Tensor, offset: int = 0) -> Tensor:
     cov = features_2d.T @ features_2d / (features_2d.shape[0] - 1)
     eigenvalues, eigenvectors = torch.linalg.eigh(cov)
 
-    # Get top 3 principal components
-    top3_indices: Tensor = torch.argsort(eigenvalues, descending=True)[offset : offset + 3]
-    top3_components: Tensor = eigenvectors[:, top3_indices]
+    # Get top k principal components
+    topk_indices: Tensor = torch.argsort(eigenvalues, descending=True)[offset : offset + k]
+    topk_components: Tensor = eigenvectors[:, topk_indices]
 
-    # Project features onto top 3 components
-    projected = features_2d @ top3_components
-    projected = projected.reshape(n, h, w, 3)
+    # Project features onto top k components
+    projected = features_2d @ topk_components
+    projected = projected.reshape(n, h, w, k)
 
     # Normalize to [0,1] range for each component
     projected = projected - projected.amin()
@@ -92,6 +96,10 @@ def parse_args() -> Namespace:
     parser.add_argument("-o", "--offset", type=int, default=0, help="Offset of the principal components to visualize")
     parser.add_argument("-r", "--raw", action="store_true", help="Do not apply PCA, visualize raw features")
     parser.add_argument("-i", "--invert", action="store_true", help="Also process an inverted image")
+    parser.add_argument("-z", "--zero", action="store_true", help="Also process an all-zero image")
+    parser.add_argument(
+        "-m", "--mode", choices=["rgb", "single"], default="rgb", help="Mode to visualize the principal components"
+    )
     parser.add_argument(
         "-n",
         "--num-components",
@@ -123,6 +131,8 @@ def main(args: Namespace) -> None:
         imgs.append(img)
         if args.invert:
             imgs.append(1 - img)
+    if args.zero:
+        imgs.append(torch.zeros_like(imgs[0]))
     img = torch.cat(imgs, dim=0)
 
     # Load model and move to device
@@ -130,6 +140,7 @@ def main(args: Namespace) -> None:
     assert isinstance(config, ViTConfig)
     model = config.instantiate()
     model = model.to(device)
+    model.requires_grad_(False)
     model.eval()
 
     # Load checkpoint
@@ -138,22 +149,33 @@ def main(args: Namespace) -> None:
 
     # Run forward pass
     H, W = img.shape[-2:]
-    with torch.autocast(device.type, dtype=torch.bfloat16):
+    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"), torch.inference_mode():
+        start = time()
         features = cast(Tensor, model(img))
+        end = time()
+        torch.cuda.synchronize()
+        print(f"Forward pass took {end - start:.2f} seconds")
     features = features.to(torch.float32)
     Ht, Wt = model.stem.tokenized_size((H, W))
     features = rearrange(features, "n (ht wt) d -> n ht wt d", ht=Ht, wt=Wt)
 
     # Compute PCA and scale to [0,255] range
     pca_tensors: List[Tensor] = []
+    k = 3 if args.mode == "rgb" else 1
     for i in range(args.num_components):
         if args.raw:
             pca: Tensor = rearrange(
-                features[..., args.offset + i * 3 : args.offset + (i + 1) * 3], "n h w c -> n c h w"
+                features[..., args.offset + i * k : args.offset + (i + 1) * k], "n h w c -> n c h w"
             )
         else:
-            pca: Tensor = pca_top3(features, args.offset + i * 3)
+            pca: Tensor = pca_topk(features, args.offset + i * k, k=k)
         pca = F.interpolate(pca, size=(H, W), mode="nearest")
+
+        # Apply colormap when k=1
+        if k == 1:
+            pca = torch.from_numpy(plt.cm.inferno(pca.squeeze().cpu())[..., :3])
+            pca = rearrange(pca, "n h w c -> n c h w").to(device)
+
         pca_tensors.append(pca)
     pca = torch.cat(pca_tensors, dim=-1)
 
