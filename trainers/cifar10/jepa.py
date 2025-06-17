@@ -200,7 +200,7 @@ def train(
                 context_mask, target_mask = generate_masks(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
                 )
-                context = cast(Tensor, backbone(img, mask=context_mask, return_register_tokens=True))
+                context = cast(Tensor, backbone(img, mask=context_mask))
                 pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
 
                 # Compute JEPA loss
