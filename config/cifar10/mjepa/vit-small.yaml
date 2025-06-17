@@ -19,8 +19,6 @@ backbone: !!python/object:vit.ViTConfig
   hidden_dropout: 0.1
   drop_path_rate: 0.1
   num_register_tokens: 8
-  pos_emb: "fourier"
-  output_norm: true
   heads:
     cls: !!python/object:vit.HeadConfig
       head_type: "linear"
@@ -45,7 +43,6 @@ jepa: !!python/object:mjepa.JEPAConfig
   context_ratio: 0.5
   target_ratio: 0.25
   scale: 2
-  probe_type: "linear"
 
 optimizer: !!python/object:mjepa.OptimizerConfig
   optimizer: "adamw"

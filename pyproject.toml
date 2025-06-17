@@ -33,8 +33,6 @@ name = "PyTorch"
 url = "https://download.pytorch.org/whl/cu128"
 include_packages = ["torch", "torchvision"]
 
-[project.optional-dependencies]
-
 [tool.autoflake]
 remove-all-unused-imports = true
 remove-unused-variables = true

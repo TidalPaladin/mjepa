@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -34,14 +34,15 @@ class CrossAttentionPredictor(nn.Module):
         out_dim: int | None = None,
     ):
         super().__init__()
+        # NOTE: This specific setup seems very important to high CIFAR-10 probe performance.
+        # Changes should be made with care.
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
         self.pos_enc_context = LearnablePosition(backbone.config.hidden_size, spatial_size)
         self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
-        self.context_norm = (
-            nn.RMSNorm(backbone.config.hidden_size) if not backbone.config.output_norm else nn.Identity()
-        )
         nn.init.normal_(self.query)
+        nn.init.trunc_normal_(self.pos_enc_target.positions, std=0.02)
+        nn.init.trunc_normal_(self.pos_enc_context.positions, std=0.02)
 
         # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for _ in range(depth)])
@@ -71,7 +72,7 @@ class CrossAttentionPredictor(nn.Module):
         ), f"pos_context.shape: {pos_context.shape}, context.shape: {context.shape}"
 
         # Prepare inputs
-        context = self.context_norm(context + pos_context)
+        context = context + pos_context
         query = self.query + pos_target
 
         # Run query and context through predictor
@@ -154,7 +155,6 @@ class JEPAConfig:
         momentum: The base momentum for the EMA update. Momentum will be linearly annealed
             from this value to 1.0 over the course of training.
         predictor_depth: Depth of the predictor network.
-        probe_type: Type of probe to use (linear or attentive)
     """
 
     context_ratio: float = 0.5
@@ -162,7 +162,6 @@ class JEPAConfig:
     scale: int = 4
     momentum: float = 0.99
     predictor_depth: int = 4
-    probe_type: Literal["attentive", "linear"] = "linear"
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:

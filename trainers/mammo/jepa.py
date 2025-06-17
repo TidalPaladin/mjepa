@@ -191,7 +191,7 @@ def train(
                 path=log_dir / f"checkpoint.pt",
                 backbone=backbone,
                 predictor=predictor,
-                probe=None,
+                teacher=teacher,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 step=step,
