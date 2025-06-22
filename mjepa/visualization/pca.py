@@ -62,8 +62,8 @@ def pca_topk(features: Tensor, offset: int = 0, k: int = 3) -> Tensor:
     projected = projected.reshape(n, h, w, k)
 
     # Normalize to [0,1] range for each component
-    projected = projected - projected.amin()
-    projected = projected / projected.amax()
+    projected = projected - projected.amin(dim=(0, 1, 2), keepdim=True)
+    projected = projected / projected.amax(dim=(0, 1, 2), keepdim=True)
 
     return projected.float()
 
