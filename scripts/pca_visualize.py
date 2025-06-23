@@ -16,7 +16,7 @@ def main(args: Namespace) -> None:
     # Load images
     imgs = []
     for image in args.input:
-        img = load_image(image, visualizer.base_img_size)
+        img = load_image(image, visualizer.size)
         imgs.append(img)
     img = torch.cat(imgs, dim=0)
 
