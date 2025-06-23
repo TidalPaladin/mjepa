@@ -1,7 +1,7 @@
 from argparse import Action, ArgumentParser, Namespace
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Self, Sequence, Tuple, Type, cast
+from typing import Any, List, Optional, Self, Sequence, Type, cast
 
 import matplotlib.pyplot as plt
 import safetensors.torch as st
@@ -11,7 +11,7 @@ import yaml
 from dicom_preprocessing import load_tiff_f32
 from einops import rearrange, reduce
 from torch import Tensor
-from torchvision.transforms.v2.functional import resized_crop, to_pil_image
+from torchvision.transforms.v2.functional import to_pil_image
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from vit import ViT, ViTConfig
@@ -140,23 +140,15 @@ class PCAVisualizer:
     dtype: torch.dtype = torch.float32
     invert: bool = False
     zero: bool = False
-    zoom_steps: int | None = None
-    zoom_factor: float = 2.0
+    size: Sequence[int] | None = None
+    animate: bool = False
 
     def __post_init__(self) -> None:
-        if self.zoom_factor < 1.0:
-            raise ValueError("Zoom factor must be greater than 1.0")
+        if self.size is None:
+            self.size = self.model.config.img_size
         self.model = self.model.to(self.device)
         self.model.requires_grad_(False)
         self.model.eval()
-
-    @property
-    def backbone_img_size(self) -> Tuple[int, int]:
-        return self.model.config.img_size
-
-    @property
-    def base_img_size(self) -> Tuple[int, int]:
-        return tuple(int(s * self.zoom_factor) for s in self.backbone_img_size)
 
     @torch.inference_mode()
     def _forward_features(self, img: Tensor) -> Tensor:
@@ -207,44 +199,27 @@ class PCAVisualizer:
         if self.zero:
             img = self._append_zero_img(img)
         img = img.to(self.device)
+        img = F.interpolate(img, size=self.size, mode="bilinear", align_corners=False)
 
-        # No zoom animation, run a single forward pass and visualize
-        if self.zoom_steps is None:
-            img = F.interpolate(img, size=self.model.config.img_size, mode="bilinear", align_corners=False)
+        if self.animate:
+            feature_list: List[Tensor] = []
+            for _img in tqdm(img, desc="Animating"):
+                # Compute zoom window boundaries that shrink towards center
+                features = self._forward_features(_img[None])
+                feature_list.append(features)
+
+            pca = self._compute_pca(torch.cat(feature_list, dim=0), self.backbone_img_size).chunk(img.shape[0], dim=0)
+            grids: List[Tensor] = [self._create_grid(i[None], p) for i, p in zip(img, pca)]
+            return torch.stack(grids, dim=0)
+        else:
             features = self._forward_features(img)
             pca = self._compute_pca(features, img.shape[-2:])
-            # pca = torch.stack([self._compute_pca(features[i, None], img[i, None].shape[-2:]) for i in range(features.shape[0])], dim=0)
             grid = self._create_grid(img, pca)
             return grid
 
-        else:
-            zoomed_imgs: List[Tensor] = []
-            feature_list: List[Tensor] = []
-            for factor in tqdm(torch.linspace(1.0, self.zoom_factor, self.zoom_steps), desc="Zooming"):
-                # Compute zoom window boundaries that shrink towards center
-                h, w = img.shape[-2:]
-                center_h, center_w = h // 2, w // 2
-                window_h = int(h / factor)
-                window_w = int(w / factor)
-                top = center_h - window_h // 2
-                left = center_w - window_w // 2
-
-                img_zoomed = resized_crop(img, top, left, window_h, window_w, self.model.config.img_size)
-                features = self._forward_features(img_zoomed)
-                feature_list.append(features)
-                zoomed_imgs.append(img_zoomed)
-
-            pca = self._compute_pca(torch.cat(feature_list, dim=0), self.backbone_img_size).chunk(
-                self.zoom_steps, dim=0
-            )
-            grids: List[Tensor] = [self._create_grid(i, p) for i, p in zip(zoomed_imgs, pca)]
-            return torch.stack(grids, dim=0)
-
     @torch.inference_mode()
     def save(self, grid: Tensor, output: Path) -> None:
-        if self.zoom_steps is None:
-            save_image(grid, output)
-        else:
+        if self.animate:
             # Convert to uint8 and convert to PIL images
             grid = grid.mul(255).clip_(0, 255).to(torch.uint8).cpu()
             frames = [to_pil_image(frame) for frame in grid]
@@ -252,6 +227,8 @@ class PCAVisualizer:
             # Save as animated GIF using PIL
             output = output.with_suffix(".gif")
             frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0)
+        else:
+            save_image(grid, output)
 
     @classmethod
     def create_parser(cls: Type[Self], custom_loader: bool = False) -> ArgumentParser:
@@ -266,6 +243,17 @@ class PCAVisualizer:
             help="Path to input image(s) or directory containing .tiff files",
         )
         parser.add_argument("output", type=output_path_type, help="Path to output PNG file")
+        parser.add_argument(
+            "-s",
+            "--size",
+            type=int,
+            nargs=2,
+            default=None,
+            help="Size of the input image. By default size is inferred from the model configuration.",
+        )
+        parser.add_argument(
+            "-a", "--animate", action="store_true", help="Treat each image as a separate animation frame"
+        )
         parser.add_argument("-d", "--device", default="cpu", type=torch.device, help="Device to run the model on")
         parser.add_argument(
             "-o", "--offset", type=int, default=0, help="Offset of the principal components to visualize"
@@ -282,8 +270,6 @@ class PCAVisualizer:
             default=1,
             help="Number of principal component groups to visualize",
         )
-        parser.add_argument("--zoom-factor", type=float, default=2.0, help="Zoom factor for the animation")
-        parser.add_argument("--zoom-steps", type=int, help="Number of steps for the animation (if animating)")
         parser.add_argument(
             "-dt", "--dtype", default="fp32", type=torch_dtype_type, help="Data type to run the model on"
         )
@@ -308,6 +294,6 @@ class PCAVisualizer:
             args.dtype,
             args.invert,
             args.zero,
-            args.zoom_steps,
-            args.zoom_factor,
+            args.size,
+            args.animate,
         )
