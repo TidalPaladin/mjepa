@@ -1,4 +1,4 @@
-# Config for training ViT-B/16 using MJEPA on chest X-ray.
+# Config for training ViT-B/16 using MJEPA on 2D CT slices.
 trainer: !!python/object:mjepa.TrainerConfig
   batch_size: 256
   num_workers: 24 
@@ -8,8 +8,8 @@ backbone: !!python/object:vit.ViTConfig
   in_channels: 1
   hidden_size: 768
   ffn_hidden_size: 3072
-  img_size: [256, 256]
   patch_size: [16, 16]
+  img_size: [256, 256]
   depth: 12
   num_attention_heads: 12
   activation: "swiglu"
