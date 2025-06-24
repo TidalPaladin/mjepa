@@ -1,5 +1,5 @@
 from argparse import Action, ArgumentParser, Namespace
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Self, Sequence, Type, cast
 
@@ -22,7 +22,7 @@ from mjepa.jepa import register_constructors
 register_constructors()
 
 
-def pca_topk(features: Tensor, offset: int = 0, k: int = 3) -> Tensor:
+def pca_topk(features: Tensor, offset: int = 0, k: int = 3, normalize: Sequence[str] = ["spatial"]) -> Tensor:
     r"""Applies PCA to the features and returns the top k principal components.
 
     Args:
@@ -62,8 +62,15 @@ def pca_topk(features: Tensor, offset: int = 0, k: int = 3) -> Tensor:
     projected = projected.reshape(n, h, w, k)
 
     # Normalize to [0,1] range for each component
-    projected = projected - projected.amin(dim=(0, 1, 2), keepdim=True)
-    projected = projected / projected.amax(dim=(0, 1, 2), keepdim=True)
+    norm_axes = []
+    if "batch" in normalize:
+        norm_axes.append(0)
+    if "channel" in normalize:
+        norm_axes.append(3)
+    if "spatial" in normalize:
+        norm_axes += [1, 2]
+    projected = projected - projected.amin(dim=norm_axes, keepdim=True)
+    projected = projected / projected.amax(dim=norm_axes, keepdim=True)
 
     return projected.float()
 
@@ -142,6 +149,7 @@ class PCAVisualizer:
     zero: bool = False
     size: Sequence[int] | None = None
     animate: bool = False
+    normalize: Sequence[str] = field(default_factory=lambda: ["spatial"])
 
     def __post_init__(self) -> None:
         if self.size is None:
@@ -168,7 +176,7 @@ class PCAVisualizer:
         return x
 
     def _compute_pca(self, features: Tensor, output_size: Sequence[int]) -> Tensor:
-        pca = pca_topk(features, self.offset, k=self.num_components)
+        pca = pca_topk(features, self.offset, k=self.num_components, normalize=self.normalize)
         visualizations: List[Tensor] = []
         for i in range(pca.shape[-1]):
             pca_i = pca[..., i].unsqueeze_(1)
@@ -262,6 +270,9 @@ class PCAVisualizer:
         parser.add_argument("-i", "--invert", action="store_true", help="Also process an inverted image")
         parser.add_argument("-z", "--zero", action="store_true", help="Also process an all-zero image")
         parser.add_argument(
+            "--normalize", choices=["batch", "channel", "spatial"], default=["spatial"], help="Which axes to normalize"
+        )
+        parser.add_argument(
             "-m", "--mode", choices=["rgb", "single"], default="rgb", help="Mode to visualize the principal components"
         )
         parser.add_argument(
@@ -297,4 +308,5 @@ class PCAVisualizer:
             args.zero,
             args.size,
             args.animate,
+            args.normalize,
         )
