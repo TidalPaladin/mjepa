@@ -181,7 +181,7 @@ def resize_learnable_pos_enc(model: nn.Module, tokenized_size: Sequence[int]) ->
     for name, module in model.named_modules():
         if isinstance(module, LearnablePosition):
             try:
-                module.expand_positions(tokenized_size) # type: ignore
+                module.expand_positions(tokenized_size)  # type: ignore
                 module.spatial_size = tokenized_size
                 rank_zero_info(f"Expanded positional encodings for {name} to {tokenized_size}")
             except ValueError:
