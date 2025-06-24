@@ -38,11 +38,8 @@ class CrossAttentionPredictor(nn.Module):
         # Changes should be made with care.
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
-        self.pos_enc_context = LearnablePosition(backbone.config.hidden_size, spatial_size)
         self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
         nn.init.normal_(self.query)
-        nn.init.trunc_normal_(self.pos_enc_target.positions, std=0.02)
-        nn.init.trunc_normal_(self.pos_enc_context.positions, std=0.02)
 
         # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for _ in range(depth)])
@@ -56,23 +53,10 @@ class CrossAttentionPredictor(nn.Module):
         target_mask: Tensor,
     ) -> Tensor:
         # Create positional encodings
-        # NOTE: Introducing positional encoding to the context seems to be helpful.
-        B, L = target_mask.shape
+        B, _ = target_mask.shape
         pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
-        pos_context = apply_mask(context_mask, self.pos_enc_context(tokenized_size).expand(B, -1, -1))
-
-        # Pad pos_context to account for leading register tokens
-        Lpos = pos_context.shape[1]
-        Lcontext = context.shape[1]
-        if Lpos != Lcontext:
-            padding = pos_context.new_zeros(B, Lcontext - Lpos, pos_context.shape[-1])
-            pos_context = torch.cat([padding, pos_context], dim=1)
-        assert (
-            pos_context.shape == context.shape
-        ), f"pos_context.shape: {pos_context.shape}, context.shape: {context.shape}"
 
         # Prepare inputs
-        context = context + pos_context
         query = self.query + pos_target
 
         # Run query and context through predictor
