@@ -194,6 +194,7 @@ class PCAVisualizer:
 
     @torch.inference_mode()
     def __call__(self, img: Tensor) -> Tensor:
+        assert not self.model.training, "Model must be in evaluation mode"
         if self.invert:
             img = self._append_inverted_img(img)
         if self.zero:
@@ -208,7 +209,7 @@ class PCAVisualizer:
                 features = self._forward_features(_img[None])
                 feature_list.append(features)
 
-            pca = self._compute_pca(torch.cat(feature_list, dim=0), self.backbone_img_size).chunk(img.shape[0], dim=0)
+            pca = self._compute_pca(torch.cat(feature_list, dim=0), self.size).chunk(img.shape[0], dim=0)
             grids: List[Tensor] = [self._create_grid(i[None], p) for i, p in zip(img, pca)]
             return torch.stack(grids, dim=0)
         else:
