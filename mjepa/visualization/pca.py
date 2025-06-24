@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Self, Sequence, Type, cast
 import matplotlib.pyplot as plt
 import safetensors.torch as st
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from dicom_preprocessing import load_tiff_f32
@@ -150,6 +151,7 @@ class PCAVisualizer:
     size: Sequence[int] | None = None
     animate: bool = False
     normalize: Sequence[str] = field(default_factory=lambda: ["spatial"])
+    no_output_norm: bool = False
 
     def __post_init__(self) -> None:
         if self.size is None:
@@ -157,6 +159,8 @@ class PCAVisualizer:
         self.model = self.model.to(self.device)
         self.model.requires_grad_(False)
         self.model.eval()
+        if self.no_output_norm:
+            self.model.output_norm = nn.Identity()
 
     @torch.inference_mode()
     def _forward_features(self, img: Tensor) -> Tensor:
@@ -285,6 +289,9 @@ class PCAVisualizer:
         parser.add_argument(
             "-dt", "--dtype", default="fp32", type=torch_dtype_type, help="Data type to run the model on"
         )
+        parser.add_argument(
+            "--no-output-norm", action="store_true", help="Disable output normalization from the backbone"
+        )
         return parser
 
     @classmethod
@@ -309,4 +316,5 @@ class PCAVisualizer:
             args.size,
             args.animate,
             args.normalize,
+            args.no_output_norm,
         )
