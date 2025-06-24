@@ -1,6 +1,8 @@
 from argparse import Namespace
+from typing import Sequence
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 from torchvision.datasets import CIFAR10
@@ -9,9 +11,11 @@ from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 from mjepa.visualization.pca import PCAVisualizer
 
 
-def load_image(dataset: CIFAR10, index: int) -> Tensor:
+def load_image(dataset: CIFAR10, index: int, size: Sequence[int]) -> Tensor:
     img, _ = dataset[index]
-    return rearrange(img, "c h w -> () c h w")
+    img = rearrange(img, "c h w -> () c h w")
+    img = F.interpolate(img, size=size, mode="bilinear", align_corners=False)
+    return img
 
 
 def parse_args() -> Namespace:
@@ -27,7 +31,7 @@ def main(args: Namespace) -> None:
     transform = Compose([ToImage(), ToDtype(torch.float32, scale=True)])
     dataset = CIFAR10(args.input[0], download=True, train=False, transform=transform)
     for i in range(8):
-        img = load_image(dataset, i)
+        img = load_image(dataset, i, visualizer.size)
         imgs.append(img)
     img = torch.cat(imgs, dim=0)
 
