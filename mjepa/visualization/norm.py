@@ -20,30 +20,46 @@ from .pca import ExpandImagePathsAction, existing_file_type, output_path_type, t
 register_constructors()
 
 
-def create_norm_histogram(features: Tensor) -> plt.Figure:
+def create_norm_histogram(features: Tensor, register_tokens: Tensor) -> plt.Figure:
     # Compute L2 norms along the feature dimension
-    norms = torch.norm(features, p=2, dim=-1)  # Shape: (n, num_tokens)
+    feature_norms = torch.norm(features, p=2, dim=-1)  # Shape: (n, num_tokens)
+    register_norms = torch.norm(register_tokens, p=2, dim=-1)  # Shape: (n, num_register_tokens)
 
     # Flatten to get all norm values
-    all_norms = norms.flatten().cpu().numpy()
+    all_feature_norms = feature_norms.flatten().cpu().numpy()
+    all_register_norms = register_norms.flatten().cpu().numpy()
 
     plt.figure(figsize=(10, 6))
-    plt.hist(all_norms, bins=50, alpha=0.7, edgecolor="black")
+    plt.hist(
+        [all_feature_norms, all_register_norms],
+        bins=50,
+        alpha=0.6,
+        label=["Features", "Register Tokens"],
+        color=["blue", "red"],
+    )
     plt.xlabel("L2 Norm")
     plt.ylabel("Frequency")
     plt.yscale("log")
     plt.title("Distribution of Feature L2 Norms")
     plt.grid(True, alpha=0.3)
 
-    # Add statistics to the plot
-    mean_norm = all_norms.mean()
-    std_norm = all_norms.std()
-    plt.axvline(mean_norm, color="red", linestyle="--", label=f"Mean: {mean_norm:.3f}")
+    # Add statistics to the plot (only for features)
+    mean_norm = all_feature_norms.mean()
+    std_norm = all_feature_norms.std()
+    plt.axvline(mean_norm, color="red", linestyle="--", label=f"Features Mean: {mean_norm:.3f}")
     plt.axvline(
-        mean_norm + std_norm, color="orange", linestyle="--", alpha=0.7, label=f"Mean + Std: {mean_norm + std_norm:.3f}"
+        mean_norm + std_norm,
+        color="orange",
+        linestyle="--",
+        alpha=0.7,
+        label=f"Features Mean + Std: {mean_norm + std_norm:.3f}",
     )
     plt.axvline(
-        mean_norm - std_norm, color="orange", linestyle="--", alpha=0.7, label=f"Mean - Std: {mean_norm - std_norm:.3f}"
+        mean_norm - std_norm,
+        color="orange",
+        linestyle="--",
+        alpha=0.7,
+        label=f"Features Mean - Std: {mean_norm - std_norm:.3f}",
     )
     plt.legend()
 
@@ -73,9 +89,8 @@ class NormVisualizer:
         assert not self.model.training, "Model must be in evaluation mode"
         assert img.device == self.device, "Image must be on the same device as the model"
         with torch.autocast(self.device.type, dtype=self.dtype):
-            features = cast(Tensor, self.model(img))
+            features = cast(Tensor, self.model(img, return_register_tokens=True))
         features = features.to(torch.float32)
-        Ht, Wt = self.model.stem.tokenized_size((H, W))
         return features
 
     @torch.inference_mode()
@@ -84,7 +99,9 @@ class NormVisualizer:
         img = img.to(self.device)
         img = F.interpolate(img, size=self.size, mode="bilinear", align_corners=False)
         features = self._forward_features(img)
-        return create_norm_histogram(features)
+        register_tokens = features[..., : self.model.config.num_register_tokens, :]
+        features = features[..., self.model.config.num_register_tokens :, :]
+        return create_norm_histogram(features, register_tokens)
 
     @torch.inference_mode()
     def save(self, fig: plt.Figure, output: Path) -> None:
