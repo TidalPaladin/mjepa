@@ -58,8 +58,8 @@ LOG_INTERVAL: Final[int] = 50
 def get_train_transforms(size: Tuple[int, int]) -> Compose:
     return Compose(
         [
-            RandomResizedCrop(size=size, scale=(0.25, 1.0), ratio=(0.75, 1.33)),
             RandomRotation(degrees=45, interpolation=Image.BILINEAR),
+            RandomResizedCrop(size=size, scale=(0.25, 1.0), ratio=(0.75, 1.33)),
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.5),
             ColorJitter(brightness=0.2, contrast=0.2),
