@@ -40,27 +40,8 @@ def create_norm_histogram(features: Tensor, register_tokens: Tensor) -> plt.Figu
     plt.xlabel("L2 Norm")
     plt.ylabel("Frequency")
     plt.yscale("log")
-    plt.title("Distribution of Feature L2 Norms")
+    plt.title("Distribution of L2 Norms")
     plt.grid(True, alpha=0.3)
-
-    # Add statistics to the plot (only for features)
-    mean_norm = all_feature_norms.mean()
-    std_norm = all_feature_norms.std()
-    plt.axvline(mean_norm, color="red", linestyle="--", label=f"Features Mean: {mean_norm:.3f}")
-    plt.axvline(
-        mean_norm + std_norm,
-        color="orange",
-        linestyle="--",
-        alpha=0.7,
-        label=f"Features Mean + Std: {mean_norm + std_norm:.3f}",
-    )
-    plt.axvline(
-        mean_norm - std_norm,
-        color="orange",
-        linestyle="--",
-        alpha=0.7,
-        label=f"Features Mean - Std: {mean_norm - std_norm:.3f}",
-    )
     plt.legend()
 
     # Save the plot
@@ -82,6 +63,7 @@ class NormVisualizer:
         self.model.requires_grad_(False)
         self.model.eval()
         self.model.output_norm = nn.Identity()
+        torch.set_float32_matmul_precision("high")
 
     @torch.inference_mode()
     def _forward_features(self, img: Tensor) -> Tensor:
