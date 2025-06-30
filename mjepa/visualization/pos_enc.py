@@ -34,7 +34,7 @@ def create_pos_enc_maps(positions: Tensor) -> plt.Figure:
 
     # Compute similarities for each position
     fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-    fig.suptitle("Position Embedding Dot Products", fontsize=16)
+    fig.suptitle("Position Embedding Similarities", fontsize=16)
 
     for idx, (pos_idx, label) in enumerate(zip(indices, labels)):
         # Get similarities between position token and all others
