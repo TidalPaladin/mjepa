@@ -161,6 +161,7 @@ class PCAVisualizer:
         self.model.eval()
         if self.no_output_norm:
             self.model.output_norm = nn.Identity()
+        torch.set_float32_matmul_precision("high")
 
     @torch.inference_mode()
     def _forward_features(self, img: Tensor) -> Tensor:

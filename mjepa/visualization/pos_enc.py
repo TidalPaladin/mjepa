@@ -73,6 +73,7 @@ class PositionVisualizer:
         self.model = self.model.to(self.device)
         self.model.requires_grad_(False)
         self.model.eval()
+        torch.set_float32_matmul_precision("high")
 
     @torch.inference_mode()
     def _get_positions(self) -> Tensor:

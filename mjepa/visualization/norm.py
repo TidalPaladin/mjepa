@@ -63,6 +63,7 @@ class NormVisualizer:
         self.model.requires_grad_(False)
         self.model.eval()
         self.model.output_norm = nn.Identity()
+        torch.set_float32_matmul_precision("high")
 
     @torch.inference_mode()
     def _forward_features(self, img: Tensor) -> Tensor:
