@@ -1,3 +1,4 @@
+import math
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,64 +59,104 @@ def _process_weights(
     ax.axis("off")
 
 
-def visualize_attention_weights(
-    image: Tensor,
-    pred: Tensor,
-    weights: Tensor,
-    overlay_alpha: float = 0.6,
-) -> plt.Figure:
-    """Visualize attention weights for a specific layer and token across all heads.
+def _create_subplot_grid(B: int, H: int) -> Tuple[plt.Figure, plt.Axes, int, int]:
+    """Create subplot grid based on batch size and number of heads."""
+    if H == 1:
+        # Special layout for single attention head: 4 image-weight pairs per row
+        pairs_per_row = 4
+        nrows = math.ceil(B / pairs_per_row)
+        ncols = pairs_per_row * 2
+    else:
+        # Original layout for multiple attention heads
+        head_offset = 3
+        nrows, ncols = B, H + head_offset
 
-    Args:
-        weights: Dictionary with keys like 'layer_i' and attention weight tensors
-        layer: Specific layer index to visualize
-        token: Specific token index to visualize
-        image: Input image tensor of shape (B, C, H, W), None to skip image display
-        overlay_alpha: Alpha value for blending attention weights over image (0-1)
-
-    Returns:
-        matplotlib Figure with attention weight visualizations overlaid on the input image
-    """
-    original_img_shape = image.shape[2:]  # (H, W)
-    image = image.cpu()
-    if image.shape[1] == 1:
-        image = image.expand(-1, 3, -1, -1)
-    image = rearrange(image, "... c h w -> ... h w c").cpu()
-
-    B, *grid, H = weights.shape
-    head_offset = 3
-    nrows, ncols = B, H + head_offset
-
-    # Create figure and subplots
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
 
-    # Generate visualizations for each head
+    # Ensure axes is always 2D
+    if nrows == 1 and ncols == 1:
+        axes = axes.reshape(1, 1)
+    elif nrows == 1 or ncols == 1:
+        axes = axes.reshape(nrows, ncols)
+
+    return fig, axes, nrows, ncols
+
+
+def _visualize_single_head_layout(
+    axes: plt.Axes,
+    image: Tensor,
+    weights: Tensor,
+    original_img_shape: Tuple[int, int],
+    grid: Tuple[int, int],
+    B: int,
+    nrows: int,
+    ncols: int,
+) -> None:
+    """Handle visualization for single attention head layout."""
+    pairs_per_row = 4
+
     for batch_idx in range(B):
-        ax = axes[batch_idx, 0]
-        ax.imshow(image[batch_idx].numpy(), origin="upper")
-        ax.axis("off")
+        row = batch_idx // pairs_per_row
+        col_start = (batch_idx % pairs_per_row) * 2
+
+        # Show image
+        axes[row, col_start].imshow(image[batch_idx].numpy(), origin="upper")
+        axes[row, col_start].axis("off")
+
+        # Show attention weight
+        _process_weights(
+            weights[batch_idx, ..., 0],
+            original_img_shape,
+            grid,
+            axes[row, col_start + 1],
+            batch_idx,
+            -1,
+            caption=None,
+        )
+
+    # Hide unused subplots
+    for batch_idx in range(B, nrows * pairs_per_row):
+        row = batch_idx // pairs_per_row
+        col_start = (batch_idx % pairs_per_row) * 2
+        for col in [col_start, col_start + 1]:
+            if row < nrows and col < ncols:
+                axes[row, col].axis("off")
+
+
+def _visualize_multi_head_layout(
+    axes: plt.Axes,
+    image: Tensor,
+    weights: Tensor,
+    original_img_shape: Tuple[int, int],
+    grid: Tuple[int, int],
+    B: int,
+    H: int,
+) -> None:
+    """Handle visualization for multiple attention heads layout."""
+    head_offset = 3
+
+    for batch_idx in range(B):
+        # Show original image
+        axes[batch_idx, 0].imshow(image[batch_idx].numpy(), origin="upper")
+        axes[batch_idx, 0].axis("off")
         if batch_idx == 0:
-            ax.set_title("Image", fontsize=32)
+            axes[batch_idx, 0].set_title("Image", fontsize=32)
 
-        _process_weights(
-            weights[batch_idx].mean(dim=-1),
-            original_img_shape,
-            grid,
-            axes[batch_idx, 1],
-            batch_idx,
-            -1,
-            caption="Average" if batch_idx == 0 else None,
-        )
-        _process_weights(
-            weights[batch_idx].amax(dim=-1),
-            original_img_shape,
-            grid,
-            axes[batch_idx, 2],
-            batch_idx,
-            -1,
-            caption="Max" if batch_idx == 0 else None,
-        )
+        # Show average and max attention
+        for col, (agg_func, caption) in enumerate(
+            [(lambda x: x.mean(dim=-1), "Average"), (lambda x: x.amax(dim=-1), "Max")], start=1
+        ):
+            _process_weights(
+                agg_func(weights[batch_idx]),
+                original_img_shape,
+                grid,
+                axes[batch_idx, col],
+                batch_idx,
+                -1,
+                caption=caption if batch_idx == 0 else None,
+            )
 
+        # Show individual attention heads
         for head_idx in range(H):
             _process_weights(
                 weights[batch_idx, ..., head_idx],
@@ -126,10 +167,46 @@ def visualize_attention_weights(
                 head_idx,
             )
 
-    # Add overall title
-    fig.suptitle(f"Attention Weight Visualization", fontsize=48, fontweight="bold")
+
+def visualize_attention_weights(
+    image: Tensor,
+    pred: Tensor,
+    weights: Tensor,
+) -> plt.Figure:
+    """Visualize attention weights for a specific layer and token across all heads.
+
+    Args:
+        image: Input image tensor of shape (B, C, H, W)
+        pred: Model predictions
+        weights: Attention weights tensor
+
+    Returns:
+        matplotlib Figure with attention weight visualizations overlaid on the input image
+    """
+    # Preprocess image
+    original_img_shape = image.shape[2:]  # (H, W)
+    image = image.cpu()
+    if image.shape[1] == 1:
+        image = image.expand(-1, 3, -1, -1)
+    image = rearrange(image, "... c h w -> ... h w c").cpu()
+
+    B, *grid, H = weights.shape
+
+    # Create subplot grid
+    fig, axes, nrows, ncols = _create_subplot_grid(B, H)
+
+    # Choose layout based on number of heads
+    if H == 1:
+        _visualize_single_head_layout(axes, image, weights, original_img_shape, grid, B, nrows, ncols)
+        top_adjust = 0.88
+    else:
+        _visualize_multi_head_layout(axes, image, weights, original_img_shape, grid, B, H)
+        top_adjust = 0.92
+
+    # Finalize figure
+    fig.suptitle("Attention Weight Visualization", fontsize=48, fontweight="bold")
     plt.tight_layout()
-    plt.subplots_adjust(top=0.92)
+    plt.subplots_adjust(top=top_adjust)
 
     return fig
 
@@ -141,7 +218,6 @@ class AttentionVisualizer:
     device: torch.device = torch.device("cpu")
     dtype: torch.dtype = torch.float32
     size: Sequence[int] | None = None
-    overlay_alpha: float = 0.6
 
     def __post_init__(self) -> None:
         if self.size is None:
@@ -186,12 +262,7 @@ class AttentionVisualizer:
         img = F.interpolate(img, size=self.size, mode="bilinear", align_corners=False)
 
         pred, weights = self._forward_attention_weights(img)
-        fig = visualize_attention_weights(
-            img,
-            pred,
-            weights,
-            overlay_alpha=self.overlay_alpha,
-        )
+        fig = visualize_attention_weights(img, pred, weights)
         return fig
 
     @torch.inference_mode()
@@ -224,7 +295,6 @@ class AttentionVisualizer:
             "-dt", "--dtype", default="fp32", type=torch_dtype_type, help="Data type to run the model on"
         )
         parser.add_argument("--head", default="cls", help="Head to visualize")
-        parser.add_argument("--overlay-alpha", type=float, default=0.6, help="Alpha value for overlay blending (0-1)")
         return parser
 
     @classmethod
@@ -244,5 +314,4 @@ class AttentionVisualizer:
             args.device,
             args.dtype,
             args.size,
-            args.overlay_alpha,
         )
