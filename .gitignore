@@ -22,3 +22,4 @@ node_modules/
 *.gif
 *.log
 output/
+*.gif

@@ -1,4 +1,3 @@
-import gc
 import os
 from argparse import ArgumentParser, Namespace
 from copy import deepcopy
@@ -12,18 +11,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics as tm
 import yaml
+from PIL import Image
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, DistributedSampler
-from torchvision.transforms.v2 import ColorJitter, Compose, RandomHorizontalFlip, RandomResizedCrop, RandomVerticalFlip
+from torchvision.transforms.v2 import (
+    ColorJitter,
+    Compose,
+    RandomHorizontalFlip,
+    RandomResizedCrop,
+    RandomRotation,
+    RandomVerticalFlip,
+)
 from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
 from mjepa.augmentation import AugmentationConfig, apply_invert, apply_mixup, apply_noise, apply_posterize
-from mjepa.data import NIHChestDataset
+from mjepa.data import PreprocessedTIFFDataset
 from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher
 from mjepa.logging import CSVLogger, SaveImage
 from mjepa.optimizer import OptimizerConfig
@@ -44,14 +51,15 @@ from mjepa.trainer import (
 
 
 WINDOW: Final[int] = 5
-DEFAULT_SIZE: Final[Tuple[int, int]] = (512, 512)
+DEFAULT_SIZE: Final[Tuple[int, int]] = (256, 256)
 LOG_INTERVAL: Final[int] = 50
 
 
 def get_train_transforms(size: Tuple[int, int]) -> Compose:
     return Compose(
         [
-            RandomResizedCrop(size=size, scale=(0.2, 1.0), ratio=(0.75, 1.33)),
+            RandomRotation(degrees=45, interpolation=Image.BILINEAR),
+            RandomResizedCrop(size=size, scale=(0.25, 1.0), ratio=(0.75, 1.33)),
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.5),
             ColorJitter(brightness=0.2, contrast=0.2),
@@ -64,12 +72,13 @@ def get_train_dataloader(
     size: Tuple[int, int],
     batch_size: int,
     num_workers: int,
+    keep_volume: bool,
     shuffle: bool,
     local_rank: int,
     world_size: int,
 ) -> DataLoader:
     transforms = get_train_transforms(size)
-    dataset = NIHChestDataset(root=root, train=True, transform=transforms)
+    dataset = PreprocessedTIFFDataset(root=root, training=True, transform=transforms, keep_volume=keep_volume)
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=shuffle)
         return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, sampler=sampler)
@@ -130,7 +139,7 @@ def train(
         modules.train()
         desc = format_pbar_description(step, microbatch, epoch, loss=train_loss)
         pbar = tqdm(train_dataloader, desc=desc, disable=not is_rank_zero(), leave=False)
-        for img, label in pbar:
+        for img in pbar:
             img = img.cuda()
             if microbatch == 0:
                 image_saver(img)
@@ -184,10 +193,6 @@ def train(
 
         rank_zero_info(f"Epoch: {epoch}, Loss: {train_loss_epoch.compute():.4f}")
         train_loss_epoch.reset()
-
-        gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
         # Save checkpoint
         if log_dir:
@@ -271,12 +276,14 @@ def main(args: Namespace) -> None:
         wrapper = DDP(wrapper, device_ids=[local_rank])
 
     # Instantiate dataloaders
+    keep_volume = False
     shuffle = True
     train_dataloader = get_train_dataloader(
         args.data,
         args.size,
         trainer_config.batch_size,
         trainer_config.num_workers,
+        keep_volume,
         shuffle,
         local_rank,
         world_size,
