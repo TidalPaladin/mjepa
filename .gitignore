@@ -19,6 +19,7 @@ node_modules/
 *.tiff
 *.dcm
 *.png
+*.gif
 *.log
 output/
 *.gif

@@ -19,8 +19,8 @@ backbone: !!python/object:vit.ViTConfig
   hidden_dropout: 0.1
   drop_path_rate: 0.1
   num_register_tokens: 8
-  pos_emb: "fourier"
-  output_norm: true
+  pos_enc: "fourier"
+  layer_scale: 0.00001
   heads:
     cls: !!python/object:vit.HeadConfig
       head_type: "linear"
