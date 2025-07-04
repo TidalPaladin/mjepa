@@ -2,11 +2,10 @@ from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from typing import Dict, List, Self, Sequence, Type
+from typing import Dict, Final, List, Self, Sequence, Type
 
 import matplotlib.pyplot as plt
 import numpy as np
-import safetensors.torch as st
 import torch
 import yaml
 from vit import ViT, ViTConfig
@@ -15,6 +14,8 @@ from mjepa.jepa import register_constructors
 
 from .pca import existing_file_type, output_path_type, torch_dtype_type
 
+
+NUM_WARMUP_RUNS: Final = 3
 
 register_constructors()
 
@@ -37,8 +38,8 @@ def plot_times(times: Dict[Sequence[int], List[float]], device: torch.device, ba
 
     # Convert sizes to labels and plot boxes
     labels = [f"{h}x{w}" for h, w in times.keys()]
-    means = [np.mean(d) for d in data]
-    latency_line = ax.plot(range(1, len(data) + 1), means, "o-", label="Latency")[0]
+    medians = [np.median(d) for d in data]
+    latency_line = ax.plot(range(1, len(data) + 1), medians, "o-", label="Latency")[0]
     ax.set_xticks(range(1, len(data) + 1))
     ax.set_xticklabels(labels)
 
@@ -51,7 +52,7 @@ def plot_times(times: Dict[Sequence[int], List[float]], device: torch.device, ba
 
     # Add second y-axis for throughput
     ax2 = ax.twinx()
-    throughput = [batch_size / (np.mean(d) / 1000 if use_ms else np.mean(d)) for d in data]
+    throughput = [batch_size / (np.median(d) / 1000 if use_ms else np.median(d)) for d in data]
     throughput_line = ax2.plot(range(1, len(data) + 1), throughput, "o--", color="r", label="Throughput")[0]
     ax2.set_ylabel("Throughput (Images/s)", color="r")
     ax2.tick_params(axis="y")
@@ -84,11 +85,14 @@ class RuntimeVisualizer:
     @torch.inference_mode()
     def _get_runtime(self, size: Sequence[int]) -> List[float]:
         B, C = self.batch_size, self.model.config.in_channels
-        x = torch.randn(B, C, *size, device=self.device, dtype=self.dtype)
+        x = torch.randn(B, C, *size, device=self.device)
         times: List[float] = []
         with torch.autocast(self.device.type, dtype=self.dtype):
             # First pass for warmup/compile
-            self.model(x)
+            for _ in range(NUM_WARMUP_RUNS):
+                self.model(x)
+            torch.cuda.synchronize()
+
             for _ in range(self.num_runs):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -113,7 +117,6 @@ class RuntimeVisualizer:
         """Create argument parser with built-in validation."""
         parser = ArgumentParser(prog="pca-visualize", description="Visualize PCA ViT output features")
         parser.add_argument("config", type=existing_file_type, help="Path to model YAML configuration file")
-        parser.add_argument("checkpoint", type=existing_file_type, help="Path to safetensors checkpoint")
         parser.add_argument("output", type=output_path_type, help="Path to output PNG file")
         parser.add_argument(
             "-s",
@@ -156,10 +159,6 @@ class RuntimeVisualizer:
         config = yaml.full_load(args.config.read_text())["backbone"]
         assert isinstance(config, ViTConfig)
         model = config.instantiate()
-
-        # Load checkpoint
-        state_dict = st.load_file(args.checkpoint)
-        model.load_state_dict(state_dict)
 
         # Get sizes
         sizes = [(int(config.img_size[0] * scale), int(config.img_size[1] * scale)) for scale in args.scales]

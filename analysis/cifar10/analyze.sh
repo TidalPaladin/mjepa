@@ -31,6 +31,5 @@ pdm run scripts/position_visualize.py \
 
 pdm run scripts/runtime_visualize.py \
     $CONFIG \
-    $BACKBONE/backbone.safetensors \
     $OUTPUT/runtime.png \
-    -d $DEVICE -dt bf16 --scales 0.25 0.5 1.0 2.0 4.0 -b 8
+    -d $DEVICE -dt bf16 --scales 0.25 0.5 1.0 2.0 4.0 -b 32
