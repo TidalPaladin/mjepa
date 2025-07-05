@@ -1,5 +1,6 @@
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -124,6 +125,26 @@ def get_momentum(step: int, total_steps: int, momentum: float) -> float:
         The current momentum value.
     """
     return momentum + (1 - momentum) * (step / total_steps)
+
+
+M = TypeVar("M", bound=nn.Module)
+
+
+def setup_teacher(backbone: M) -> M:
+    r"""Create a teacher model from a backbone model.
+
+    The teacher will have parameters frozen and will be set to evaluation mode.
+
+    Args:
+        backbone: Backbone model to create a teacher from.
+
+    Returns:
+        Teacher model.
+    """
+    teacher = deepcopy(backbone)
+    teacher.requires_grad_(False)
+    teacher.eval()
+    return teacher
 
 
 @dataclass
