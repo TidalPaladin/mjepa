@@ -4,7 +4,7 @@ import os
 from argparse import ArgumentParser, Namespace
 from functools import partial
 from pathlib import Path
-from typing import Callable, Final, Sequence, cast
+from typing import Final, Sequence, cast
 
 import safetensors.torch as st
 import torch
@@ -49,6 +49,7 @@ from mjepa.augmentation import (
 from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, setup_teacher, update_teacher
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
+    DataLoaderFn,
     TrainerConfig,
     assert_all_trainable_params_have_grad,
     calculate_total_steps,
@@ -149,8 +150,8 @@ def get_val_dataloader(
 
 def train(
     modules: nn.ModuleDict,
-    train_dataloader_fn: Callable[[Sequence[int], int], DataLoader],
-    val_dataloader_fn: Callable[[Sequence[int], int], DataLoader],
+    train_dataloader_fn: DataLoaderFn,
+    val_dataloader_fn: DataLoaderFn,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     jepa_config: JEPAConfig,
