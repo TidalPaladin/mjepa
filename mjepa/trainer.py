@@ -390,10 +390,9 @@ def size_change(
     Returns:
         Tuple of training dataloader, validation dataloader, and updated number of gradient accumulation steps.
     """
-    size = size_config.size
     accumulate_grad_batches = accumulate_grad_batches * (batch_size // size_config.batch_size)
-    train_dataloader = train_dataloader_fn(size, batch_size)
-    val_dataloader = val_dataloader_fn(size, batch_size) if val_dataloader_fn else None
+    train_dataloader = train_dataloader_fn(size_config.size, size_config.batch_size)
+    val_dataloader = val_dataloader_fn(size_config.size, size_config.batch_size) if val_dataloader_fn else None
     return train_dataloader, val_dataloader, accumulate_grad_batches
 
 
