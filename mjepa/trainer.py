@@ -396,6 +396,21 @@ def size_change(
     return train_dataloader, val_dataloader, accumulate_grad_batches
 
 
+def scale_change(base_size: Sequence[int], size_config: "ResolutionConfig", scale: int) -> int:
+    r"""Calculate the updated MIM scale factor for a given resolution configuration.
+
+    Args:
+        base_size: Base image size
+        size_config: New size configuration.
+        scale: Base MIM scale factor.
+
+    Returns:
+        Updated MIM scale factor.
+    """
+    min_ratio = min(new_size / old_size for new_size, old_size in zip(size_config.size, base_size))
+    return int(scale * min_ratio)
+
+
 def ignore_warnings():
     filterwarnings("ignore", category=DeprecationWarning)
     filterwarnings("ignore", category=UserWarning)

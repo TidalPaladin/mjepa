@@ -60,6 +60,7 @@ from mjepa.trainer import (
     is_rank_zero,
     rank_zero_info,
     save_checkpoint,
+    scale_change,
     setup_logdir,
     should_step_optimizer,
     size_change,
@@ -167,6 +168,7 @@ def train(
     predictor: CrossAttentionPredictor = modules["predictor"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
+    jepa_scale = jepa_config.scale
 
     # DataLoader setup
     train_dataloader = train_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
@@ -202,6 +204,7 @@ def train(
                 train_dataloader_fn,
                 val_dataloader_fn,
             )
+            jepa_scale = scale_change(backbone.config.img_size, size_config, jepa_scale)
             rank_zero_info(
                 f"Changing size to {size_config.size} and batch size to {size_config.batch_size} (accumulate grad batches: {accumulate_grad_batches})"
             )
@@ -231,7 +234,7 @@ def train(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Masked forward through student and predictor
                 context_mask, target_mask = generate_masks(
-                    backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
+                    backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
                 )
                 context = cast(Tensor, backbone(img, mask=context_mask))
                 pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
