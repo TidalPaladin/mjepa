@@ -267,7 +267,8 @@ def train(
 
             # Optimizer update and teacher update
             if should_step_optimizer(microbatch, accumulate_grad_batches):
-                scheduler.step()
+                if step < total_steps:
+                    scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
                 current_momentum = get_momentum(step, total_steps, jepa_config.momentum)
