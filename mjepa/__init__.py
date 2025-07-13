@@ -4,7 +4,7 @@ from .augmentation import AugmentationConfig
 from .jepa import CrossAttentionPredictor, JEPAConfig
 from .mae import MAEConfig
 from .optimizer import OptimizerConfig
-from .trainer import TrainerConfig
+from .trainer import ResolutionConfig, TrainerConfig
 
 
 __version__ = importlib.metadata.version("mjepa")
@@ -15,4 +15,5 @@ __all__ = [
     "AugmentationConfig",
     "OptimizerConfig",
     "CrossAttentionPredictor",
+    "ResolutionConfig",
 ]

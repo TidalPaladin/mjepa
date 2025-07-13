@@ -1,12 +1,12 @@
 import logging
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from shutil import copyfile
-from typing import Callable, Literal, Sequence, Tuple, overload
+from typing import Callable, Dict, Literal, Sequence, Tuple, overload
 from warnings import filterwarnings
 
 import numpy as np
@@ -23,6 +23,9 @@ from vit import ViT
 from vit.pos_enc import LearnablePosition
 
 from .jepa import CrossAttentionPredictor
+
+
+DataLoaderFn = Callable[[Sequence[int], int], DataLoader]
 
 
 def seed_everything(seed: int) -> None:
@@ -363,10 +366,61 @@ def assert_all_trainable_params_have_grad(model: nn.Module, step: int | None = N
             raise AssertionError(f"Parameter {name} should have a gradient, but does not")
 
 
+def size_change(
+    size_config: "ResolutionConfig",
+    batch_size: int,
+    accumulate_grad_batches: int,
+    train_dataloader_fn: DataLoaderFn,
+    val_dataloader_fn: DataLoaderFn | None = None,
+) -> Tuple[DataLoader, DataLoader | None, int]:
+    r"""Reconstruct dataloaders for a given resolution configuration.
+
+    The resolution and batch size are updated to the values given in the size configuration.
+    Gradient accumulation is updated to maintain the number of steps per epoch. For example,
+    if the batch size is halved to account for the higher resolution, the number of gradient accumulation steps
+    is doubled to maintain the same number of steps per epoch.
+
+    Args:
+        size_config: Size configuration to change to.
+        batch_size: Default batch size
+        accumulate_grad_batches: Default number of gradient accumulation steps
+        train_dataloader_fn: Function to create the training dataloader.
+        val_dataloader_fn: Optional function to create the validation dataloader.
+
+    Returns:
+        Tuple of training dataloader, validation dataloader, and updated number of gradient accumulation steps.
+    """
+    accumulate_grad_batches = accumulate_grad_batches * (batch_size // size_config.batch_size)
+    train_dataloader = train_dataloader_fn(size_config.size, size_config.batch_size)
+    val_dataloader = val_dataloader_fn(size_config.size, size_config.batch_size) if val_dataloader_fn else None
+    return train_dataloader, val_dataloader, accumulate_grad_batches
+
+
+def scale_change(base_size: Sequence[int], size_config: "ResolutionConfig", scale: int) -> int:
+    r"""Calculate the updated MIM scale factor for a given resolution configuration.
+
+    Args:
+        base_size: Base image size
+        size_config: New size configuration.
+        scale: Base MIM scale factor.
+
+    Returns:
+        Updated MIM scale factor.
+    """
+    min_ratio = min(new_size / old_size for new_size, old_size in zip(size_config.size, base_size))
+    return int(scale * min_ratio)
+
+
 def ignore_warnings():
     filterwarnings("ignore", category=DeprecationWarning)
     filterwarnings("ignore", category=UserWarning)
     filterwarnings("ignore", category=FutureWarning)
+
+
+@dataclass
+class ResolutionConfig:
+    size: Sequence[int]
+    batch_size: int
 
 
 @dataclass
@@ -377,21 +431,45 @@ class TrainerConfig:
     accumulate_grad_batches: int = 1
     log_interval: int = 50
     check_val_every_n_epoch: int = 1
+    sizes: Dict[int, ResolutionConfig] = field(default_factory=dict)
+
+    def is_size_change_epoch(self, epoch: int) -> bool:
+        return epoch in self.sizes
+
+    def get_size_for_epoch(self, epoch: int) -> ResolutionConfig | None:
+        config = None
+        for target_epoch, size_config in self.sizes.items():
+            if epoch >= target_epoch:
+                config = size_config
+            else:
+                break
+        return config
 
 
-def config_constructor(loader, node):
+def trainer_config_constructor(loader, node):
     values = loader.construct_mapping(node, deep=True)
     return TrainerConfig(**values)
 
 
+def resolution_config_constructor(loader, node):
+    values = loader.construct_mapping(node, deep=True)
+    return ResolutionConfig(**values)
+
+
 def register_constructors():
+    loaders = [yaml.SafeLoader, yaml.FullLoader, yaml.UnsafeLoader]
+    tags = [
+        "tag:yaml.org,2002:python/object:mjepa.ResolutionConfig",
+    ]
+    for tag in tags:
+        for loader in loaders:
+            loader.add_constructor(tag, resolution_config_constructor)
     tags = [
         "tag:yaml.org,2002:python/object:mjepa.TrainerConfig",
     ]
-    loaders = [yaml.SafeLoader, yaml.FullLoader, yaml.UnsafeLoader]
     for tag in tags:
         for loader in loaders:
-            loader.add_constructor(tag, config_constructor)
+            loader.add_constructor(tag, trainer_config_constructor)
 
 
 register_constructors()

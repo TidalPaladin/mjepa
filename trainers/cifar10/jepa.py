@@ -2,9 +2,9 @@ import gc
 import logging
 import os
 from argparse import ArgumentParser, Namespace
-from copy import deepcopy
+from functools import partial
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Sequence, cast
 
 import safetensors.torch as st
 import torch
@@ -29,6 +29,7 @@ from torchvision.transforms.v2 import (
     RandomResizedCrop,
     RandomRotation,
     RandomVerticalFlip,
+    Resize,
     ToDtype,
     ToImage,
 )
@@ -45,9 +46,10 @@ from mjepa.augmentation import (
     cross_entropy_mixup,
     is_mixed,
 )
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher
+from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, setup_teacher, update_teacher
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
+    DataLoaderFn,
     TrainerConfig,
     assert_all_trainable_params_have_grad,
     calculate_total_steps,
@@ -58,8 +60,10 @@ from mjepa.trainer import (
     is_rank_zero,
     rank_zero_info,
     save_checkpoint,
+    scale_change,
     setup_logdir,
     should_step_optimizer,
+    size_change,
 )
 
 
@@ -68,12 +72,12 @@ UNKNOWN_LABEL: Final[int] = -1
 WINDOW: Final[int] = 5
 
 
-def get_train_transforms() -> Compose:
+def get_train_transforms(size: Sequence[int]) -> Compose:
     return Compose(
         [
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.5),
-            RandomResizedCrop(size=(32, 32), scale=(0.75, 1.0), ratio=(0.75, 1.33)),
+            RandomResizedCrop(size=size, scale=(0.75, 1.0), ratio=(0.75, 1.33)),
             RandomApply([RandomRotation(degrees=15)], p=0.25),
             ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             RandomGrayscale(p=0.1),
@@ -83,17 +87,25 @@ def get_train_transforms() -> Compose:
     )
 
 
-def get_val_transforms() -> Compose:
+def get_val_transforms(size: Sequence[int]) -> Compose:
     return Compose(
         [
+            Resize(size=size),
             ToImage(),
             ToDtype(torch.float32, scale=True),
         ]
     )
 
 
-def get_train_dataloader(root: Path, batch_size: int, num_workers: int, local_rank: int, world_size: int) -> DataLoader:
-    transforms = get_train_transforms()
+def get_train_dataloader(
+    size: Sequence[int],
+    batch_size: int,
+    root: Path,
+    num_workers: int,
+    local_rank: int,
+    world_size: int,
+) -> DataLoader:
+    transforms = get_train_transforms(size)
     dataset = CIFAR10(root=root, train=True, transform=transforms, download=True)
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
@@ -111,8 +123,15 @@ def get_train_dataloader(root: Path, batch_size: int, num_workers: int, local_ra
         )
 
 
-def get_val_dataloader(root: Path, batch_size: int, num_workers: int, local_rank: int, world_size: int) -> DataLoader:
-    transforms = get_val_transforms()
+def get_val_dataloader(
+    size: Sequence[int],
+    batch_size: int,
+    root: Path,
+    num_workers: int,
+    local_rank: int,
+    world_size: int,
+) -> DataLoader:
+    transforms = get_val_transforms(size)
     dataset = CIFAR10(root=root, train=False, transform=transforms, download=True)
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
@@ -132,8 +151,8 @@ def get_val_dataloader(root: Path, batch_size: int, num_workers: int, local_rank
 
 def train(
     modules: nn.ModuleDict,
-    train_dataloader: DataLoader,
-    val_dataloader: DataLoader,
+    train_dataloader_fn: DataLoaderFn,
+    val_dataloader_fn: DataLoaderFn,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     jepa_config: JEPAConfig,
@@ -149,17 +168,19 @@ def train(
     predictor: CrossAttentionPredictor = modules["predictor"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
+    jepa_scale = jepa_config.scale
+
+    # DataLoader setup
+    train_dataloader = train_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
+    val_dataloader = val_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
 
     # Teacher setup
-    teacher = deepcopy(backbone)
-    teacher.requires_grad_(False)
-    teacher.eval()
+    teacher = setup_teacher(backbone)
 
+    accumulate_grad_batches = trainer_config.accumulate_grad_batches
     microbatch = (last_epoch + 1) * len(train_dataloader)
-    step = microbatch // trainer_config.accumulate_grad_batches
-    total_steps = calculate_total_steps(
-        train_dataloader, trainer_config.num_epochs, trainer_config.accumulate_grad_batches
-    )
+    step = microbatch // accumulate_grad_batches
+    total_steps = calculate_total_steps(train_dataloader, trainer_config.num_epochs, accumulate_grad_batches)
     rank_zero_info(f"Training for {trainer_config.num_epochs} epochs = {total_steps} steps")
     rank_zero_info(
         f"Batch size: {trainer_config.batch_size}, Microbatch accumulation: {trainer_config.accumulate_grad_batches}"
@@ -173,6 +194,21 @@ def train(
     img: Tensor
     label: Tensor
     for epoch in range(last_epoch + 1, trainer_config.num_epochs):
+        # Update training resolution / batch_size / accumulate_grad_batches if necessary
+        if trainer_config.is_size_change_epoch(epoch):
+            size_config = trainer_config.sizes[epoch]
+            train_dataloader, val_dataloader, accumulate_grad_batches = size_change(
+                size_config,
+                trainer_config.batch_size,
+                accumulate_grad_batches,
+                train_dataloader_fn,
+                val_dataloader_fn,
+            )
+            jepa_scale = scale_change(backbone.config.img_size, size_config, jepa_scale)
+            rank_zero_info(
+                f"Changing size to {size_config.size} and batch size to {size_config.batch_size} (accumulate grad batches: {accumulate_grad_batches})"
+            )
+
         modules.train()
         desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
         pbar = tqdm(train_dataloader, desc=desc, disable=not is_rank_zero(), leave=False)
@@ -198,7 +234,7 @@ def train(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Masked forward through student and predictor
                 context_mask, target_mask = generate_masks(
-                    backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
+                    backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
                 )
                 context = cast(Tensor, backbone(img, mask=context_mask))
                 pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
@@ -230,8 +266,9 @@ def train(
             microbatch += 1
 
             # Optimizer update and teacher update
-            if should_step_optimizer(microbatch, trainer_config.accumulate_grad_batches):
-                scheduler.step()
+            if should_step_optimizer(microbatch, accumulate_grad_batches):
+                if step < total_steps:
+                    scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
                 current_momentum = get_momentum(step, total_steps, jepa_config.momentum)
@@ -342,12 +379,21 @@ def main(args: Namespace) -> None:
         wrapper = DDP(wrapper, device_ids=[local_rank])
 
     # Instantiate dataloaders
-    train_dataloader = get_train_dataloader(
-        args.data, trainer_config.batch_size, trainer_config.num_workers, local_rank, world_size
+    train_dataloader_fn = partial(
+        get_train_dataloader,
+        root=args.data,
+        num_workers=trainer_config.num_workers,
+        local_rank=local_rank,
+        world_size=world_size,
     )
-    val_dataloader = get_val_dataloader(
-        args.data, trainer_config.batch_size, trainer_config.num_workers, local_rank, world_size
+    val_dataloader_fn = partial(
+        get_val_dataloader,
+        root=args.data,
+        num_workers=trainer_config.num_workers,
+        local_rank=local_rank,
+        world_size=world_size,
     )
+    train_dataloader = train_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
 
     # Instantiate optimizer and scheduler
     total_steps = calculate_total_steps(
@@ -364,8 +410,8 @@ def main(args: Namespace) -> None:
     ignore_warnings()
     train(
         wrapper,
-        train_dataloader,
-        val_dataloader,
+        train_dataloader_fn,
+        val_dataloader_fn,
         optimizer,
         scheduler,
         jepa_config,
