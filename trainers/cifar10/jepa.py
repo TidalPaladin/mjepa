@@ -47,6 +47,7 @@ from mjepa.augmentation import (
     is_mixed,
 )
 from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, setup_teacher, update_teacher
+from mjepa.logging import CSVLogger
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
     DataLoaderFn,
@@ -70,6 +71,7 @@ from mjepa.trainer import (
 NUM_CLASSES: Final[int] = 10
 UNKNOWN_LABEL: Final[int] = -1
 WINDOW: Final[int] = 5
+LOG_INTERVAL: Final[int] = 50
 
 
 def get_train_transforms(size: Sequence[int]) -> Compose:
@@ -190,6 +192,9 @@ def train(
     train_loss = tm.RunningMean(window=WINDOW).cuda()
     train_acc = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
     val_acc = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
+    logger = CSVLogger(
+        log_dir / "run.csv", interval=LOG_INTERVAL, accumulate_grad_batches=trainer_config.accumulate_grad_batches
+    )
 
     img: Tensor
     label: Tensor
@@ -242,6 +247,7 @@ def train(
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
                 jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1)).mean()
+                # jepa_loss = F.mse_loss(pred, target)
                 train_loss.update(jepa_loss)
 
                 # Compute linear probe loss
@@ -294,6 +300,7 @@ def train(
 
             # Validation epoch end
             rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
+            logger.log(epoch, step, microbatch, acc=val_acc.compute())
 
         gc.collect()
         torch.cuda.synchronize()
