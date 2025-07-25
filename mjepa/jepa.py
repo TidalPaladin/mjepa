@@ -124,7 +124,7 @@ def get_momentum(step: int, total_steps: int, momentum: float) -> float:
     Returns:
         The current momentum value.
     """
-    return momentum + (1 - momentum) * (step / total_steps)
+    return min(momentum + (1 - momentum) * (step / total_steps), 1.0)
 
 
 M = TypeVar("M", bound=nn.Module)
