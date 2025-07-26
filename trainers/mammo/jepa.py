@@ -1,8 +1,9 @@
 import os
+from functools import partial
 from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 from pathlib import Path
-from typing import Final, Tuple, cast
+from typing import Final, Tuple, cast, Sequence
 
 import safetensors.torch as st
 import torch
@@ -16,17 +17,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, DistributedSampler
-from torchvision.transforms.v2 import ColorJitter, Compose, RandomHorizontalFlip, RandomResizedCrop, RandomVerticalFlip
+from torchvision.transforms.v2 import ColorJitter, Compose, RandomHorizontalFlip, RandomResizedCrop, RandomVerticalFlip, RandomApply, RandomRotation
 from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
 from mjepa.augmentation import AugmentationConfig, apply_invert, apply_mixup, apply_noise, apply_posterize
 from mjepa.data import PreprocessedTIFFDataset
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher
+from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher, setup_teacher
 from mjepa.logging import CSVLogger, SaveImage
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
+    DataLoaderFn,
     TrainerConfig,
     assert_all_trainable_params_have_grad,
     calculate_total_steps,
@@ -39,17 +41,19 @@ from mjepa.trainer import (
     save_checkpoint,
     setup_logdir,
     should_step_optimizer,
+    size_change,
+    scale_change,
 )
 
 
 WINDOW: Final[int] = 5
-DEFAULT_SIZE: Final[Tuple[int, int]] = (384, 256)
-LOG_INTERVAL: Final[int] = 50
+LOG_INTERVAL: Final = 50
 
 
-def get_train_transforms(size: Tuple[int, int]) -> Compose:
+def get_train_transforms(size: Sequence[int]) -> Compose:
     return Compose(
         [
+            RandomApply([RandomRotation(degrees=15)], p=0.25),
             RandomResizedCrop(size=size, scale=(0.1, 1.0), ratio=(0.75, 1.33)),
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.5),
@@ -59,9 +63,9 @@ def get_train_transforms(size: Tuple[int, int]) -> Compose:
 
 
 def get_train_dataloader(
-    root: Path,
-    size: Tuple[int, int],
+    size: Sequence[int],
     batch_size: int,
+    root: Path,
     num_workers: int,
     keep_volume: bool,
     shuffle: bool,
@@ -85,7 +89,7 @@ def get_train_dataloader(
 
 def train(
     modules: nn.ModuleDict,
-    train_dataloader: DataLoader,
+    train_dataloader_fn: DataLoaderFn,
     optimizer: Optimizer,
     scheduler: LRScheduler,
     jepa_config: JEPAConfig,
@@ -101,17 +105,18 @@ def train(
     predictor: CrossAttentionPredictor = modules["predictor"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
+    jepa_scale = jepa_config.scale
+
+    # DataLoader setup
+    train_dataloader = train_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
 
     # Teacher setup
-    teacher = deepcopy(backbone)
-    teacher.requires_grad_(False)
-    teacher.eval()
+    teacher = setup_teacher(backbone)
 
+    accumulate_grad_batches = trainer_config.accumulate_grad_batches
     microbatch = (last_epoch + 1) * len(train_dataloader)
-    step = microbatch // trainer_config.accumulate_grad_batches
-    total_steps = calculate_total_steps(
-        train_dataloader, trainer_config.num_epochs, trainer_config.accumulate_grad_batches
-    )
+    step = microbatch // accumulate_grad_batches
+    total_steps = calculate_total_steps(train_dataloader, trainer_config.num_epochs, accumulate_grad_batches)
     rank_zero_info(f"Training for {trainer_config.num_epochs} epochs = {total_steps} steps")
     rank_zero_info(
         f"Batch size: {trainer_config.batch_size}, Microbatch accumulation: {trainer_config.accumulate_grad_batches}"
@@ -127,11 +132,27 @@ def train(
 
     img: Tensor
     for epoch in range(last_epoch + 1, trainer_config.num_epochs):
+        # Update training resolution / batch_size / accumulate_grad_batches if necessary
+        if trainer_config.is_size_change_epoch(epoch):
+            size_config = trainer_config.sizes[epoch]
+            train_dataloader, _, accumulate_grad_batches = size_change(
+                size_config,
+                trainer_config.batch_size,
+                accumulate_grad_batches,
+                train_dataloader_fn,
+                None,
+            )
+            jepa_scale = scale_change(backbone.config.img_size, size_config, jepa_scale)
+            rank_zero_info(
+                f"Changing size to {size_config.size} and batch size to {size_config.batch_size} (accumulate grad batches: {accumulate_grad_batches})"
+            )
+
         modules.train()
         desc = format_pbar_description(step, microbatch, epoch, loss=train_loss)
         pbar = tqdm(train_dataloader, desc=desc, disable=not is_rank_zero(), leave=False)
         for img in pbar:
             img = img.cuda()
+            tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
             if microbatch == 0:
                 image_saver(img)
 
@@ -170,8 +191,9 @@ def train(
             logger.log(epoch, step, microbatch, loss=train_loss.compute().item())
 
             # Optimizer update and teacher update
-            if should_step_optimizer(microbatch, trainer_config.accumulate_grad_batches):
-                scheduler.step()
+            if should_step_optimizer(microbatch, accumulate_grad_batches):
+                if step < total_steps:
+                    scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
                 current_momentum = get_momentum(step, total_steps, jepa_config.momentum)
@@ -226,7 +248,6 @@ def parse_args() -> Namespace:
     parser.add_argument("-l", "--log-dir", type=Path, default=None, help="Directory to save logs")
     parser.add_argument("--local-rank", type=int, default=1, help="Local rank / device")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to checkpoint to load")
-    parser.add_argument("--size", type=int, nargs=2, default=DEFAULT_SIZE, help="Training image size")
     return parser.parse_args()
 
 
@@ -269,19 +290,21 @@ def main(args: Namespace) -> None:
     # Instantiate dataloaders
     keep_volume = False
     shuffle = True
-    train_dataloader = get_train_dataloader(
-        args.data,
-        args.size,
-        trainer_config.batch_size,
-        trainer_config.num_workers,
-        keep_volume,
-        shuffle,
-        local_rank,
-        world_size,
+    train_dataloader_fn = partial(
+        get_train_dataloader,
+        root=args.data,
+        num_workers=trainer_config.num_workers,
+        local_rank=local_rank,
+        world_size=world_size,
+        keep_volume=keep_volume,
+        shuffle=shuffle,
     )
+    train_dataloader = train_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
 
     # Instantiate optimizer and scheduler
-    total_steps = trainer_config.num_epochs * len(train_dataloader) // trainer_config.accumulate_grad_batches
+    total_steps = calculate_total_steps(
+        train_dataloader, trainer_config.num_epochs, trainer_config.accumulate_grad_batches
+    )
     optimizer, scheduler = optimizer_config.instantiate(wrapper, total_steps=total_steps)
 
     # Create log subdirectory with timestamp
@@ -291,10 +314,9 @@ def main(args: Namespace) -> None:
         log_dir = None
 
     ignore_warnings()
-    rank_zero_info(f"Training with image size {tuple(args.size)}")
     train(
         wrapper,
-        train_dataloader,
+        train_dataloader_fn,
         optimizer,
         scheduler,
         jepa_config,
