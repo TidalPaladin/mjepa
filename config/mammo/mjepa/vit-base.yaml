@@ -2,7 +2,11 @@
 trainer: !!python/object:mjepa.TrainerConfig
   batch_size: 256
   num_workers: 24 
-  num_epochs: 300
+  num_epochs: 350
+  sizes:
+    300: !!python/object:mjepa.ResolutionConfig
+      size: [512, 384]
+      batch_size: 64
 
 backbone: !!python/object:vit.ViTConfig
   in_channels: 1
@@ -12,9 +16,9 @@ backbone: !!python/object:vit.ViTConfig
   img_size: [256, 192]
   depth: 12
   num_attention_heads: 12
-  activation: "swiglu"
+  activation: "srelu"
   bias: false
-  attention_dropout: 0.1
+  attention_dropout: 0.0
   hidden_dropout: 0.1
   drop_path_rate: 0.1
   num_register_tokens: 16
@@ -22,7 +26,7 @@ backbone: !!python/object:vit.ViTConfig
   layer_scale: 0.00001
 
 augmentations: !!python/object:mjepa.AugmentationConfig
-  mixup_prob: 0.1
+  mixup_prob: 0.2
   mixup_alpha: 1.0
   use_noise: true
   noise_prob: 0.1
@@ -34,16 +38,16 @@ augmentations: !!python/object:mjepa.AugmentationConfig
   posterize_bits: 6
 
 jepa: !!python/object:mjepa.JEPAConfig
-  momentum: 0.99
-  predictor_depth: 5
+  momentum: 0.98
+  predictor_depth: 3
   context_ratio: 0.5
-  target_ratio: 0.25
+  target_ratio: 0.5
   scale: 4
 
 optimizer: !!python/object:mjepa.OptimizerConfig
   optimizer: "adamw"
-  lr: 0.0001
-  weight_decay: 0.05
+  lr: 0.00025
+  weight_decay: 0.1
   betas: [0.85, 0.95]
   fused: true
   pct_start: 0.01
