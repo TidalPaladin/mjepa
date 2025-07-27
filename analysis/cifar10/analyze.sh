@@ -7,7 +7,7 @@ OUTPUT=./analysis/cifar10/
 DATA=/mnt/data/cifar10/cifar-10-batches-py
 
 CONFIG=config/cifar10/mjepa/vit-small.yaml
-BACKBONE=output/cifar10/2025-06-29_23-44-56_mjepa-vit-s-fourier-linprobe
+BACKBONE=cifar10-ablations/2025-07-25_10-55-35_mjepa-vit-s-usebestresults
 
 pdm run scripts/cifar10_visualize.py \
     $CONFIG \
@@ -33,3 +33,10 @@ pdm run scripts/runtime_visualize.py \
     $CONFIG \
     $OUTPUT/runtime.png \
     -d $DEVICE -dt bf16 --scales 0.25 0.5 1.0 2.0 4.0 -b 32
+
+pdm run scripts/cifar10_attention.py \
+    $CONFIG \
+    $BACKBONE/backbone.safetensors \
+    $DATA \
+    $OUTPUT/attention.png \
+    -d $DEVICE -dt bf16 --head cls -s $SIZE

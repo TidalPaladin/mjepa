@@ -221,7 +221,7 @@ def load_checkpoint(
     Returns:
         Tuple of current step, epoch.
     """
-    data = torch.load(path)
+    data = torch.load(path, weights_only=False)
     old_img_size = (256, 256)
     old_tokenized_size = backbone.stem.tokenized_size(old_img_size)
     new_tokenized_size = backbone.stem.tokenized_size(backbone.config.img_size)
