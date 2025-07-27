@@ -247,7 +247,6 @@ def train(
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
                 jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1)).mean()
-                # jepa_loss = F.mse_loss(pred, target)
                 train_loss.update(jepa_loss)
 
                 # Compute linear probe loss

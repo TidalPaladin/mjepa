@@ -1,7 +1,6 @@
 import gc
-import math
+import logging
 import os
-import warnings
 from argparse import ArgumentParser, Namespace
 from functools import partial
 from pathlib import Path
@@ -11,10 +10,8 @@ import safetensors.torch as st
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import torchmetrics as tm
 import yaml
-from einops import rearrange
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
@@ -37,11 +34,17 @@ from torchvision.transforms.v2 import (
 )
 from tqdm import tqdm
 from vit import ViT, ViTConfig
-from vit.tokens import apply_mask
 
-from mjepa.jepa import CrossAttentionPredictor, generate_masks
+from mjepa.augmentation import (
+    AugmentationConfig,
+    apply_invert,
+    apply_mixup,
+    apply_noise,
+    apply_posterize,
+    cross_entropy_mixup,
+    is_mixed,
+)
 from mjepa.logging import CSVLogger
-from mjepa.mae import MAEConfig
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
     DataLoaderFn,
@@ -53,9 +56,9 @@ from mjepa.trainer import (
     format_pbar_description,
     ignore_warnings,
     is_rank_zero,
+    load_checkpoint,
     rank_zero_info,
     save_checkpoint,
-    scale_change,
     setup_logdir,
     should_step_optimizer,
     size_change,
@@ -66,10 +69,6 @@ NUM_CLASSES: Final[int] = 10
 UNKNOWN_LABEL: Final[int] = -1
 WINDOW: Final[int] = 5
 LOG_INTERVAL: Final[int] = 50
-
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 def get_train_transforms(size: Sequence[int]) -> Compose:
@@ -155,7 +154,7 @@ def train(
     val_dataloader_fn: DataLoaderFn,
     optimizer: Optimizer,
     scheduler: LRScheduler,
-    mae_config: MAEConfig,
+    augmentation_config: AugmentationConfig,
     trainer_config: TrainerConfig,
     log_dir: Path | None = None,
     last_epoch: int = -1,
@@ -164,10 +163,7 @@ def train(
     rank_zero_info(f"Starting training, logging to {log_dir if log_dir else 'console only'}")
     optimizer.zero_grad()
     backbone: ViT = modules["backbone"]
-    predictor: CrossAttentionPredictor = modules["predictor"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
-    rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
-    mae_scale = mae_config.scale
 
     # DataLoader setup
     train_dataloader = train_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
@@ -203,7 +199,6 @@ def train(
                 train_dataloader_fn,
                 val_dataloader_fn,
             )
-            mae_scale = scale_change(backbone.config.img_size, size_config, mae_scale)
             rank_zero_info(
                 f"Changing size to {size_config.size} and batch size to {size_config.batch_size} (accumulate grad batches: {accumulate_grad_batches})"
             )
@@ -212,36 +207,34 @@ def train(
         desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
         pbar = tqdm(train_dataloader, desc=desc, disable=not is_rank_zero(), leave=False)
         for img, label in pbar:
+            B = img.shape[0]
             img = img.cuda()
             label = label.cuda()
+            tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
 
-            # Fold the image to create the target
-            hp, wp = backbone.config.patch_size
-            target = rearrange(img, "b c (h hp) (w wp) -> b (h w) (hp wp c)", hp=hp, wp=wp)
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # Masked forward through backbone and predictor
-                context_mask, target_mask = generate_masks(
-                    backbone, img, mae_config.context_ratio, mae_config.target_ratio, mae_config.scale
-                )
-                context = cast(Tensor, backbone(img, mask=context_mask))
-                tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
-                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
-
-                # Compute MAE loss
-                target = apply_mask(target_mask, target, fill_value=None)
-                mae_loss = F.l1_loss(pred, target)
-                train_loss.update(mae_loss)
-
-                # Compute linear probe loss
-                probe_pred = backbone.heads["cls"](context.detach())
-                probe_loss = F.cross_entropy(probe_pred, label)
-
-                # Combine losses
-                loss = mae_loss + probe_loss
-
+            # Apply augmentations
             with torch.no_grad():
-                train_acc.update(probe_pred, label)
+                img = apply_noise(augmentation_config, img)
+                mixup_seed, (img,) = apply_mixup(augmentation_config, img)
+                img = apply_invert(augmentation_config, img)[0]
+                img = apply_posterize(augmentation_config, img)[0]
+
+            # Forward pass and loss
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                features = cast(Tensor, backbone(img))
+                pred = backbone.heads["cls"](features)
+
+                loss = cross_entropy_mixup(
+                    pred, label, mixup_seed, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
+                ).mean()
+                train_loss.update(loss)
+
+            # Metric computation
+            with torch.no_grad():
+                mask = is_mixed(
+                    B, augmentation_config.mixup_prob, augmentation_config.mixup_alpha, mixup_seed
+                ).logical_not_()
+                train_acc.update(pred[mask], label[mask])
 
             # Backward
             assert not loss.isnan()
@@ -266,12 +259,13 @@ def train(
             modules.eval()
             val_acc.reset()
             for img, label in tqdm(val_dataloader, desc=f"Validating: ", disable=not is_rank_zero(), leave=False):
+                B = img.shape[0]
                 img = img.cuda()
                 label = label.cuda()
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    full_output = cast(Tensor, backbone(img))
-                    probe_pred = backbone.heads["cls"](full_output)
-                    val_acc.update(probe_pred, label)
+                    features = cast(Tensor, backbone(img))
+                    pred = backbone.heads["cls"](features)
+                    val_acc.update(pred, label)
 
             # Validation epoch end
             rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
@@ -286,7 +280,7 @@ def train(
             save_checkpoint(
                 path=log_dir / f"checkpoint.pt",
                 backbone=backbone,
-                predictor=predictor,
+                predictor=None,
                 teacher=None,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -308,12 +302,13 @@ def train(
 
 def ddp_setup() -> None:
     dist.init_process_group(backend="nccl")
+    logging.info("Initialized DDP")
 
 
 def parse_args() -> Namespace:
     parser = ArgumentParser()
     parser.add_argument("config", type=Path, help="Path to YAML configuration file")
-    parser.add_argument("data", type=Path)
+    parser.add_argument("data", type=Path, help="Path to training data")
     parser.add_argument(
         "-n", "--name", type=str, default=None, help="Name of the run. Will be appended to the log subdirectory."
     )
@@ -330,11 +325,11 @@ def main(args: Namespace) -> None:
 
     # Extract instantiated dataclasses from config
     backbone_config = config["backbone"]
-    mae_config = config["mae"]
+    augmentation_config = config["augmentations"]
     optimizer_config = config["optimizer"]
     trainer_config = config["trainer"]
     assert isinstance(backbone_config, ViTConfig)
-    assert isinstance(mae_config, MAEConfig)
+    assert isinstance(augmentation_config, AugmentationConfig)
     assert isinstance(optimizer_config, OptimizerConfig)
     assert isinstance(trainer_config, TrainerConfig)
     if args.log_dir and not args.log_dir.is_dir():
@@ -349,10 +344,7 @@ def main(args: Namespace) -> None:
 
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
-    out_dim = math.prod(backbone.config.patch_size) * backbone.config.in_channels
-    predictor = CrossAttentionPredictor(backbone, mae_config.predictor_depth, out_dim)
-    wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor}).cuda()
-    nn.init.constant_(predictor.predictor_proj.bias, 0.5)
+    wrapper = nn.ModuleDict({"backbone": backbone}).cuda()
 
     # Wrap in DDP for distributed training
     if world_size > 1:
@@ -382,6 +374,18 @@ def main(args: Namespace) -> None:
     )
     optimizer, scheduler = optimizer_config.instantiate(wrapper, total_steps=total_steps)
 
+    if args.checkpoint:
+        # NOTE: For now only support fresh checkpoint
+        load_checkpoint(
+            args.checkpoint,
+            backbone,
+            None,
+            None,
+            optimizer,
+            scheduler,
+            mode="fresh",
+        )
+
     # Create log subdirectory with timestamp
     if args.log_dir:
         log_dir = setup_logdir(args.log_dir, config_path, name=args.name)
@@ -389,7 +393,16 @@ def main(args: Namespace) -> None:
         log_dir = None
 
     ignore_warnings()
-    train(wrapper, train_dataloader_fn, val_dataloader_fn, optimizer, scheduler, mae_config, trainer_config, log_dir)
+    train(
+        wrapper,
+        train_dataloader_fn,
+        val_dataloader_fn,
+        optimizer,
+        scheduler,
+        augmentation_config,
+        trainer_config,
+        log_dir,
+    )
 
 
 def entrypoint() -> None:
