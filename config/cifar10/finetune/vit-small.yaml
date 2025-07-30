@@ -1,4 +1,4 @@
-# Config for training ViT-S/4 using MJEPA on CIFAR-10.
+# Config for fine-tuning a pretrained ViT-S/4 on CIFAR-10.
 trainer: !!python/object:mjepa.TrainerConfig
   batch_size: 256
   num_workers: 24 
