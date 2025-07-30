@@ -1,17 +1,20 @@
-# Config for fine-tuning a pretrained ViT-S/4 on CIFAR-10.
+# Config for training ViT-S/4 from scratch on CIFAR-10.
 trainer: !!python/object:mjepa.TrainerConfig
-  batch_size: 256
+  batch_size: 1024
   num_workers: 24 
   num_epochs: 1500
-  check_val_every_n_epoch: 5
-  accumulate_grad_batches: 4
+  check_val_every_n_epoch: 10
+  sizes:
+    1000: !!python/object:mjepa.ResolutionConfig
+      size: [64, 64]
+      batch_size: 256
 
 backbone: !!python/object:vit.ViTConfig
   in_channels: 3
   hidden_size: 384
   ffn_hidden_size: 1536
   patch_size: [4, 4]
-  img_size: [64, 64]
+  img_size: [32, 32]
   depth: 12
   num_attention_heads: 12
   activation: "srelu"
@@ -43,7 +46,7 @@ augmentations: !!python/object:mjepa.AugmentationConfig
 
 optimizer: !!python/object:mjepa.OptimizerConfig
   optimizer: "adamw"
-  lr: 0.00001
+  lr: 0.0005
   weight_decay: 0.1
   betas: [0.85, 0.95]
   fused: true
