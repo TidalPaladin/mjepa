@@ -433,6 +433,17 @@ class TrainerConfig:
     check_val_every_n_epoch: int = 1
     sizes: Dict[int, ResolutionConfig] = field(default_factory=dict)
 
+    def __post_init__(self):
+        for epoch, size_config in self.sizes.items():
+            if not isinstance(epoch, int):
+                self.sizes[int(epoch)] = size_config
+            del self.sizes[epoch]
+            if not 0 <= epoch <= self.num_epochs:
+                raise ValueError(f"Resolution config for epoch {epoch} is not between 0 and {self.num_epochs}")
+
+            if not isinstance(size_config, ResolutionConfig):
+                raise TypeError(f"Size config for epoch {epoch} is not a ResolutionConfig")
+
     def is_size_change_epoch(self, epoch: int) -> bool:
         return epoch in self.sizes
 
