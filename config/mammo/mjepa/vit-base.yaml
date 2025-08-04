@@ -1,12 +1,15 @@
 # Config for training ViT-B/16 using MJEPA on mammography.
 trainer: !!python/object:mjepa.TrainerConfig
-  batch_size: 256
+  batch_size: 512
   num_workers: 24 
-  num_epochs: 350
+  num_epochs: 375
   sizes:
     300: !!python/object:mjepa.ResolutionConfig
       size: [512, 384]
-      batch_size: 64
+      batch_size: 128
+    350: !!python/object:mjepa.ResolutionConfig
+      size: [1024, 768]
+      batch_size: 32
 
 backbone: !!python/object:vit.ViTConfig
   in_channels: 1

@@ -435,12 +435,8 @@ class TrainerConfig:
 
     def __post_init__(self):
         for epoch, size_config in self.sizes.items():
-            if not isinstance(epoch, int):
-                self.sizes[int(epoch)] = size_config
-            del self.sizes[epoch]
             if not 0 <= epoch <= self.num_epochs:
                 raise ValueError(f"Resolution config for epoch {epoch} is not between 0 and {self.num_epochs}")
-
             if not isinstance(size_config, ResolutionConfig):
                 raise TypeError(f"Size config for epoch {epoch} is not a ResolutionConfig")
 

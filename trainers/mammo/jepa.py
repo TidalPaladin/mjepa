@@ -1,9 +1,8 @@
 import os
-from functools import partial
 from argparse import ArgumentParser, Namespace
-from copy import deepcopy
+from functools import partial
 from pathlib import Path
-from typing import Final, Tuple, cast, Sequence
+from typing import Final, Sequence, Tuple, cast
 
 import safetensors.torch as st
 import torch
@@ -17,14 +16,22 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, DistributedSampler
-from torchvision.transforms.v2 import ColorJitter, Compose, RandomHorizontalFlip, RandomResizedCrop, RandomVerticalFlip, RandomApply, RandomRotation
+from torchvision.transforms.v2 import (
+    ColorJitter,
+    Compose,
+    RandomApply,
+    RandomHorizontalFlip,
+    RandomResizedCrop,
+    RandomRotation,
+    RandomVerticalFlip,
+)
 from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
 from mjepa.augmentation import AugmentationConfig, apply_invert, apply_mixup, apply_noise, apply_posterize
 from mjepa.data import PreprocessedTIFFDataset
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, update_teacher, setup_teacher
+from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, setup_teacher, update_teacher
 from mjepa.logging import CSVLogger, SaveImage
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
@@ -39,10 +46,10 @@ from mjepa.trainer import (
     is_rank_zero,
     rank_zero_info,
     save_checkpoint,
+    scale_change,
     setup_logdir,
     should_step_optimizer,
     size_change,
-    scale_change,
 )
 
 
@@ -71,7 +78,13 @@ def get_train_dataloader(
     shuffle: bool,
     local_rank: int,
     world_size: int,
+    highres_data: Path | None = None,
+    highres_cutoff: Tuple[int, int] = (1024, 768),
 ) -> DataLoader:
+    if size[0] >= highres_cutoff[0] or size[1] >= highres_cutoff[1]:
+        root = highres_data
+    else:
+        root = root
     transforms = get_train_transforms(size)
     dataset = PreprocessedTIFFDataset(root=root, training=True, transform=transforms, keep_volume=keep_volume)
     if world_size > 1:
@@ -142,9 +155,10 @@ def train(
                 train_dataloader_fn,
                 None,
             )
-            jepa_scale = scale_change(backbone.config.img_size, size_config, jepa_scale)
+            jepa_scale = scale_change(backbone.config.img_size, size_config, jepa_config.scale)
             rank_zero_info(
-                f"Changing size to {size_config.size} and batch size to {size_config.batch_size} (accumulate grad batches: {accumulate_grad_batches})"
+                f"Changing size to {size_config.size} and batch size to {size_config.batch_size} "
+                f"(accumulate grad batches: {accumulate_grad_batches}, jepa scale: {jepa_scale})"
             )
 
         modules.train()
@@ -172,7 +186,7 @@ def train(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # Masked forward through student and predictor
                 context_mask, target_mask = generate_masks(
-                    backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_config.scale
+                    backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
                 )
                 context = cast(Tensor, backbone(img, mask=context_mask))
                 tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
@@ -248,6 +262,14 @@ def parse_args() -> Namespace:
     parser.add_argument("-l", "--log-dir", type=Path, default=None, help="Directory to save logs")
     parser.add_argument("--local-rank", type=int, default=1, help="Local rank / device")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to checkpoint to load")
+    parser.add_argument("--highres-data", type=Path, default=None, help="Path to high resolution training data")
+    parser.add_argument(
+        "--highres-cutoff",
+        type=int,
+        nargs=2,
+        default=(1024, 768),
+        help="Resolution cutoff at which to switch to high resolution data",
+    )
     return parser.parse_args()
 
 
@@ -298,6 +320,8 @@ def main(args: Namespace) -> None:
         world_size=world_size,
         keep_volume=keep_volume,
         shuffle=shuffle,
+        highres_data=args.highres_data,
+        highres_cutoff=args.highres_cutoff,
     )
     train_dataloader = train_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
 

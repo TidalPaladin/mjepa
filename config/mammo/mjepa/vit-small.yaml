@@ -2,7 +2,7 @@
 trainer: !!python/object:mjepa.TrainerConfig
   batch_size: 512
   num_workers: 24 
-  num_epochs: 450
+  num_epochs: 365
   sizes:
     300: !!python/object:mjepa.ResolutionConfig
       size: [512, 384]
@@ -10,7 +10,7 @@ trainer: !!python/object:mjepa.TrainerConfig
     350: !!python/object:mjepa.ResolutionConfig
       size: [1024, 768]
       batch_size: 32
-    400: !!python/object:mjepa.ResolutionConfig
+    360: !!python/object:mjepa.ResolutionConfig
       size: [2048, 1536]
       batch_size: 8
 
