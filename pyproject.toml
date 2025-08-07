@@ -5,7 +5,7 @@ build-backend = "pdm.pep517.api"
 [project]
 name = "mjepa"
 description = ""
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [
     {name = "Scott Chase Waggener", email = "chase.waggener@icloud.com"},
 ]
@@ -21,17 +21,11 @@ dependencies = [
   "safetensors",
   "tqdm",
   "vit @ git+https://github.com/TidalPaladin/vit.git",
-  "convnext @ git+https://github.com/TidalPaladin/convnext.git",
   "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
 ]
 readme = "README.md"
 license = {text = "Apache"}
 dynamic = ["version"]
-
-[[tool.pdm.source]]
-name = "PyTorch"
-url = "https://download.pytorch.org/whl/cu128"
-include_packages = ["torch", "torchvision"]
 
 [tool.autoflake]
 remove-all-unused-imports = true
