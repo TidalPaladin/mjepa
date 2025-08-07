@@ -209,9 +209,10 @@ def train(
                 train_dataloader_fn,
                 val_dataloader_fn,
             )
-            jepa_scale = scale_change(backbone.config.img_size, size_config, jepa_scale)
+            jepa_scale = scale_change(backbone.config.img_size, size_config, jepa_config.scale)
             rank_zero_info(
-                f"Changing size to {size_config.size} and batch size to {size_config.batch_size} (accumulate grad batches: {accumulate_grad_batches})"
+                f"Changing size to {size_config.size} and batch size to {size_config.batch_size} "
+                f"(accumulate grad batches: {accumulate_grad_batches}, jepa scale: {jepa_scale})"
             )
 
         modules.train()
@@ -246,7 +247,7 @@ def train(
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                jepa_loss = (1 - F.cosine_similarity(pred, target, dim=-1)).mean()
+                jepa_loss = F.mse_loss(pred, target)
                 train_loss.update(jepa_loss)
 
                 # Compute linear probe loss

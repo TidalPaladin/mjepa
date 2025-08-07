@@ -6,6 +6,7 @@ from functools import partial
 from pathlib import Path
 from typing import Final, Sequence, cast
 
+import numpy as np
 import safetensors.torch as st
 import torch
 import torch.distributed as dist
@@ -96,6 +97,40 @@ def get_val_transforms(size: Sequence[int]) -> Compose:
     )
 
 
+def convert_to_few_shot(dataset: CIFAR10, few_shot: int) -> CIFAR10:
+    """Convert dataset to few-shot by selecting examples from each class.
+
+    Args:
+        dataset: CIFAR10 dataset to convert
+        few_shot: Number of examples per class to keep
+    """
+    # Convert targets to numpy for easier indexing
+    targets_array = np.array(dataset.targets)
+
+    # Find indices for each class
+    selected_indices = []
+    for class_idx in range(NUM_CLASSES):
+        class_indices = np.where(targets_array == class_idx)[0]
+        # Deterministically select first few_shot examples of each class
+        selected_class_indices = class_indices[:few_shot]
+        selected_indices.extend(selected_class_indices)
+
+    selected_indices = np.array(selected_indices)
+
+    # Update dataset in place
+    dataset.data = dataset.data[selected_indices]
+    dataset.targets = [dataset.targets[i] for i in selected_indices]
+
+    # Verify the few-shot constraint is met for each class
+    assert len(dataset) == few_shot * NUM_CLASSES
+    targets_array = np.array(dataset.targets)
+    for class_idx in range(NUM_CLASSES):
+        class_count = np.sum(targets_array == class_idx)
+        assert class_count == few_shot, f"Class {class_idx} has {class_count} examples, expected {few_shot}"
+
+    return dataset
+
+
 def get_train_dataloader(
     size: Sequence[int],
     batch_size: int,
@@ -103,9 +138,13 @@ def get_train_dataloader(
     num_workers: int,
     local_rank: int,
     world_size: int,
+    few_shot: int | None = None,
 ) -> DataLoader:
     transforms = get_train_transforms(size)
     dataset = CIFAR10(root=root, train=True, transform=transforms, download=True)
+    if few_shot:
+        dataset = convert_to_few_shot(dataset, few_shot)
+
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
         return DataLoader(
@@ -221,7 +260,9 @@ def train(
 
             # Forward pass and loss
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                backbone.eval()
                 features = cast(Tensor, backbone(img))
+                backbone.train()
                 pred = backbone.heads["cls"](features)
 
                 loss = cross_entropy_mixup(
@@ -315,6 +356,9 @@ def parse_args() -> Namespace:
     parser.add_argument("-l", "--log-dir", type=Path, default=None, help="Directory to save logs")
     parser.add_argument("--local-rank", type=int, default=1, help="Local rank / device")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to checkpoint to load")
+    parser.add_argument("--fresh-head", default=False, action="store_true", help="Use fresh head weights")
+    parser.add_argument("--few-shot", type=int, help="Number of shots for few-shot learning")
+    parser.add_argument("--head-only", default=False, action="store_true", help="Freeze the backbone")
     return parser.parse_args()
 
 
@@ -358,6 +402,7 @@ def main(args: Namespace) -> None:
         num_workers=trainer_config.num_workers,
         local_rank=local_rank,
         world_size=world_size,
+        few_shot=args.few_shot,
     )
     val_dataloader_fn = partial(
         get_val_dataloader,
@@ -385,6 +430,16 @@ def main(args: Namespace) -> None:
             scheduler,
             mode="fresh",
         )
+        if args.fresh_head:
+            for head in backbone.heads.values():
+                head.reset_parameters()
+
+    if args.head_only:
+        for param in backbone.parameters():
+            param.requires_grad_(False)
+        for param in backbone.heads.parameters():
+            param.requires_grad_(True)
+        backbone.mlp_requires_grad_(True)
 
     # Create log subdirectory with timestamp
     if args.log_dir:
