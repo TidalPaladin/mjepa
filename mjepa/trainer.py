@@ -244,10 +244,9 @@ def load_checkpoint(
         predictor.load_state_dict(data["predictor"], strict=strict)
         resize_learnable_pos_enc(predictor, new_tokenized_size)
     if teacher:
-        pass
-        # resize_learnable_pos_enc(teacher, old_tokenized_size)
-        # teacher.load_state_dict(data["teacher"], strict=strict)
-        # resize_learnable_pos_enc(teacher, new_tokenized_size)
+        resize_learnable_pos_enc(teacher, old_tokenized_size)
+        teacher.load_state_dict(data["teacher"], strict=strict)
+        resize_learnable_pos_enc(teacher, new_tokenized_size)
 
     # Load optimizer and scheduler if resuming.
     if mode == "resume":
