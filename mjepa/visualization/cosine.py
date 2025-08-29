@@ -10,9 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from dicom_preprocessing import load_tiff_f32
-from einops import rearrange, reduce
+from einops import rearrange
 from torch import Tensor
-from torchvision.transforms.v2.functional import to_pil_image
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 from vit import ViT, ViTConfig
@@ -24,7 +23,10 @@ register_constructors()
 
 
 def cosine_similarity_heatmap(
-    features: Tensor, target_coords: List[Tuple[int, int]], normalize: Sequence[str] = ["spatial"], combine_coords: bool = False
+    features: Tensor,
+    target_coords: List[Tuple[int, int]],
+    normalize: Sequence[str] = ["spatial"],
+    combine_coords: bool = False,
 ) -> Tensor:
     """Compute cosine similarity heatmaps between target coordinates and all other tokens.
 
@@ -40,28 +42,28 @@ def cosine_similarity_heatmap(
     """
     n, h, w, d = features.shape
     features_flat = rearrange(features, "n h w d -> n (h w) d")
-    
+
     # Normalize features for cosine similarity
     features_norm = F.normalize(features_flat, dim=-1)
-    
+
     similarity_maps = []
-    
+
     for row, col in target_coords:
         # Ensure coordinates are within bounds
         row = max(0, min(row, h - 1))
         col = max(0, min(col, w - 1))
-        
+
         # Get target token index
         target_idx = row * w + col
         target_tokens = features_norm[:, target_idx, :]  # Shape: (n, d)
-        
+
         # Compute cosine similarities
         similarities = torch.einsum("nd,nmd->nm", target_tokens, features_norm)  # Shape: (n, h*w)
-        
+
         # Reshape back to spatial dimensions
         similarities = rearrange(similarities, "n (h w) -> n h w", h=h, w=w)
         similarity_maps.append(similarities)
-    
+
     if combine_coords:
         # Average all similarity maps to combine multiple coordinates
         combined_heatmap = torch.stack(similarity_maps, dim=-1).mean(dim=-1, keepdim=True)  # Shape: (n, h, w, 1)
@@ -69,7 +71,7 @@ def cosine_similarity_heatmap(
     else:
         # Stack along last dimension (original behavior)
         heatmaps = torch.stack(similarity_maps, dim=-1)  # Shape: (n, h, w, num_targets)
-    
+
     # Normalize to [0,1] range
     norm_axes = []
     if "batch" in normalize:
@@ -78,10 +80,10 @@ def cosine_similarity_heatmap(
         norm_axes.append(3)
     if "spatial" in normalize:
         norm_axes += [1, 2]
-    
+
     heatmaps = heatmaps - heatmaps.amin(dim=norm_axes, keepdim=True)
     heatmaps = heatmaps / (heatmaps.amax(dim=norm_axes, keepdim=True) + 1e-8)
-    
+
     return heatmaps.float()
 
 
@@ -163,7 +165,7 @@ class ExpandImagePathsAction(Action):
 @dataclass
 class CosineVisualizer:
     """Visualizer for cosine similarity heatmaps between target tokens and all other tokens."""
-    
+
     model: ViT
     target_coords: List[Tuple[int, int]]
     device: torch.device = torch.device("cpu")
@@ -206,51 +208,48 @@ class CosineVisualizer:
         x = rearrange(x, "... h w c -> ... c h w").to(self.device)
         return x
 
-    def _draw_red_x(self, img: Tensor, coords: Tuple[int, int], token_size: Tuple[float, float]) -> Tensor:
-        """Draw a red X marker at the specified token coordinate.
-        
+    def _draw_red_box(self, img: Tensor, coords: Tuple[int, int], token_size: Tuple[float, float]) -> Tensor:
+        """Draw a red box covering the entire token at the specified coordinate.
+
         Args:
             img: Image tensor with shape (n, c, h, w)
             coords: (row, col) token coordinate
             token_size: (token_h, token_w) size of each token in pixels (float values)
-            
+
         Returns:
-            Image with red X overlay
+            Image with red box overlay
         """
         n, c, h, w = img.shape
         row, col = coords
         token_h, token_w = token_size
-        
-        # Calculate pixel coordinates for the center of the token
-        center_y = int((row + 0.5) * token_h)
-        center_x = int((col + 0.5) * token_w)
-        
-        # Define X size (make it about 80% of token size)
-        x_size_h = max(1, int(0.4 * token_h))
-        x_size_w = max(1, int(0.4 * token_w))
-        
+
+        # Calculate pixel boundaries for the entire token
+        start_y = int(row * token_h)
+        end_y = int((row + 1) * token_h)
+        start_x = int(col * token_w)
+        end_x = int((col + 1) * token_w)
+
+        # Ensure boundaries are within image bounds
+        start_y = max(0, start_y)
+        end_y = min(h, end_y)
+        start_x = max(0, start_x)
+        end_x = min(w, end_x)
+
         # Create a copy to avoid modifying the original
-        img_with_x = img.clone()
-        
-        # Draw the X by setting red channel to 1.0 and others to 0.0
-        for i in range(-x_size_h, x_size_h + 1):
-            for j in range(-x_size_w, x_size_w + 1):
-                y = center_y + i
-                x = center_x + j
-                
-                # Check if we're drawing the diagonal lines of the X
-                if (abs(i) == abs(j)) and 0 <= y < h and 0 <= x < w:
-                    img_with_x[:, 0, y, x] = 1.0  # Red channel
-                    img_with_x[:, 1, y, x] = 0.0  # Green channel  
-                    img_with_x[:, 2, y, x] = 0.0  # Blue channel
-        
-        return img_with_x
+        img_with_box = img.clone()
+
+        # Fill the entire token area with red
+        img_with_box[:, 0, start_y:end_y, start_x:end_x] = 1.0  # Red channel
+        img_with_box[:, 1, start_y:end_y, start_x:end_x] = 0.0  # Green channel
+        img_with_box[:, 2, start_y:end_y, start_x:end_x] = 0.0  # Blue channel
+
+        return img_with_box
 
     def _compute_cosine_heatmaps(self, features: Tensor, output_size: Sequence[int]) -> Tensor:
         """Compute cosine similarity heatmaps for all target coordinates."""
         heatmaps = cosine_similarity_heatmap(features, self.target_coords, self.normalize, self.combine_coords)
         visualizations: List[Tensor] = []
-        
+
         for i in range(heatmaps.shape[-1]):
             heatmap_i = heatmaps[..., i].unsqueeze_(1)
             heatmap_i = F.interpolate(heatmap_i, size=output_size, mode="nearest")
@@ -264,36 +263,36 @@ class CosineVisualizer:
         """Create visualization grid with original image and heatmaps."""
         # Expand grayscale to RGB if needed
         img = img.expand(-1, 3, -1, -1)
-        
+
         # Calculate token size in pixels
         h, w = img.shape[-2:]
         feature_h, feature_w = features_shape[:2]
         token_h = h / feature_h
         token_w = w / feature_w
-        
+
         # Original image has no markers
         img_no_markers = img.clone()
-        
-        # Add red X markers to heatmaps - each heatmap gets only its corresponding coordinate marker
+
+        # Add red box markers to heatmaps - each heatmap gets only its corresponding coordinate marker
         heatmaps_with_markers = heatmaps.clone()
-        
+
         # Split heatmaps along width to process each one individually
         # heatmaps has shape (n, c, h, total_w) where total_w = w * num_coords
         num_coords = len(self.target_coords)
         coord_width = heatmaps.shape[-1] // num_coords
-        
+
         for i, coords in enumerate(self.target_coords):
             # Extract the specific heatmap for this coordinate
             start_idx = i * coord_width
             end_idx = (i + 1) * coord_width
             heatmap_slice = heatmaps_with_markers[:, :, :, start_idx:end_idx]
-            
-            # Add red X marker only to this specific heatmap
-            heatmap_with_marker = self._draw_red_x(heatmap_slice, coords, (token_h, token_w))
-            
+
+            # Add red box marker only to this specific heatmap
+            heatmap_with_marker = self._draw_red_box(heatmap_slice, coords, (token_h, token_w))
+
             # Put it back
             heatmaps_with_markers[:, :, :, start_idx:end_idx] = heatmap_with_marker
-        
+
         elements = torch.cat([img_no_markers, heatmaps_with_markers], dim=-1)
         kwargs.setdefault("nrow", 1)
         grid = make_grid(elements, **kwargs)
@@ -332,8 +331,7 @@ class CosineVisualizer:
     def create_parser(cls: Type[Self], custom_loader: bool = False) -> ArgumentParser:
         """Create argument parser with built-in validation."""
         parser = ArgumentParser(
-            prog="cosine-visualize", 
-            description="Visualize cosine similarity heatmaps for ViT token features"
+            prog="cosine-visualize", description="Visualize cosine similarity heatmaps for ViT token features"
         )
         parser.add_argument("config", type=existing_file_type, help="Path to model YAML configuration file")
         parser.add_argument("checkpoint", type=existing_file_type, help="Path to safetensors checkpoint")
@@ -345,7 +343,8 @@ class CosineVisualizer:
         )
         parser.add_argument("output", type=output_path_type, help="Path to output PNG file")
         parser.add_argument(
-            "-c", "--coordinates",
+            "-c",
+            "--coordinates",
             nargs="+",
             type=coordinate_type,
             help="Target coordinates in format 'row,col' (e.g., '5,10')",
@@ -362,11 +361,11 @@ class CosineVisualizer:
         parser.add_argument("-i", "--invert", action="store_true", help="Also process an inverted image")
         parser.add_argument("-z", "--zero", action="store_true", help="Also process an all-zero image")
         parser.add_argument(
-            "--normalize", 
-            choices=["batch", "channel", "spatial"], 
-            default=["spatial"], 
+            "--normalize",
+            choices=["batch", "channel", "spatial"],
+            default=["spatial"],
             nargs="+",
-            help="Which axes to normalize"
+            help="Which axes to normalize",
         )
         parser.add_argument(
             "-dt", "--dtype", default="fp32", type=torch_dtype_type, help="Data type to run the model on"
@@ -375,7 +374,9 @@ class CosineVisualizer:
             "--no-output-norm", action="store_true", help="Disable output normalization from the backbone"
         )
         parser.add_argument(
-            "--combine-coords", action="store_true", help="Combine multiple coordinate pairs into single heatmap by averaging"
+            "--combine-coords",
+            action="store_true",
+            help="Combine multiple coordinate pairs into single heatmap by averaging",
         )
         return parser
 
@@ -409,23 +410,23 @@ def main() -> None:
     """Main CLI entry point."""
     parser = CosineVisualizer.create_parser()
     args = parser.parse_args()
-    
+
     visualizer = CosineVisualizer.from_args(args)
-    
+
     # Process all input images
     all_grids: List[Tensor] = []
     for img_path in tqdm(args.input, desc="Processing images"):
         img = load_image(img_path, visualizer.size or (224, 224))
         grid = visualizer(img)
         all_grids.append(grid)
-    
+
     # Combine all grids into a single visualization
     if len(all_grids) > 1:
         # Stack grids vertically for multiple images
         final_grid = torch.cat(all_grids, dim=-2)
     else:
         final_grid = all_grids[0]
-    
+
     visualizer.save(final_grid, args.output)
     print(f"Cosine similarity visualization saved to {args.output}")
 
