@@ -6,11 +6,11 @@ from functools import partial
 from pathlib import Path
 from typing import Final, Sequence, cast
 
+import numpy as np
 import safetensors.torch as st
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import torchmetrics as tm
 import yaml
 from torch import Tensor
@@ -19,7 +19,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, DistributedSampler
 from torchmetrics.wrappers import Running
-from torchvision.datasets import CIFAR10
+from torchvision.datasets import CIFAR100
 from torchvision.transforms.v2 import (
     ColorJitter,
     Compose,
@@ -35,7 +35,6 @@ from torchvision.transforms.v2 import (
 )
 from tqdm import tqdm
 from vit import ViT, ViTConfig
-from vit.tokens import apply_mask
 
 from mjepa.augmentation import (
     AugmentationConfig,
@@ -46,7 +45,6 @@ from mjepa.augmentation import (
     cross_entropy_mixup,
     is_mixed,
 )
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, setup_teacher, update_teacher
 from mjepa.logging import CSVLogger
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
@@ -59,16 +57,16 @@ from mjepa.trainer import (
     format_pbar_description,
     ignore_warnings,
     is_rank_zero,
+    load_checkpoint,
     rank_zero_info,
     save_checkpoint,
-    scale_change,
     setup_logdir,
     should_step_optimizer,
     size_change,
 )
 
 
-NUM_CLASSES: Final[int] = 10
+NUM_CLASSES: Final[int] = 100
 UNKNOWN_LABEL: Final[int] = -1
 WINDOW: Final[int] = 5
 LOG_INTERVAL: Final[int] = 50
@@ -99,6 +97,40 @@ def get_val_transforms(size: Sequence[int]) -> Compose:
     )
 
 
+def convert_to_few_shot(dataset: CIFAR100, few_shot: int) -> CIFAR100:
+    """Convert dataset to few-shot by selecting examples from each class.
+
+    Args:
+        dataset: CIFAR100 dataset to convert
+        few_shot: Number of examples per class to keep
+    """
+    # Convert targets to numpy for easier indexing
+    targets_array = np.array(dataset.targets)
+
+    # Find indices for each class
+    selected_indices = []
+    for class_idx in range(NUM_CLASSES):
+        class_indices = np.where(targets_array == class_idx)[0]
+        # Deterministically select first few_shot examples of each class
+        selected_class_indices = class_indices[:few_shot]
+        selected_indices.extend(selected_class_indices)
+
+    selected_indices = np.array(selected_indices)
+
+    # Update dataset in place
+    dataset.data = dataset.data[selected_indices]
+    dataset.targets = [dataset.targets[i] for i in selected_indices]
+
+    # Verify the few-shot constraint is met for each class
+    assert len(dataset) == few_shot * NUM_CLASSES
+    targets_array = np.array(dataset.targets)
+    for class_idx in range(NUM_CLASSES):
+        class_count = np.sum(targets_array == class_idx)
+        assert class_count == few_shot, f"Class {class_idx} has {class_count} examples, expected {few_shot}"
+
+    return dataset
+
+
 def get_train_dataloader(
     size: Sequence[int],
     batch_size: int,
@@ -106,9 +138,13 @@ def get_train_dataloader(
     num_workers: int,
     local_rank: int,
     world_size: int,
+    few_shot: int | None = None,
 ) -> DataLoader:
     transforms = get_train_transforms(size)
-    dataset = CIFAR10(root=root, train=True, transform=transforms, download=True)
+    dataset = CIFAR100(root=root, train=True, transform=transforms, download=True)
+    if few_shot:
+        dataset = convert_to_few_shot(dataset, few_shot)
+
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
         return DataLoader(
@@ -134,7 +170,7 @@ def get_val_dataloader(
     world_size: int,
 ) -> DataLoader:
     transforms = get_val_transforms(size)
-    dataset = CIFAR10(root=root, train=False, transform=transforms, download=True)
+    dataset = CIFAR100(root=root, train=False, transform=transforms, download=True)
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
         return DataLoader(
@@ -157,7 +193,6 @@ def train(
     val_dataloader_fn: DataLoaderFn,
     optimizer: Optimizer,
     scheduler: LRScheduler,
-    jepa_config: JEPAConfig,
     augmentation_config: AugmentationConfig,
     trainer_config: TrainerConfig,
     log_dir: Path | None = None,
@@ -167,17 +202,11 @@ def train(
     rank_zero_info(f"Starting training, logging to {log_dir if log_dir else 'console only'}")
     optimizer.zero_grad()
     backbone: ViT = modules["backbone"]
-    predictor: CrossAttentionPredictor = modules["predictor"]
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
-    rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
-    jepa_scale = jepa_config.scale
 
     # DataLoader setup
     train_dataloader = train_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
     val_dataloader = val_dataloader_fn(backbone.config.img_size, trainer_config.batch_size)
-
-    # Teacher setup
-    teacher = setup_teacher(backbone)
 
     accumulate_grad_batches = trainer_config.accumulate_grad_batches
     microbatch = (last_epoch + 1) * len(train_dataloader)
@@ -209,10 +238,8 @@ def train(
                 train_dataloader_fn,
                 val_dataloader_fn,
             )
-            jepa_scale = scale_change(backbone.config.img_size, size_config, jepa_config.scale)
             rank_zero_info(
-                f"Changing size to {size_config.size} and batch size to {size_config.batch_size} "
-                f"(accumulate grad batches: {accumulate_grad_batches}, jepa scale: {jepa_scale})"
+                f"Changing size to {size_config.size} and batch size to {size_config.batch_size} (accumulate grad batches: {accumulate_grad_batches})"
             )
 
         modules.train()
@@ -224,46 +251,31 @@ def train(
             label = label.cuda()
             tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
 
-            # Teacher forward pass (unaugmented)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
-                assert not teacher.training
-                teacher_output = cast(Tensor, teacher(img))
-            teacher_output = teacher_output.clone()
-
             # Apply augmentations
             with torch.no_grad():
                 img = apply_noise(augmentation_config, img)
-                mixup_seed, (img, teacher_output) = apply_mixup(augmentation_config, img, teacher_output)
+                mixup_seed, (img,) = apply_mixup(augmentation_config, img)
                 img = apply_invert(augmentation_config, img)[0]
                 img = apply_posterize(augmentation_config, img)[0]
 
+            # Forward pass and loss
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # Masked forward through student and predictor
-                context_mask, target_mask = generate_masks(
-                    backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
-                )
-                context = cast(Tensor, backbone(img, mask=context_mask))
-                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
+                backbone.eval()
+                features = cast(Tensor, backbone(img))
+                backbone.train()
+                pred = backbone.heads["cls"](features)
 
-                # Compute JEPA loss
-                target = apply_mask(target_mask, teacher_output, fill_value=None)
-                jepa_loss = F.mse_loss(pred, target)
-                train_loss.update(jepa_loss)
-
-                # Compute linear probe loss
-                probe_pred = backbone.heads["cls"](teacher_output)
-                probe_loss = cross_entropy_mixup(
-                    probe_pred, label, mixup_seed, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
+                loss = cross_entropy_mixup(
+                    pred, label, mixup_seed, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
                 ).mean()
+                train_loss.update(loss)
 
-                # Combine losses
-                loss = jepa_loss + probe_loss
-
+            # Metric computation
             with torch.no_grad():
                 mask = is_mixed(
                     B, augmentation_config.mixup_prob, augmentation_config.mixup_alpha, mixup_seed
                 ).logical_not_()
-                train_acc.update(probe_pred[mask], label[mask])
+                train_acc.update(pred[mask], label[mask])
 
             # Backward
             assert not loss.isnan()
@@ -277,8 +289,6 @@ def train(
                     scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
-                current_momentum = get_momentum(step, total_steps, jepa_config.momentum)
-                update_teacher(backbone, teacher, current_momentum)
                 step += 1
 
             desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
@@ -294,9 +304,9 @@ def train(
                 img = img.cuda()
                 label = label.cuda()
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    teacher_output = cast(Tensor, teacher(img))
-                    probe_pred = backbone.heads["cls"](teacher_output)
-                    val_acc.update(probe_pred, label)
+                    features = cast(Tensor, backbone(img))
+                    pred = backbone.heads["cls"](features)
+                    val_acc.update(pred, label)
 
             # Validation epoch end
             rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
@@ -311,8 +321,8 @@ def train(
             save_checkpoint(
                 path=log_dir / f"checkpoint.pt",
                 backbone=backbone,
-                predictor=predictor,
-                teacher=teacher,
+                predictor=None,
+                teacher=None,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 step=step,
@@ -346,6 +356,9 @@ def parse_args() -> Namespace:
     parser.add_argument("-l", "--log-dir", type=Path, default=None, help="Directory to save logs")
     parser.add_argument("--local-rank", type=int, default=1, help="Local rank / device")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to checkpoint to load")
+    parser.add_argument("--fresh-head", default=False, action="store_true", help="Use fresh head weights")
+    parser.add_argument("--few-shot", type=int, help="Number of shots for few-shot learning")
+    parser.add_argument("--head-only", default=False, action="store_true", help="Freeze the backbone")
     return parser.parse_args()
 
 
@@ -356,12 +369,10 @@ def main(args: Namespace) -> None:
 
     # Extract instantiated dataclasses from config
     backbone_config = config["backbone"]
-    jepa_config = config["jepa"]
     augmentation_config = config["augmentations"]
     optimizer_config = config["optimizer"]
     trainer_config = config["trainer"]
     assert isinstance(backbone_config, ViTConfig)
-    assert isinstance(jepa_config, JEPAConfig)
     assert isinstance(augmentation_config, AugmentationConfig)
     assert isinstance(optimizer_config, OptimizerConfig)
     assert isinstance(trainer_config, TrainerConfig)
@@ -377,8 +388,7 @@ def main(args: Namespace) -> None:
 
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
-    predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
-    wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor}).cuda()
+    wrapper = nn.ModuleDict({"backbone": backbone}).cuda()
 
     # Wrap in DDP for distributed training
     if world_size > 1:
@@ -392,6 +402,7 @@ def main(args: Namespace) -> None:
         num_workers=trainer_config.num_workers,
         local_rank=local_rank,
         world_size=world_size,
+        few_shot=args.few_shot,
     )
     val_dataloader_fn = partial(
         get_val_dataloader,
@@ -408,6 +419,28 @@ def main(args: Namespace) -> None:
     )
     optimizer, scheduler = optimizer_config.instantiate(wrapper, total_steps=total_steps)
 
+    if args.checkpoint:
+        # NOTE: For now only support fresh checkpoint
+        load_checkpoint(
+            args.checkpoint,
+            backbone,
+            None,
+            None,
+            optimizer,
+            scheduler,
+            mode="fresh",
+        )
+        if args.fresh_head:
+            for head in backbone.heads.values():
+                head.reset_parameters()
+
+    if args.head_only:
+        for param in backbone.parameters():
+            param.requires_grad_(False)
+        for param in backbone.heads.parameters():
+            param.requires_grad_(True)
+        backbone.mlp_requires_grad_(True)
+
     # Create log subdirectory with timestamp
     if args.log_dir:
         log_dir = setup_logdir(args.log_dir, config_path, name=args.name)
@@ -421,7 +454,6 @@ def main(args: Namespace) -> None:
         val_dataloader_fn,
         optimizer,
         scheduler,
-        jepa_config,
         augmentation_config,
         trainer_config,
         log_dir,

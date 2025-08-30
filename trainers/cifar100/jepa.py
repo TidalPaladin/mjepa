@@ -19,7 +19,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, DistributedSampler
 from torchmetrics.wrappers import Running
-from torchvision.datasets import CIFAR10
+from torchvision.datasets import CIFAR100
 from torchvision.transforms.v2 import (
     ColorJitter,
     Compose,
@@ -68,7 +68,7 @@ from mjepa.trainer import (
 )
 
 
-NUM_CLASSES: Final[int] = 10
+NUM_CLASSES: Final[int] = 100
 UNKNOWN_LABEL: Final[int] = -1
 WINDOW: Final[int] = 5
 LOG_INTERVAL: Final[int] = 50
@@ -108,7 +108,7 @@ def get_train_dataloader(
     world_size: int,
 ) -> DataLoader:
     transforms = get_train_transforms(size)
-    dataset = CIFAR10(root=root, train=True, transform=transforms, download=True)
+    dataset = CIFAR100(root=root, train=True, transform=transforms, download=True)
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
         return DataLoader(
@@ -134,7 +134,7 @@ def get_val_dataloader(
     world_size: int,
 ) -> DataLoader:
     transforms = get_val_transforms(size)
-    dataset = CIFAR10(root=root, train=False, transform=transforms, download=True)
+    dataset = CIFAR100(root=root, train=False, transform=transforms, download=True)
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
         return DataLoader(

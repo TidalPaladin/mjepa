@@ -2,7 +2,7 @@
 trainer: !!python/object:mjepa.TrainerConfig
   batch_size: 256
   num_workers: 24 
-  num_epochs: 500
+  num_epochs: 100
   check_val_every_n_epoch: 5
   accumulate_grad_batches: 4
 
@@ -26,7 +26,7 @@ backbone: !!python/object:vit.ViTConfig
     cls: !!python/object:vit.HeadConfig
       head_type: "linear"
       pool_type: "attentive"
-      out_dim: 10
+      out_dim: 100
       num_attention_heads: 12
 
 augmentations: !!python/object:mjepa.AugmentationConfig
