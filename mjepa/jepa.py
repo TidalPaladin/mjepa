@@ -4,6 +4,7 @@ from typing import Tuple, TypeVar
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from torch import Tensor
 from vit import ViT
@@ -135,18 +136,19 @@ def update_teacher(student: nn.Module, teacher: nn.Module, momentum: float) -> N
         teacher_param.lerp_(student_param, weight)
 
 
-def get_momentum(step: int, total_steps: int, momentum: float) -> float:
+def get_momentum(step: int, total_steps: int, momentum: float, scheduled: bool = False) -> float:
     r"""Linearly anneal momentum from the given value to 1.0 over the course of training.
 
     Args:
         step: Current step in the training loop.
         total_steps: Total number of steps in the training loop.
         momentum: The base momentum for the EMA update.
+        scheduled: Whether to schedule the momentum.
 
     Returns:
         The current momentum value.
     """
-    return min(momentum + (1 - momentum) * (step / total_steps), 1.0)
+    return min(momentum + (1 - momentum) * (step / total_steps), 1.0) if scheduled else momentum
 
 
 M = TypeVar("M", bound=nn.Module)
@@ -169,6 +171,13 @@ def setup_teacher(backbone: M) -> M:
     return teacher
 
 
+@torch.compile(fullgraph=True)
+def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True) -> Tensor:
+    student = F.normalize(student, dim=-1) if normalize else student
+    teacher = F.normalize(teacher, dim=-1) if normalize else teacher
+    return F.mse_loss(student.bmm(student.mT), teacher.bmm(teacher.mT))
+
+
 @dataclass
 class JEPAConfig:
     """
@@ -180,21 +189,28 @@ class JEPAConfig:
         scale: Integer scale at which to sample contiguous blocks of context tokens.
             Increasing this ensures more adjacent tokens appear together in the context.
         momentum: The base momentum for the EMA update. Momentum will be linearly annealed
-            from this value to 1.0 over the course of training.
+            from this value to 1.0 over the course of training if scheduled is ``True``.
+        scheduled: Whether to schedule the momentum.
         predictor_depth: Depth of the predictor network.
+        gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
+            If ``None``, the Gram loss will not be computed.
     """
 
     context_ratio: float = 0.5
     target_ratio: float = 0.25
     scale: int = 4
     momentum: float = 0.99
+    scheduled: bool = False
     predictor_depth: int = 4
+    gram_epoch: int | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:
             raise ValueError("target_ratio must be in the range (0, 1]")
+        if self.gram_epoch is not None and self.gram_epoch <= 0:
+            raise ValueError("gram_epoch must be a positive integer or None")
 
 
 def config_constructor(loader, node):

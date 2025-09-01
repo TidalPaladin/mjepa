@@ -2,6 +2,7 @@ import gc
 import logging
 import os
 from argparse import ArgumentParser, Namespace
+from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from typing import Final, Sequence, cast
@@ -46,7 +47,15 @@ from mjepa.augmentation import (
     cross_entropy_mixup,
     is_mixed,
 )
-from mjepa.jepa import CrossAttentionPredictor, JEPAConfig, generate_masks, get_momentum, setup_teacher, update_teacher
+from mjepa.jepa import (
+    CrossAttentionPredictor,
+    JEPAConfig,
+    compute_gram_loss,
+    generate_masks,
+    get_momentum,
+    setup_teacher,
+    update_teacher,
+)
 from mjepa.logging import CSVLogger
 from mjepa.optimizer import OptimizerConfig
 from mjepa.trainer import (
@@ -179,6 +188,10 @@ def train(
     # Teacher setup
     teacher = setup_teacher(backbone)
 
+    # Gram teacher setup (pre-allocated)
+    gram_teacher: ViT | None = setup_teacher(backbone) if jepa_config.gram_epoch is not None else None
+    computing_gram_loss = False
+
     accumulate_grad_batches = trainer_config.accumulate_grad_batches
     microbatch = (last_epoch + 1) * len(train_dataloader)
     step = microbatch // accumulate_grad_batches
@@ -215,6 +228,14 @@ def train(
                 f"(accumulate grad batches: {accumulate_grad_batches}, jepa scale: {jepa_scale})"
             )
 
+        # Initial Gram teacher setup (if necessary)
+        if jepa_config.gram_epoch is not None and epoch == jepa_config.gram_epoch:
+            gram_teacher = deepcopy(teacher)
+            gram_teacher.requires_grad_(False)
+            gram_teacher.eval()
+            computing_gram_loss = True
+            rank_zero_info(f"Gram teacher setup complete")
+
         modules.train()
         desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
         pbar = tqdm(train_dataloader, desc=desc, disable=not is_rank_zero(), leave=False)
@@ -230,6 +251,16 @@ def train(
                 assert not teacher.training
                 teacher_output = cast(Tensor, teacher(img, rope_seed=rope_seed))
             teacher_output = teacher_output.clone()
+
+            # Gram teacher forward pass (if necessary)
+            if computing_gram_loss:
+                assert gram_teacher is not None
+                assert not gram_teacher.training
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
+                    gram_teacher_output = cast(Tensor, gram_teacher(img, rope_seed=rope_seed))
+                gram_teacher_output = gram_teacher_output.clone()
+            else:
+                gram_teacher_output = None
 
             # Apply augmentations
             with torch.no_grad():
@@ -251,6 +282,14 @@ def train(
                 jepa_loss = F.mse_loss(pred, target)
                 train_loss.update(jepa_loss)
 
+                # Compute Gram loss (if necessary)
+                if computing_gram_loss:
+                    assert gram_teacher_output is not None
+                    gram_target = apply_mask(context_mask, gram_teacher_output, fill_value=None)
+                    gram_loss = compute_gram_loss(context, gram_target)
+                else:
+                    gram_loss = 0.0
+
                 # Compute linear probe loss
                 probe_pred = backbone.heads["cls"](teacher_output)
                 probe_loss = cross_entropy_mixup(
@@ -258,7 +297,7 @@ def train(
                 ).mean()
 
                 # Combine losses
-                loss = jepa_loss + probe_loss
+                loss = jepa_loss + probe_loss + gram_loss
 
             with torch.no_grad():
                 mask = is_mixed(
@@ -278,7 +317,7 @@ def train(
                     scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
-                current_momentum = get_momentum(step, total_steps, jepa_config.momentum)
+                current_momentum = get_momentum(step, total_steps, jepa_config.momentum, jepa_config.scheduled)
                 update_teacher(backbone, teacher, current_momentum)
                 step += 1
 
