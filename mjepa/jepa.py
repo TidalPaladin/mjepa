@@ -173,9 +173,37 @@ def setup_teacher(backbone: M) -> M:
 
 @torch.compile(fullgraph=True)
 def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True) -> Tensor:
+    r"""Compute the Gram loss between student features and the Gram teacher's features.
+
+    Args:
+        student: Student features.
+        teacher: Gram teacher features.
+        normalize: Whether to normalize the features.
+
+    Shapes:
+        student: :math:`(*, L, D)`
+        teacher: :math:`(*, L, D)`
+        Output: Scalar
+
+    Returns:
+        The Gram loss.
+    """
     student = F.normalize(student, dim=-1) if normalize else student
     teacher = F.normalize(teacher, dim=-1) if normalize else teacher
     return F.mse_loss(student.bmm(student.mT), teacher.bmm(teacher.mT))
+
+
+def is_gram_update_epoch(epoch: int, gram_epoch: int | None, gram_update_interval_epoch: int) -> bool:
+    r"""Check if the current epoch is a Gram update epoch.
+
+    Args:
+        epoch: Current epoch.
+        gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
+        gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
+    """
+    if gram_epoch is None:
+        return False
+    return (epoch - gram_epoch) % gram_update_interval_epoch == 0
 
 
 @dataclass
@@ -194,6 +222,7 @@ class JEPAConfig:
         predictor_depth: Depth of the predictor network.
         gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
             If ``None``, the Gram loss will not be computed.
+        gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
     """
 
     context_ratio: float = 0.5
@@ -203,6 +232,7 @@ class JEPAConfig:
     scheduled: bool = False
     predictor_depth: int = 4
     gram_epoch: int | None = None
+    gram_update_interval_epoch: int = 10
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
@@ -211,6 +241,8 @@ class JEPAConfig:
             raise ValueError("target_ratio must be in the range (0, 1]")
         if self.gram_epoch is not None and self.gram_epoch <= 0:
             raise ValueError("gram_epoch must be a positive integer or None")
+        if self.gram_update_interval_epoch < 0:
+            raise ValueError("gram_update_interval_epoch must be a non-negative integer")
 
 
 def config_constructor(loader, node):
