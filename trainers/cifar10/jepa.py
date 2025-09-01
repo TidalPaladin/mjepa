@@ -223,11 +223,12 @@ def train(
             img = img.cuda()
             label = label.cuda()
             tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
+            rope_seed = int(torch.randint(0, 1000000, (1,)).item())
 
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
-                teacher_output = cast(Tensor, teacher(img))
+                teacher_output = cast(Tensor, teacher(img, rope_seed=rope_seed))
             teacher_output = teacher_output.clone()
 
             # Apply augmentations
@@ -242,8 +243,8 @@ def train(
                 context_mask, target_mask = generate_masks(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
                 )
-                context = cast(Tensor, backbone(img, mask=context_mask))
-                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask)
+                context = cast(Tensor, backbone(img, mask=context_mask, rope_seed=rope_seed))
+                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)

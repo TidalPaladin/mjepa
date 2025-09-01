@@ -39,11 +39,11 @@ class CrossAttentionPredictor(nn.Module):
         # Changes should be made with care.
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
-        self.query = nn.Parameter(torch.empty(backbone.config.hidden_size))
-        nn.init.normal_(self.query)
+        self.rope = backbone.rope
 
         # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for _ in range(depth)])
+
         self.predictor_proj = nn.Linear(backbone.config.hidden_size, out_dim or backbone.config.hidden_size)
 
     def forward(
@@ -52,19 +52,41 @@ class CrossAttentionPredictor(nn.Module):
         context: Tensor,
         context_mask: Tensor,
         target_mask: Tensor,
+        rope_seed: int | None = None,
     ) -> Tensor:
         # Create positional encodings
         B, _ = target_mask.shape
         pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
 
         # Prepare inputs
-        query = self.query + pos_target
+        query = pos_target
+        rope_q, rope_k = self.prepare_rope(tokenized_size, context_mask, target_mask, rope_seed=rope_seed)
 
         # Run query and context through predictor
         for block in self.blocks:
-            query = block(query, context)
+            query = block(query, context, rope_q=rope_q, rope_k=rope_k)
 
         return self.predictor_proj(query)
+
+    def prepare_rope(
+        self, tokenized_size: Tuple[int, int], context_mask: Tensor, target_mask: Tensor, rope_seed: int | None = None
+    ) -> Tuple[Tensor | None, Tensor | None]:
+        if self.rope is None:
+            return None, None
+
+        H, W = tokenized_size
+        rope = self.rope(H=H, W=W, rope_seed=rope_seed)
+        sin, cos = rope
+        B = context_mask.shape[0]
+
+        sin_q = apply_mask(target_mask, sin[None].expand(B, -1, -1))
+        cos_q = apply_mask(target_mask, cos[None].expand(B, -1, -1))
+        rope_q = torch.stack([sin_q[:, None, ...], cos_q[:, None, ...]], dim=0)
+
+        sin_k = apply_mask(context_mask, sin[None].expand(B, -1, -1))
+        cos_k = apply_mask(context_mask, cos[None].expand(B, -1, -1))
+        rope_k = torch.stack([sin_k[:, None, ...], cos_k[:, None, ...]], dim=0)
+        return rope_q, rope_k
 
 
 @torch.no_grad()
