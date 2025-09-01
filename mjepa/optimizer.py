@@ -6,7 +6,7 @@ import torch.nn as nn
 import yaml
 from pytorch_optimizer import SOAP
 from torch.optim import AdamW, Optimizer
-from torch.optim.lr_scheduler import LRScheduler, OneCycleLR
+from torch.optim.lr_scheduler import LinearLR, LRScheduler, OneCycleLR
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class OptimizerConfig:
     optimizer: Literal["adamw", "soap"] = "adamw"
 
     # Scheduler
+    scheduled: bool = False
     pct_start: float = 0.05
     base_momentum: float = 0.85
     max_momentum: float = 0.95
@@ -39,16 +40,24 @@ class OptimizerConfig:
                 optimizer = self._instantiate_soap(model)
             case _:
                 raise ValueError(f"Invalid optimizer: {self.optimizer}")
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=self.lr,
-            total_steps=total_steps,
-            pct_start=self.pct_start,
-            base_momentum=self.base_momentum,
-            max_momentum=self.max_momentum,
-            div_factor=self.div_factor,
-            final_div_factor=self.final_div_factor,
-        )
+        if self.scheduled:
+            scheduler = OneCycleLR(
+                optimizer,
+                max_lr=self.lr,
+                total_steps=total_steps,
+                pct_start=self.pct_start,
+                base_momentum=self.base_momentum,
+                max_momentum=self.max_momentum,
+                div_factor=self.div_factor,
+                final_div_factor=self.final_div_factor,
+            )
+        else:
+            scheduler = LinearLR(
+                optimizer,
+                start_factor=1 / self.div_factor,
+                end_factor=1,
+                total_iters=int(total_steps * self.pct_start),
+            )
         return optimizer, scheduler
 
     def _instantiate_adamw(self, model: nn.Module) -> Optimizer:
