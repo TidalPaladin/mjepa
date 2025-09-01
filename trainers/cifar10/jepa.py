@@ -53,6 +53,7 @@ from mjepa.jepa import (
     compute_gram_loss,
     generate_masks,
     get_momentum,
+    is_gram_update_epoch,
     setup_teacher,
     update_teacher,
 )
@@ -229,12 +230,12 @@ def train(
             )
 
         # Initial Gram teacher setup (if necessary)
-        if jepa_config.gram_epoch is not None and epoch == jepa_config.gram_epoch:
+        if is_gram_update_epoch(epoch, jepa_config.gram_epoch, jepa_config.gram_update_interval_epoch):
             gram_teacher = deepcopy(teacher)
             gram_teacher.requires_grad_(False)
             gram_teacher.eval()
             computing_gram_loss = True
-            rank_zero_info(f"Gram teacher setup complete")
+            rank_zero_info(f"Gram teacher updated on epoch {epoch}")
 
         modules.train()
         desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
