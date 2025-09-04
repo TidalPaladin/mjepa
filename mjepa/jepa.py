@@ -1,6 +1,6 @@
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Tuple, TypeVar
+from typing import TYPE_CHECKING, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -68,6 +68,18 @@ class CrossAttentionPredictor(nn.Module):
             query = block(query, context, rope_q=rope_q, rope_k=rope_k)
 
         return self.predictor_proj(query)
+
+    if TYPE_CHECKING:
+
+        def __call__(
+            self,
+            tokenized_size: Tuple[int, int],
+            context: Tensor,
+            context_mask: Tensor,
+            target_mask: Tensor,
+            rope_seed: int | None = None,
+        ) -> Tensor:
+            return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed)
 
     def prepare_rope(
         self, tokenized_size: Tuple[int, int], context_mask: Tensor, target_mask: Tensor, rope_seed: int | None = None
@@ -172,13 +184,14 @@ def setup_teacher(backbone: M) -> M:
 
 
 @torch.compile(fullgraph=True)
-def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True) -> Tensor:
+def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True, remove_neg: bool = True) -> Tensor:
     r"""Compute the Gram loss between student features and the Gram teacher's features.
 
     Args:
         student: Student features.
         teacher: Gram teacher features.
         normalize: Whether to normalize the features.
+        remove_neg: Whether to remove negative values from the Gram matrix.
 
     Shapes:
         student: :math:`(*, L, D)`
@@ -190,7 +203,14 @@ def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True) 
     """
     student = F.normalize(student, dim=-1) if normalize else student
     teacher = F.normalize(teacher, dim=-1) if normalize else teacher
-    return F.mse_loss(student.bmm(student.mT), teacher.bmm(teacher.mT))
+
+    student_sim = student.bmm(student.mT)
+    teacher_sim = teacher.bmm(teacher.mT)
+    if remove_neg:
+        teacher_sim = teacher_sim.clamp(min=0.0)
+        student_sim = student_sim.clamp(min=0.0)
+
+    return F.mse_loss(student_sim, teacher_sim)
 
 
 def is_gram_update_epoch(epoch: int, gram_epoch: int | None, gram_update_interval_epoch: int) -> bool:
@@ -203,7 +223,7 @@ def is_gram_update_epoch(epoch: int, gram_epoch: int | None, gram_update_interva
     """
     if gram_epoch is None:
         return False
-    return (epoch - gram_epoch) % gram_update_interval_epoch == 0
+    return epoch >= gram_epoch and (epoch - gram_epoch) % gram_update_interval_epoch == 0
 
 
 @dataclass
