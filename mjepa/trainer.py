@@ -256,11 +256,11 @@ def load_checkpoint(
 
 
 @overload
-def setup_logdir(log_dir: None, config_path: os.PathLike | None) -> None: ...
+def setup_logdir(log_dir: None, config_path: os.PathLike | None, name: str | None = None) -> None: ...
 
 
 @overload
-def setup_logdir(log_dir: os.PathLike, config_path: os.PathLike) -> Path: ...
+def setup_logdir(log_dir: os.PathLike, config_path: os.PathLike, name: str | None = None) -> Path: ...
 
 
 def setup_logdir(log_dir: os.PathLike | None, config_path: os.PathLike | None, name: str | None = None) -> Path | None:

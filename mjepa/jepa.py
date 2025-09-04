@@ -1,6 +1,6 @@
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Tuple, TypeVar
+from typing import TYPE_CHECKING, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -68,6 +68,18 @@ class CrossAttentionPredictor(nn.Module):
             query = block(query, context, rope_q=rope_q, rope_k=rope_k)
 
         return self.predictor_proj(query)
+
+    if TYPE_CHECKING:
+
+        def __call__(
+            self,
+            tokenized_size: Tuple[int, int],
+            context: Tensor,
+            context_mask: Tensor,
+            target_mask: Tensor,
+            rope_seed: int | None = None,
+        ) -> Tensor:
+            return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed)
 
     def prepare_rope(
         self, tokenized_size: Tuple[int, int], context_mask: Tensor, target_mask: Tensor, rope_seed: int | None = None
