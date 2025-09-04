@@ -5,7 +5,7 @@ from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
-from typing import Final, Sequence, cast
+from typing import Any, Final, Sequence, cast
 
 import safetensors.torch as st
 import torch
@@ -90,7 +90,7 @@ def get_train_transforms(size: Sequence[int]) -> Compose:
             RandomHorizontalFlip(p=0.5),
             RandomVerticalFlip(p=0.5),
             RandomResizedCrop(size=size, scale=(0.75, 1.0), ratio=(0.75, 1.33)),
-            RandomApply([RandomRotation(degrees=15)], p=0.25),
+            RandomApply([RandomRotation(degrees=cast(Any, 15))], p=0.25),
             ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             RandomGrayscale(p=0.1),
             ToImage(),
@@ -176,8 +176,8 @@ def train(
     # Module setup
     rank_zero_info(f"Starting training, logging to {log_dir if log_dir else 'console only'}")
     optimizer.zero_grad()
-    backbone: ViT = modules["backbone"]
-    predictor: CrossAttentionPredictor = modules["predictor"]
+    backbone: ViT = cast(ViT, modules["backbone"])
+    predictor: CrossAttentionPredictor = cast(CrossAttentionPredictor, modules["predictor"])
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
     jepa_scale = jepa_config.scale
@@ -206,8 +206,12 @@ def train(
     train_loss = tm.RunningMean(window=WINDOW).cuda()
     train_acc = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
     val_acc = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
-    logger = CSVLogger(
-        log_dir / "run.csv", interval=LOG_INTERVAL, accumulate_grad_batches=trainer_config.accumulate_grad_batches
+    logger = (
+        CSVLogger(
+            log_dir / "run.csv", interval=LOG_INTERVAL, accumulate_grad_batches=trainer_config.accumulate_grad_batches
+        )
+        if log_dir
+        else None
     )
 
     img: Tensor
@@ -250,7 +254,7 @@ def train(
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
-                teacher_output = cast(Tensor, teacher(img, rope_seed=rope_seed))
+                teacher_output = teacher(img, rope_seed=rope_seed)
             teacher_output = teacher_output.clone()
 
             # Gram teacher forward pass (if necessary)
@@ -258,7 +262,7 @@ def train(
                 assert gram_teacher is not None
                 assert not gram_teacher.training
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
-                    gram_teacher_output = cast(Tensor, gram_teacher(img, rope_seed=rope_seed))
+                    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed)
                 gram_teacher_output = gram_teacher_output.clone()
             else:
                 gram_teacher_output = None
@@ -275,8 +279,8 @@ def train(
                 context_mask, target_mask = generate_masks(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
                 )
-                context = cast(Tensor, backbone(img, mask=context_mask, rope_seed=rope_seed))
-                pred: Tensor = predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+                context = backbone(img, mask=context_mask, rope_seed=rope_seed)
+                pred = predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
@@ -292,9 +296,9 @@ def train(
                     gram_loss = 0.0
 
                 # Compute linear probe loss
-                probe_pred = backbone.heads["cls"](teacher_output)
+                probe_pred = backbone.get_head("cls")(teacher_output)
                 probe_loss = cross_entropy_mixup(
-                    probe_pred, label, mixup_seed, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
+                    probe_pred, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
                 ).mean()
 
                 # Combine losses
@@ -327,7 +331,7 @@ def train(
 
         # Validation
         pbar.close()
-        if (epoch + 1) % trainer_config.check_val_every_n_epoch == 0:
+        if val_dataloader is not None and (epoch + 1) % trainer_config.check_val_every_n_epoch == 0:
             modules.eval()
             val_acc.reset()
             for img, label in tqdm(val_dataloader, desc=f"Validating: ", disable=not is_rank_zero(), leave=False):
@@ -335,13 +339,13 @@ def train(
                 img = img.cuda()
                 label = label.cuda()
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    teacher_output = cast(Tensor, teacher(img))
-                    probe_pred = backbone.heads["cls"](teacher_output)
+                    teacher_output = teacher(img)
+                    probe_pred = backbone.get_head("cls")(teacher_output)
                     val_acc.update(probe_pred, label)
 
             # Validation epoch end
             rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
-            logger.log(epoch, step, microbatch, acc=val_acc.compute())
+            logger.log(epoch, step, microbatch, acc=val_acc.compute()) if logger else None
 
         gc.collect()
         torch.cuda.synchronize()
@@ -410,8 +414,8 @@ def main(args: Namespace) -> None:
         raise NotADirectoryError(args.log_dir)
 
     # Determine distributed training parameters
-    world_size = os.environ.get("WORLD_SIZE", 1)
-    local_rank = os.environ.get("LOCAL_RANK", args.local_rank)
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     torch.cuda.set_device(local_rank)
     if world_size > 1:
         ddp_setup()
@@ -457,7 +461,7 @@ def main(args: Namespace) -> None:
 
     ignore_warnings()
     train(
-        wrapper,
+        cast(Any, wrapper),
         train_dataloader_fn,
         val_dataloader_fn,
         optimizer,
