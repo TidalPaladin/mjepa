@@ -2,7 +2,6 @@ import gc
 import logging
 import os
 from argparse import ArgumentParser, Namespace
-from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from typing import Any, Final, Sequence, cast
@@ -51,6 +50,7 @@ from mjepa.jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
     compute_gram_loss,
+    forward_gram_teacher,
     generate_masks,
     get_momentum,
     is_gram_update_epoch,
@@ -190,7 +190,7 @@ def train(
     teacher = setup_teacher(backbone)
 
     # Gram teacher setup (pre-allocated)
-    gram_teacher: ViT | None = setup_teacher(backbone) if jepa_config.gram_epoch is not None else None
+    gram_teacher: ViT | None = setup_teacher(backbone) if jepa_config.gram_start_epoch is not None else None
     computing_gram_loss = False
 
     accumulate_grad_batches = trainer_config.accumulate_grad_batches
@@ -234,11 +234,19 @@ def train(
             )
 
         # Initial Gram teacher setup (if necessary)
-        if is_gram_update_epoch(epoch, jepa_config.gram_epoch, jepa_config.gram_update_interval_epoch):
-            gram_teacher = deepcopy(teacher)
-            gram_teacher.requires_grad_(False)
-            gram_teacher.eval()
+        if epoch == jepa_config.gram_teacher_epoch and jepa_config.gram_start_epoch is not None:
+            assert gram_teacher is not None
+            update_teacher(teacher, gram_teacher)
+            rank_zero_info(f"Gram teacher initialized on epoch {epoch}")
+        # Start computing Gram loss (if necessary)
+        if jepa_config.gram_start_epoch is not None and epoch == jepa_config.gram_start_epoch:
             computing_gram_loss = True
+            rank_zero_info(f"Started computing Gram loss on epoch {epoch}")
+        # Gram teacher update
+        if is_gram_update_epoch(epoch, jepa_config.gram_start_epoch, jepa_config.gram_update_interval_epoch):
+            assert gram_teacher is not None
+            assert computing_gram_loss
+            update_teacher(teacher, gram_teacher)
             rank_zero_info(f"Gram teacher updated on epoch {epoch}")
 
         modules.train()
@@ -260,10 +268,15 @@ def train(
             # Gram teacher forward pass (if necessary)
             if computing_gram_loss:
                 assert gram_teacher is not None
-                assert not gram_teacher.training
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
-                    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed)
+                    gram_teacher_output = forward_gram_teacher(
+                        gram_teacher,
+                        img,
+                        rope_seed=rope_seed,
+                        resolution_scale=jepa_config.gram_resolution_scale,
+                    )
                 gram_teacher_output = gram_teacher_output.clone()
+                assert gram_teacher_output.shape == teacher_output.shape
             else:
                 gram_teacher_output = None
 
@@ -291,12 +304,17 @@ def train(
                 if computing_gram_loss:
                     assert gram_teacher_output is not None
                     gram_target = apply_mask(context_mask, gram_teacher_output, fill_value=None)
-                    gram_loss = compute_gram_loss(context, gram_target)
+                    gram_loss = compute_gram_loss(context, gram_target, remove_neg=jepa_config.gram_remove_neg)
                 else:
                     gram_loss = 0.0
 
                 # Compute linear probe loss
-                probe_pred = backbone.get_head("cls")(teacher_output)
+                rope = (
+                    backbone.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
+                    if backbone.rope is not None
+                    else None
+                )
+                probe_pred = backbone.get_head("cls")(teacher_output, rope=rope)
                 probe_loss = cross_entropy_mixup(
                     probe_pred, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
                 ).mean()
@@ -338,9 +356,13 @@ def train(
                 B = img.shape[0]
                 img = img.cuda()
                 label = label.cuda()
+                tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     teacher_output = teacher(img)
-                    probe_pred = backbone.get_head("cls")(teacher_output)
+                    rope = (
+                        backbone.rope(H=tokenized_size[0], W=tokenized_size[1]) if backbone.rope is not None else None
+                    )
+                    probe_pred = backbone.get_head("cls")(teacher_output, rope=rope)
                     val_acc.update(probe_pred, label)
 
             # Validation epoch end

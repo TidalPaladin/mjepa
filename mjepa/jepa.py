@@ -1,3 +1,4 @@
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Tuple, TypeVar
@@ -132,7 +133,7 @@ def generate_masks(
 
 
 @torch.no_grad()
-def update_teacher(student: nn.Module, teacher: nn.Module, momentum: float) -> None:
+def update_teacher(student: nn.Module, teacher: nn.Module, momentum: float = 0.0) -> None:
     r"""Update the teacher model with the student model using EMA.
 
     Args:
@@ -213,17 +214,60 @@ def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True, 
     return F.mse_loss(student_sim, teacher_sim)
 
 
-def is_gram_update_epoch(epoch: int, gram_epoch: int | None, gram_update_interval_epoch: int) -> bool:
+def is_gram_update_epoch(epoch: int, gram_start_epoch: int | None, gram_update_interval_epoch: int) -> bool:
     r"""Check if the current epoch is a Gram update epoch.
 
     Args:
         epoch: Current epoch.
-        gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
+        gram_start_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
         gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
     """
-    if gram_epoch is None:
+    if gram_start_epoch is None:
         return False
-    return epoch >= gram_epoch and (epoch - gram_epoch) % gram_update_interval_epoch == 0
+    return epoch > gram_start_epoch and (epoch - gram_start_epoch) % gram_update_interval_epoch == 0
+
+
+def forward_gram_teacher(
+    gram_teacher: ViT,
+    img: Tensor,
+    rope_seed: int | None = None,
+    resolution_scale: float = 1.0,
+) -> Tensor:
+    r"""Forward pass through the Gram teacher.
+
+    Applies image upsampling and downsampling to the input and output, respectively.
+
+    Args:
+        gram_teacher: Gram teacher model.
+        img: Input image.
+        rope_seed: Rope seed.
+        resolution_scale: Resolution scale.
+
+    Shapes:
+        img: :math:`(*, C, H, W)`
+        Output: :math:`(*, L, D)`
+
+    Returns:
+        Output features.
+    """
+    # Resize input according to resolution scale, tracking the tokenized size of the input and output
+    target_tokenized_size = gram_teacher.stem.tokenized_size(img.shape[-2:])
+    img = F.interpolate(img, scale_factor=resolution_scale, mode="bilinear", align_corners=False)
+    output_tokenized_size = gram_teacher.stem.tokenized_size(img.shape[-2:])
+
+    assert not gram_teacher.training, "Gram teacher must be in evaluation mode"
+
+    # Forward pass and resize output features to original size
+    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed)
+    B, _, D = gram_teacher_output.shape
+    gram_teacher_output = gram_teacher_output.movedim(1, -1).reshape(B, D, *output_tokenized_size)
+    gram_teacher_output = F.interpolate(
+        gram_teacher_output, scale_factor=1 / resolution_scale, mode="bilinear", align_corners=False
+    )
+    gram_teacher_output = gram_teacher_output.flatten(2).movedim(-1, 1)
+
+    assert gram_teacher_output.shape == (B, math.prod(target_tokenized_size), D)
+    return gram_teacher_output
 
 
 @dataclass
@@ -242,7 +286,11 @@ class JEPAConfig:
         predictor_depth: Depth of the predictor network.
         gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
             If ``None``, the Gram loss will not be computed.
+        gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
+            If ``None``, the Gram loss will not be computed.
         gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
+        gram_resolution_scale: The scale at which to feed inputs through the Gram teacher.
+        gram_remove_neg: Whether to remove negative values from the Gram matrix.
     """
 
     context_ratio: float = 0.5
@@ -251,18 +299,27 @@ class JEPAConfig:
     momentum: float = 0.99
     scheduled: bool = False
     predictor_depth: int = 4
-    gram_epoch: int | None = None
+    gram_teacher_epoch: int = 100
+    gram_start_epoch: int | None = None
     gram_update_interval_epoch: int = 10
+    gram_resolution_scale: float = 2.0
+    gram_remove_neg: bool = False
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:
             raise ValueError("target_ratio must be in the range (0, 1]")
-        if self.gram_epoch is not None and self.gram_epoch <= 0:
-            raise ValueError("gram_epoch must be a positive integer or None")
+        if self.gram_teacher_epoch <= 0:
+            raise ValueError("gram_teacher_epoch must be a positive integer")
+        if self.gram_start_epoch is not None and self.gram_start_epoch <= 0:
+            raise ValueError("gram_start_epoch must be a positive integer or None")
         if self.gram_update_interval_epoch < 0:
             raise ValueError("gram_update_interval_epoch must be a non-negative integer")
+        if self.gram_start_epoch is not None and self.gram_start_epoch < self.gram_teacher_epoch:
+            raise ValueError("gram_start_epoch must be greater than or equal to gram_teacher_epoch")
+        if self.gram_resolution_scale <= 0:
+            raise ValueError("gram_resolution_scale must be a positive float")
 
 
 def config_constructor(loader, node):
