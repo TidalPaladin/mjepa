@@ -251,7 +251,7 @@ class AttentionVisualizer:
         H = self.num_attention_heads
         with torch.autocast(self.device.type, dtype=self.dtype):
             features = self.model(img)
-            weights = self.pooling.forward_weights(features).view(B, *tokenized_size, H)
+            weights = self.pooling.forward_weights(features).view(B, H, *tokenized_size).movedim(1, -1)
             pred = self.head(features)
         return pred.float(), weights.float().contiguous()
 

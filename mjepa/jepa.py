@@ -1,7 +1,8 @@
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple, TypeVar
+from typing import TYPE_CHECKING, Tuple, TypeVar, Iterator
+import torch.distributed as dist
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,8 @@ from vit import ViT
 from vit.pos_enc import LearnablePosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
 
+
+torch._dynamo.config.cache_size_limit = 1024 * 1024 * 1024 * 1024
 
 class CrossAttentionPredictor(nn.Module):
     r"""
@@ -269,6 +272,189 @@ def forward_gram_teacher(
     assert gram_teacher_output.shape == (B, math.prod(target_tokenized_size), D)
     return gram_teacher_output
 
+
+def contrastive_loss(pred: Tensor, target: Tensor, temperature: Tensor, bias: Tensor, topk_frac: float = 1.0) -> Tensor:
+    B, L, _ = target.shape
+    pred = F.normalize(pred.squeeze(1).float(), dim=-1)  
+    target = F.normalize(target.float(), dim=-1)
+
+    # Positive similarities: pred_cls[i] with teacher_output[i, :, :]
+    pos_sim = torch.einsum('bd,bld->bl', pred, target)
+    assert 0 < topk_frac <= 1.0, "topk_frac must be in the range (0, 1]"
+    if topk_frac < 1.0:
+        k = max(1, int(topk_frac * L))
+        pos_sim = torch.topk(pos_sim, k, dim=-1).values.mean(dim=-1)
+    else:
+        pos_sim = pos_sim.mean(dim=-1)
+    
+    # Negative similarities: pred_cls[i] with teacher_output[j, :, :] for j != i
+    all_sim = torch.einsum('bd,cld->bcl', pred, target)  
+    all_sim = all_sim.mean(dim=-1)
+    mask = ~torch.eye(B, dtype=torch.bool, device=pred.device)
+    neg_sim = all_sim[mask].view(B, B-1)
+    
+    # Contrastive loss: maximize pos_sim, minimize neg_sim
+    logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1) * temperature + bias
+    targets = torch.zeros(B, dtype=torch.long, device=pred.device)
+    return F.cross_entropy(logits, targets)
+
+
+def contrastive_loss_v2(pred: Tensor, target: Tensor, temperature: Tensor, bias: Tensor, topk_frac: float = 1.0) -> Tensor:
+    B, L, _ = target.shape
+    pred = F.normalize(pred.squeeze(1).float(), dim=-1)  
+    target = F.normalize(target.float(), dim=-1)
+    logits = torch.einsum('bd,cld->bcl', pred, target) * temperature + bias
+    if topk_frac < 1.0:
+        k = max(1, int(topk_frac * L))
+        logits = torch.topk(logits, k, dim=-1).values
+    targets = torch.zeros_like(logits)
+    targets[torch.arange(B), torch.arange(B), :] = 1
+    return F.binary_cross_entropy_with_logits(logits, targets)
+
+
+class ContrastiveLoss(nn.Module):
+    def __init__(
+        self, 
+        hidden_size: int | None = None, 
+        temperature: float = 1, 
+        bias: float = 0,
+        topk_frac: float = 1.0,
+    ):
+        super().__init__()
+        self.topk_frac = topk_frac
+        self.proj = nn.Linear(hidden_size, hidden_size) if hidden_size is not None else nn.Identity()
+        self.temperature = nn.Parameter(torch.tensor(temperature, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.tensor(bias, dtype=torch.float32))
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred = self.proj(pred)
+        return contrastive_loss(pred, target, self.temperature, self.bias, self.topk_frac)
+
+@torch.no_grad()
+def ring_exchange(tensor: Tensor, rank: int, world_size: int) -> Tensor:
+    r"""Run one iteration of ring exchange.
+
+    The exchange sends to the next rank, and receives from the previous rank.
+
+    Args:
+        tensor: The tensor to exchange.
+        rank: The rank of the current process.
+        world_size: The number of processes in the distributed group.
+
+    Returns:
+        The exchanged tensor
+    """
+    if world_size == 1 or not torch.distributed.is_initialized():
+        return tensor
+    recv_tensor = torch.zeros_like(tensor)
+    send_op = dist.P2POp(dist.isend, tensor, (rank + 1) % world_size)
+    recv_op = dist.P2POp(dist.irecv, recv_tensor, (rank - 1 + world_size) % world_size)
+    reqs = dist.batch_isend_irecv([send_op, recv_op])
+    for req in reqs:
+        req.wait()
+    return recv_tensor
+
+
+@torch.no_grad()
+def ring_exchange_all(tensor: Tensor, rank: int, world_size: int) -> Iterator[Tensor]:
+    r"""Run ring exchange across all ranks.
+
+    The final tensor received in the exchange is the local tensor (i.e. ``tensor``).
+
+    Args:
+        tensor: The tensor to exchange.
+        rank: The rank of the current process.
+        world_size: The number of processes in the distributed group.
+
+    Returns:
+        An iterator over the tensors exchanged at each round of the ring exchange.
+    """
+    for _ in range(world_size):
+        tensor = ring_exchange(tensor, rank, world_size)
+        yield tensor
+
+
+@torch.compile(
+    fullgraph=True,
+    options={
+        "epilogue_fusion": True,
+        "shape_padding": True,
+    },
+)
+def compute_logits(x1: Tensor, x2: Tensor, t: Tensor, b: Tensor) -> Tensor:
+    r"""Compute logits between two sets of embeddings.
+
+    Logits are computed as:
+
+    .. math::
+        \text{logits} = \text{x1} \cdot \text{x2}^\top \cdot \text{t} + \text{b}
+
+    Args:
+        x1: The first set of embeddings.
+        x2: The second set of embeddings.
+        t: The temperature parameter.
+        b: The bias parameter.
+
+    Returns:
+        The logits for the SigLIP loss.
+    """
+    return torch.matmul(x1, x2) * t.exp() + b
+
+def global_contrastive_loss(
+    student: Tensor,
+    teacher: Tensor,
+    target: Tensor,
+    t: Tensor,
+    b: Tensor,
+    rank: int,
+    world_size: int,
+    eps: float = 1e-12,
+) -> Tensor:
+    r"""Compute the global contrastive loss across all ranks.
+
+    Args:
+        student: The student embeddings.
+        teacher: The teacher embeddings.
+        target: The target embeddings.
+        t: The temperature parameter.
+        b: The bias parameter.
+        rank: The rank of the current process.
+        world_size: The number of processes in the distributed group.
+        eps: The epsilon value to use for normalization.
+
+    Returns:
+        The global contrastive loss.
+    """
+    B = student.shape[0]
+    student = F.normalize(student, dim=-1, eps=eps).view(B, -1)
+    teacher = F.normalize(teacher, dim=-1, eps=eps).view(B, -1)
+    null_target = torch.zeros_like(target)
+    loss = student.new_zeros(())
+    for i, _teacher in enumerate(ring_exchange_all(teacher, rank, world_size)):
+        _target = target if i == world_size - 1 else null_target
+        logits = compute_logits(student, _teacher.mT, t, b)
+        loss += F.binary_cross_entropy_with_logits(logits, _target, reduction="sum") / (target.numel() * world_size)
+    return loss
+
+class GlobalContrastiveLoss(nn.Module):
+    def __init__(
+        self, 
+        hidden_size: int | None = None, 
+        temperature: float = math.log(10), 
+        bias: float = -10,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, hidden_size) if hidden_size is not None else nn.Identity()
+        self.temperature = nn.Parameter(torch.tensor(temperature, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.tensor(bias, dtype=torch.float32))
+        self.rank = rank
+        self.world_size = world_size
+
+    def forward(self, student: Tensor, teacher: Tensor, target: Tensor) -> Tensor:
+        student = self.proj(student)
+        return global_contrastive_loss(student, teacher, target, self.temperature, self.bias, self.rank, self.world_size)
 
 @dataclass
 class JEPAConfig:

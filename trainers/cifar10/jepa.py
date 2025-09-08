@@ -56,6 +56,8 @@ from mjepa.jepa import (
     is_gram_update_epoch,
     setup_teacher,
     update_teacher,
+    ContrastiveLoss,
+    GlobalContrastiveLoss,
 )
 from mjepa.logging import CSVLogger
 from mjepa.optimizer import OptimizerConfig
@@ -178,6 +180,8 @@ def train(
     optimizer.zero_grad()
     backbone: ViT = cast(ViT, modules["backbone"])
     predictor: CrossAttentionPredictor = cast(CrossAttentionPredictor, modules["predictor"])
+    #contrastive_loss: ContrastiveLoss = cast(ContrastiveLoss, modules["contrastive_loss"])
+    #global_contrastive_loss: GlobalContrastiveLoss = cast(GlobalContrastiveLoss, modules["global_contrastive_loss"])
     rank_zero_info(f"Backbone params: {format_large_number(count_parameters(backbone))}")
     rank_zero_info(f"Predictor params: {format_large_number(count_parameters(predictor))}")
     jepa_scale = jepa_config.scale
@@ -205,7 +209,9 @@ def train(
     # Metric setup
     train_loss = tm.RunningMean(window=WINDOW).cuda()
     train_acc = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
+    train_acc_attn = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
     val_acc = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
+    val_acc_attn = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
     logger = (
         CSVLogger(
             log_dir / "run.csv", interval=LOG_INTERVAL, accumulate_grad_batches=trainer_config.accumulate_grad_batches
@@ -259,11 +265,19 @@ def train(
             tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
             rope_seed = int(torch.randint(0, 1000000, (1,)).item())
 
+            rope = (
+                backbone.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
+                if backbone.rope is not None
+                else None
+            )
+
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
                 teacher_output = teacher(img, rope_seed=rope_seed)
+                teacher_output_cls = teacher.get_head("pool")(teacher_output, rope=rope)
             teacher_output = teacher_output.clone()
+            teacher_output_cls = teacher_output_cls.clone()
 
             # Gram teacher forward pass (if necessary)
             if computing_gram_loss:
@@ -281,24 +295,38 @@ def train(
                 gram_teacher_output = None
 
             # Apply augmentations
+            contrastive_target = torch.eye(B, device=teacher_output.device, dtype=torch.float32)
             with torch.no_grad():
                 img = apply_noise(augmentation_config, img)
-                mixup_seed, (img, teacher_output) = apply_mixup(augmentation_config, img, teacher_output)
+                mixup_seed, (img, teacher_output, teacher_output_cls, contrastive_target) = apply_mixup(augmentation_config, img, teacher_output, teacher_output_cls, contrastive_target)
                 img = apply_invert(augmentation_config, img)[0]
                 img = apply_posterize(augmentation_config, img)[0]
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # Masked forward through student and predictor
+                # Prepare context using student
                 context_mask, target_mask = generate_masks(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
                 )
                 context = backbone(img, mask=context_mask, rope_seed=rope_seed)
+                context_rope = backbone.prepare_rope(tokenized_size, context_mask, rope_seed=rope_seed) if rope is not None else None
+
+                # Prepare CLS token using teacher
+                teacher_rope = backbone.prepare_rope(tokenized_size, rope_seed=rope_seed) if rope is not None else None
+                pred_cls = backbone.get_head("pool")(teacher_output, rope=teacher_rope)
+
+                # Forward through predictor
                 pred = predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+                context = torch.cat([pred_cls.unsqueeze(1), context.detach()], dim=1)
+                pred_with_cls = predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                jepa_loss = F.mse_loss(pred, target)
+                jepa_loss = F.mse_loss(pred, target) + F.mse_loss(pred_with_cls, target)
                 train_loss.update(jepa_loss)
+
+                # Compute contrastive CLS loss
+                #cls_loss = contrastive_loss(pred_cls, teacher_output)
+                #cls_loss = F.mse_loss(pred_cls, teacher_output.mean(dim=1))
 
                 # Compute Gram loss (if necessary)
                 if computing_gram_loss:
@@ -309,24 +337,24 @@ def train(
                     gram_loss = 0.0
 
                 # Compute linear probe loss
-                rope = (
-                    backbone.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
-                    if backbone.rope is not None
-                    else None
-                )
-                probe_pred = backbone.get_head("cls")(teacher_output, rope=rope)
+                probe_pred = backbone.get_head("cls")(teacher_output_cls).view(B, -1)
+                probe_pred_attn = backbone.get_head("attentive")(teacher_output, rope=rope).view(B, -1)
                 probe_loss = cross_entropy_mixup(
                     probe_pred, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
                 ).mean()
+                probe_loss += cross_entropy_mixup(
+                    probe_pred_attn, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
+                ).mean()
 
                 # Combine losses
-                loss = jepa_loss + probe_loss + gram_loss
+                loss = jepa_loss + probe_loss + gram_loss #+ cls_loss
 
             with torch.no_grad():
                 mask = is_mixed(
                     B, augmentation_config.mixup_prob, augmentation_config.mixup_alpha, mixup_seed
                 ).logical_not_()
                 train_acc.update(probe_pred[mask], label[mask])
+                train_acc_attn.update(probe_pred_attn[mask], label[mask])
 
             # Backward
             assert not loss.isnan()
@@ -344,7 +372,7 @@ def train(
                 update_teacher(backbone, teacher, current_momentum)
                 step += 1
 
-            desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
+            desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc, acc_attn=train_acc_attn)
             pbar.set_description(desc)
 
         # Validation
@@ -352,6 +380,7 @@ def train(
         if val_dataloader is not None and (epoch + 1) % trainer_config.check_val_every_n_epoch == 0:
             modules.eval()
             val_acc.reset()
+            val_acc_attn.reset()
             for img, label in tqdm(val_dataloader, desc=f"Validating: ", disable=not is_rank_zero(), leave=False):
                 B = img.shape[0]
                 img = img.cuda()
@@ -362,12 +391,15 @@ def train(
                     rope = (
                         backbone.rope(H=tokenized_size[0], W=tokenized_size[1]) if backbone.rope is not None else None
                     )
-                    probe_pred = backbone.get_head("cls")(teacher_output, rope=rope)
+                    teacher_output_cls = teacher.get_head("pool")(teacher_output, rope=rope)
+                    probe_pred = backbone.get_head("cls")(teacher_output_cls).view(B, -1)
+                    probe_pred_attn = backbone.get_head("attentive")(teacher_output, rope=rope).view(B, -1)
                     val_acc.update(probe_pred, label)
+                    val_acc_attn.update(probe_pred_attn, label)
 
             # Validation epoch end
-            rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
-            logger.log(epoch, step, microbatch, acc=val_acc.compute()) if logger else None
+            rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}, Val Acc Attn: {val_acc_attn.compute():.4f}")
+            logger.log(epoch, step, microbatch, acc=val_acc.compute(), acc_attn=val_acc_attn.compute()) if logger else None
 
         gc.collect()
         torch.cuda.synchronize()
@@ -445,6 +477,8 @@ def main(args: Namespace) -> None:
     # Instantiate other model elements and move to device
     backbone = backbone_config.instantiate()
     predictor = CrossAttentionPredictor(backbone, jepa_config.predictor_depth)
+    #global_contrastive_loss = GlobalContrastiveLoss(hidden_size=backbone.config.hidden_size, rank=local_rank, world_size=world_size)
+    #contrastive_loss = ContrastiveLoss(hidden_size=backbone.config.hidden_size, topk_frac=0.5)
     wrapper = nn.ModuleDict({"backbone": backbone, "predictor": predictor}).cuda()
 
     # Wrap in DDP for distributed training
