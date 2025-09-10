@@ -316,6 +316,10 @@ def setup_logdir(log_dir: os.PathLike | None, config_path: os.PathLike | None, n
     if is_rank_zero():
         log_dir.mkdir()
 
+    # Synchronize DDP processes before creating file handlers
+    if dist.is_initialized():
+        dist.barrier()
+
     # Add file handler when log directory is provided
     file_handler = logging.FileHandler(log_dir / "run.log")
     file_handler.setFormatter(formatter)
