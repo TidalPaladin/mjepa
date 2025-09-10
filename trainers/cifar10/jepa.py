@@ -2,7 +2,6 @@ import gc
 import logging
 import os
 from argparse import ArgumentParser, Namespace
-from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from typing import Any, Final, Sequence, cast
@@ -51,6 +50,7 @@ from mjepa.jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
     compute_gram_loss,
+    forward_gram_teacher,
     generate_masks,
     get_momentum,
     is_gram_update_epoch,
@@ -190,7 +190,7 @@ def train(
     teacher = setup_teacher(backbone)
 
     # Gram teacher setup (pre-allocated)
-    gram_teacher: ViT | None = setup_teacher(backbone) if jepa_config.gram_epoch is not None else None
+    gram_teacher: ViT | None = setup_teacher(backbone) if jepa_config.gram_start_epoch is not None else None
     computing_gram_loss = False
 
     accumulate_grad_batches = trainer_config.accumulate_grad_batches
@@ -205,7 +205,9 @@ def train(
     # Metric setup
     train_loss = tm.RunningMean(window=WINDOW).cuda()
     train_acc = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
+    train_acc_attn = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
     val_acc = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
+    val_acc_attn = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
     logger = (
         CSVLogger(
             log_dir / "run.csv", interval=LOG_INTERVAL, accumulate_grad_batches=trainer_config.accumulate_grad_batches
@@ -234,11 +236,19 @@ def train(
             )
 
         # Initial Gram teacher setup (if necessary)
-        if is_gram_update_epoch(epoch, jepa_config.gram_epoch, jepa_config.gram_update_interval_epoch):
-            gram_teacher = deepcopy(teacher)
-            gram_teacher.requires_grad_(False)
-            gram_teacher.eval()
+        if epoch == jepa_config.gram_teacher_epoch and jepa_config.gram_start_epoch is not None:
+            assert gram_teacher is not None
+            update_teacher(teacher, gram_teacher)
+            rank_zero_info(f"Gram teacher initialized on epoch {epoch}")
+        # Start computing Gram loss (if necessary)
+        if jepa_config.gram_start_epoch is not None and epoch == jepa_config.gram_start_epoch:
             computing_gram_loss = True
+            rank_zero_info(f"Started computing Gram loss on epoch {epoch}")
+        # Gram teacher update
+        if is_gram_update_epoch(epoch, jepa_config.gram_start_epoch, jepa_config.gram_update_interval_epoch):
+            assert gram_teacher is not None
+            assert computing_gram_loss
+            update_teacher(teacher, gram_teacher)
             rank_zero_info(f"Gram teacher updated on epoch {epoch}")
 
         modules.train()
@@ -255,50 +265,88 @@ def train(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
                 teacher_output = teacher(img, rope_seed=rope_seed)
+                rope = (
+                    teacher.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
+                    if teacher.rope is not None
+                    else None
+                )
+                teacher_output_cls = teacher.get_head("pool")(teacher_output, rope=rope)
             teacher_output = teacher_output.clone()
+            teacher_output_cls = teacher_output_cls.clone()
 
             # Gram teacher forward pass (if necessary)
             if computing_gram_loss:
                 assert gram_teacher is not None
-                assert not gram_teacher.training
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
-                    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed)
+                    gram_teacher_output = forward_gram_teacher(
+                        gram_teacher,
+                        img,
+                        rope_seed=rope_seed,
+                        resolution_scale=jepa_config.gram_resolution_scale,
+                    )
                 gram_teacher_output = gram_teacher_output.clone()
+                assert gram_teacher_output.shape == teacher_output.shape
             else:
                 gram_teacher_output = None
 
             # Apply augmentations
             with torch.no_grad():
                 img = apply_noise(augmentation_config, img)
-                mixup_seed, (img, teacher_output) = apply_mixup(augmentation_config, img, teacher_output)
+                mixup_seed, (img, teacher_output, teacher_output_cls) = apply_mixup(
+                    augmentation_config, img, teacher_output, teacher_output_cls
+                )
                 img = apply_invert(augmentation_config, img)[0]
                 img = apply_posterize(augmentation_config, img)[0]
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # Masked forward through student and predictor
+                # Prepare context using student
                 context_mask, target_mask = generate_masks(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
                 )
                 context = backbone(img, mask=context_mask, rope_seed=rope_seed)
+
+                # Forward through predictor
                 pred = predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+
+                # Second predictor forward with pooled token
+                # NOTE: Stop gradient on context is very important - otherwise model cheats via over-reliance on the pooled token.
+                # NOTE: Since pooled token is part of context we reuse the backbone's output norm to normalize it.
+                rope = (
+                    backbone.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
+                    if backbone.rope is not None
+                    else None
+                )
+                pred_cls = backbone.get_head("pool")(teacher_output, rope=rope)
+                context_with_cls = torch.cat([pred_cls.unsqueeze(1), context.detach()], dim=1)
+                pred_with_cls = predictor(
+                    tokenized_size, context_with_cls, context_mask, target_mask, rope_seed=rope_seed
+                )
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                jepa_loss = F.mse_loss(pred, target)
+                jepa_loss = F.mse_loss(pred, target) + F.mse_loss(pred_with_cls, target)
                 train_loss.update(jepa_loss)
 
                 # Compute Gram loss (if necessary)
                 if computing_gram_loss:
                     assert gram_teacher_output is not None
                     gram_target = apply_mask(context_mask, gram_teacher_output, fill_value=None)
-                    gram_loss = compute_gram_loss(context, gram_target)
+                    gram_loss = compute_gram_loss(context, gram_target, remove_neg=jepa_config.gram_remove_neg)
                 else:
                     gram_loss = 0.0
 
                 # Compute linear probe loss
-                probe_pred = backbone.get_head("cls")(teacher_output)
+                probe_pred = backbone.get_head("cls")(teacher_output_cls).view(B, -1)
+                probe_pred_attn = backbone.get_head("attentive")(teacher_output, rope=rope).view(B, -1)
                 probe_loss = cross_entropy_mixup(
                     probe_pred, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
+                ).mean()
+                probe_loss += cross_entropy_mixup(
+                    probe_pred_attn,
+                    label,
+                    mixup_seed or 0,
+                    augmentation_config.mixup_prob,
+                    augmentation_config.mixup_alpha,
                 ).mean()
 
                 # Combine losses
@@ -309,6 +357,7 @@ def train(
                     B, augmentation_config.mixup_prob, augmentation_config.mixup_alpha, mixup_seed
                 ).logical_not_()
                 train_acc.update(probe_pred[mask], label[mask])
+                train_acc_attn.update(probe_pred_attn[mask], label[mask])
 
             # Backward
             assert not loss.isnan()
@@ -326,7 +375,9 @@ def train(
                 update_teacher(backbone, teacher, current_momentum)
                 step += 1
 
-            desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc)
+            desc = format_pbar_description(
+                step, microbatch, epoch, loss=train_loss, acc=train_acc, acc_attn=train_acc_attn
+            )
             pbar.set_description(desc)
 
         # Validation
@@ -334,18 +385,32 @@ def train(
         if val_dataloader is not None and (epoch + 1) % trainer_config.check_val_every_n_epoch == 0:
             modules.eval()
             val_acc.reset()
+            val_acc_attn.reset()
             for img, label in tqdm(val_dataloader, desc=f"Validating: ", disable=not is_rank_zero(), leave=False):
                 B = img.shape[0]
                 img = img.cuda()
                 label = label.cuda()
+                tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    teacher_output = teacher(img)
-                    probe_pred = backbone.get_head("cls")(teacher_output)
+                    output = backbone(img)
+                    rope = (
+                        backbone.rope(H=tokenized_size[0], W=tokenized_size[1]) if backbone.rope is not None else None
+                    )
+                    output_cls = backbone.get_head("pool")(output, rope=rope)
+                    probe_pred = backbone.get_head("cls")(output_cls).view(B, -1)
+                    probe_pred_attn = backbone.get_head("attentive")(output, rope=rope).view(B, -1)
                     val_acc.update(probe_pred, label)
+                    val_acc_attn.update(probe_pred_attn, label)
 
             # Validation epoch end
-            rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}")
-            logger.log(epoch, step, microbatch, acc=val_acc.compute()) if logger else None
+            rank_zero_info(
+                f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}, Val Acc Attn: {val_acc_attn.compute():.4f}"
+            )
+            (
+                logger.log(epoch, step, microbatch, acc=val_acc.compute(), acc_attn=val_acc_attn.compute())
+                if logger
+                else None
+            )
 
         gc.collect()
         torch.cuda.synchronize()
