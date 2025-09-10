@@ -13,6 +13,9 @@ from vit.pos_enc import LearnablePosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
 
 
+torch._dynamo.config.cache_size_limit = 1024 * 1024 * 1024 * 1024
+
+
 class CrossAttentionPredictor(nn.Module):
     r"""
     Predicts targets from context embeddings.
