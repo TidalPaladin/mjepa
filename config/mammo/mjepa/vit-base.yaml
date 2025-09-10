@@ -1,15 +1,16 @@
 # Config for training ViT-B/16 using MJEPA on mammography.
 trainer: !!python/object:mjepa.TrainerConfig
-  batch_size: 384
+  batch_size: 256
   num_workers: 24 
   num_epochs: 375
+  accumulate_grad_batches: 4
   sizes:
     300: !!python/object:mjepa.ResolutionConfig
       size: [512, 384]
-      batch_size: 96
+      batch_size: 64
     350: !!python/object:mjepa.ResolutionConfig
       size: [1024, 768]
-      batch_size: 24
+      batch_size: 16
 
 backbone: !!python/object:vit.ViTConfig
   in_channels: 1
@@ -19,14 +20,27 @@ backbone: !!python/object:vit.ViTConfig
   img_size: [256, 192]
   depth: 12
   num_attention_heads: 12
-  activation: "srelu"
-  bias: false
-  attention_dropout: 0.0
+  activation: "swiglu"
+  mlp_bias: true
+  attention_bias: false
+  attention_dropout: 0.1
   hidden_dropout: 0.1
   drop_path_rate: 0.1
-  num_register_tokens: 16
-  pos_enc: "fourier"
+  num_register_tokens: 4
+  pos_enc: "rope"
   layer_scale: 0.00001
+  rope_base: 100
+  rope_rescale_coords: 2.0
+  rope_shift_coords: null
+  rope_jitter_coords: null
+  rope_normalize_coords: "max"
+  heads:
+    pool: !!python/object:vit.HeadConfig
+      head_type: "linear"
+      pool_type: "attentive"
+      attention_dropout: 0.1
+      hidden_dropout: 0.1
+      output_norm: true
 
 augmentations: !!python/object:mjepa.AugmentationConfig
   mixup_prob: 0.2
@@ -42,10 +56,16 @@ augmentations: !!python/object:mjepa.AugmentationConfig
 
 jepa: !!python/object:mjepa.JEPAConfig
   momentum: 0.98
-  predictor_depth: 3
+  predictor_depth: 4
   context_ratio: 0.5
-  target_ratio: 0.5
+  target_ratio: 0.25
   scale: 4
+  gram_teacher_epoch: 75
+  gram_start_epoch: 125
+  gram_update_interval_epoch: 25
+  gram_resolution_scale: 2.0
+  gram_remove_neg: false
+  scheduled: false
 
 optimizer: !!python/object:mjepa.OptimizerConfig
   optimizer: "adamw"
@@ -53,8 +73,6 @@ optimizer: !!python/object:mjepa.OptimizerConfig
   weight_decay: 0.1
   betas: [0.85, 0.95]
   fused: true
+  scheduled: false
   pct_start: 0.01
-  base_momentum: 0.85
-  max_momentum: 0.95
   div_factor: 10
-  final_div_factor: 10000
