@@ -313,7 +313,8 @@ def setup_logdir(log_dir: os.PathLike | None, config_path: os.PathLike | None, n
     if name:
         subdir = f"{subdir}_{name}"
     log_dir = log_dir / subdir
-    log_dir.mkdir()
+    if is_rank_zero():
+        log_dir.mkdir()
 
     # Add file handler when log directory is provided
     file_handler = logging.FileHandler(log_dir / "run.log")
@@ -321,7 +322,7 @@ def setup_logdir(log_dir: os.PathLike | None, config_path: os.PathLike | None, n
     logging.root.addHandler(file_handler)
 
     # Copy config file to log directory
-    if config_path:
+    if config_path and is_rank_zero():
         copyfile(config_path, log_dir / "config.yaml")
     return log_dir
 
