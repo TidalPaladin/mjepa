@@ -265,7 +265,12 @@ def train(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
                 teacher_output = teacher(img, rope_seed=rope_seed)
-                teacher_output_cls = teacher.get_head("pool")(teacher_output)
+                rope = (
+                    teacher.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
+                    if teacher.rope is not None
+                    else None
+                )
+                teacher_output_cls = teacher.get_head("pool")(teacher_output, rope=rope)
             teacher_output = teacher_output.clone()
             teacher_output_cls = teacher_output_cls.clone()
 
@@ -287,7 +292,9 @@ def train(
             # Apply augmentations
             with torch.no_grad():
                 img = apply_noise(augmentation_config, img)
-                mixup_seed, (img, teacher_output, teacher_output_cls) = apply_mixup(augmentation_config, img, teacher_output, teacher_output_cls)
+                mixup_seed, (img, teacher_output, teacher_output_cls) = apply_mixup(
+                    augmentation_config, img, teacher_output, teacher_output_cls
+                )
                 img = apply_invert(augmentation_config, img)[0]
                 img = apply_posterize(augmentation_config, img)[0]
 
@@ -304,9 +311,16 @@ def train(
                 # Second predictor forward with pooled token
                 # NOTE: Stop gradient on context is very important - otherwise model cheats via over-reliance on the pooled token.
                 # NOTE: Since pooled token is part of context we reuse the backbone's output norm to normalize it.
-                pred_cls = backbone.get_head("pool")(teacher_output)
+                rope = (
+                    backbone.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
+                    if backbone.rope is not None
+                    else None
+                )
+                pred_cls = backbone.get_head("pool")(teacher_output, rope=rope)
                 context_with_cls = torch.cat([pred_cls.unsqueeze(1), context.detach()], dim=1)
-                pred_with_cls = predictor(tokenized_size, context_with_cls, context_mask, target_mask, rope_seed=rope_seed)
+                pred_with_cls = predictor(
+                    tokenized_size, context_with_cls, context_mask, target_mask, rope_seed=rope_seed
+                )
 
                 # Compute JEPA loss
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
@@ -323,12 +337,16 @@ def train(
 
                 # Compute linear probe loss
                 probe_pred = backbone.get_head("cls")(teacher_output_cls).view(B, -1)
-                probe_pred_attn = backbone.get_head("attentive")(teacher_output).view(B, -1)
+                probe_pred_attn = backbone.get_head("attentive")(teacher_output, rope=rope).view(B, -1)
                 probe_loss = cross_entropy_mixup(
                     probe_pred, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
                 ).mean()
                 probe_loss += cross_entropy_mixup(
-                    probe_pred_attn, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
+                    probe_pred_attn,
+                    label,
+                    mixup_seed or 0,
+                    augmentation_config.mixup_prob,
+                    augmentation_config.mixup_alpha,
                 ).mean()
 
                 # Combine losses
@@ -357,7 +375,9 @@ def train(
                 update_teacher(backbone, teacher, current_momentum)
                 step += 1
 
-            desc = format_pbar_description(step, microbatch, epoch, loss=train_loss, acc=train_acc, acc_attn=train_acc_attn)
+            desc = format_pbar_description(
+                step, microbatch, epoch, loss=train_loss, acc=train_acc, acc_attn=train_acc_attn
+            )
             pbar.set_description(desc)
 
         # Validation
@@ -372,16 +392,25 @@ def train(
                 label = label.cuda()
                 tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    teacher_output = teacher(img)
-                    teacher_output_cls = teacher.get_head("pool")(teacher_output)
-                    probe_pred = backbone.get_head("cls")(teacher_output_cls).view(B, -1)
-                    probe_pred_attn = backbone.get_head("attentive")(teacher_output).view(B, -1)
+                    output = backbone(img)
+                    rope = (
+                        backbone.rope(H=tokenized_size[0], W=tokenized_size[1]) if backbone.rope is not None else None
+                    )
+                    output_cls = backbone.get_head("pool")(output, rope=rope)
+                    probe_pred = backbone.get_head("cls")(output_cls).view(B, -1)
+                    probe_pred_attn = backbone.get_head("attentive")(output, rope=rope).view(B, -1)
                     val_acc.update(probe_pred, label)
                     val_acc_attn.update(probe_pred_attn, label)
 
             # Validation epoch end
-            rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}, Val Acc Attn: {val_acc_attn.compute():.4f}")
-            logger.log(epoch, step, microbatch, acc=val_acc.compute(), acc_attn=val_acc_attn.compute()) if logger else None
+            rank_zero_info(
+                f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}, Val Acc Attn: {val_acc_attn.compute():.4f}"
+            )
+            (
+                logger.log(epoch, step, microbatch, acc=val_acc.compute(), acc_attn=val_acc_attn.compute())
+                if logger
+                else None
+            )
 
         gc.collect()
         torch.cuda.synchronize()

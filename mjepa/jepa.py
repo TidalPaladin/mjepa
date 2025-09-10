@@ -1,8 +1,7 @@
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple, TypeVar, Iterator
-import torch.distributed as dist
+from typing import TYPE_CHECKING, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -15,6 +14,7 @@ from vit.tokens import apply_mask, generate_non_overlapping_mask
 
 
 torch._dynamo.config.cache_size_limit = 1024 * 1024 * 1024 * 1024
+
 
 class CrossAttentionPredictor(nn.Module):
     r"""
