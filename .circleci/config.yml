@@ -13,18 +13,18 @@ jobs:
             - checkout
             - restore_cache:
                 keys:
-                  - v1-dependencies-{{ checksum "pdm.lock" }}
+                  - v1-dependencies-{{ checksum "uv.lock" }}
             - run:
-                name: Install pdm
-                command: pip install --user pdm
+                name: Install uv
+                command: pip install --user uv
             - run:
                 name: Install dependencies
-                command: pdm install -G quality --no-default --no-self
+                command: uv sync --group dev --no-install-project
             - save_cache:
                 paths:
                   - ~/.cache/pip
-                  - ~/.cache/pdm
-                key: v1-dependencies-{{ checksum "pdm.lock" }}
+                  - ~/.cache/uv
+                key: v1-dependencies-{{ checksum "uv.lock" }}
             - run: 
                 name: Run quality tests
                 command: make quality
@@ -36,15 +36,15 @@ jobs:
             - checkout
             - restore_cache:
                 keys:
-                  - v1-dependencies-{{ checksum "pdm.lock" }}
+                  - v1-dependencies-{{ checksum "uv.lock" }}
             - run:
                 name: Install dependencies
                 command: make init
             - save_cache:
                 paths:
                   - ~/.cache/pip
-                  - ~/.cache/pdm
-                key: v1-dependencies-{{ checksum "pdm.lock" }}
+                  - ~/.cache/uv
+                key: v1-dependencies-{{ checksum "uv.lock" }}
             - run:
                 name: Run tests
                 command: make test-ci
