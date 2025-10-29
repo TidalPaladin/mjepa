@@ -12,6 +12,21 @@ from torch.utils.cpp_extension import load
 from torchvision.utils import make_grid
 
 
+def _get_cuda_source_path() -> str:
+    """Get path to CUDA source file, handling both development and installed package scenarios."""
+    # Try development path first (when running from source)
+    dev_path = Path(__file__).parents[2] / "csrc" / "mixup.cu"
+    if dev_path.exists():
+        return str(dev_path)
+    
+    # Try installed package path
+    pkg_path = Path(__file__).parent.parent / "csrc" / "mixup.cu"
+    if pkg_path.exists():
+        return str(pkg_path)
+    
+    raise FileNotFoundError(f"Could not find mixup.cu in expected locations: {dev_path}, {pkg_path}")
+
+
 try:
     import mixup_cuda  # type: ignore
 
@@ -20,7 +35,7 @@ except ImportError:
     if torch.cuda.is_available():
         _mixup_cuda = load(
             name="mixup_cuda",
-            sources=[str(Path(__file__).parents[2] / "csrc" / "mixup.cu")],
+            sources=[_get_cuda_source_path()],
             extra_cuda_cflags=["-O3"],
         )
     else:

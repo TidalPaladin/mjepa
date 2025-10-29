@@ -98,3 +98,18 @@ version-file = "mjepa/_version.py"
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["mjepa"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"csrc" = "mjepa/csrc"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/mjepa",
+    "/csrc",
+    "/tests",
+    "/trainers",
+    "/scripts",
+]
