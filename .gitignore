@@ -8,6 +8,7 @@ __pycache__/
 *.pyz
 .pdm-python
 **/_version.py
+*.so
 
 # Node
 node_modules/

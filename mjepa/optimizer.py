@@ -4,7 +4,6 @@ from typing import Any, Dict, Iterator, List, Literal, Set, Tuple
 
 import torch.nn as nn
 import yaml
-from pytorch_optimizer import SOAP
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LinearLR, LRScheduler, OneCycleLR
 
@@ -19,7 +18,7 @@ class OptimizerConfig:
     foreach: bool | None = None
     eps: float = 1e-8
     precondition_frequency: int = 10
-    optimizer: Literal["adamw", "soap"] = "adamw"
+    optimizer: Literal["adamw"] = "adamw"
 
     # Scheduler
     scheduled: bool = False
@@ -36,8 +35,6 @@ class OptimizerConfig:
         match self.optimizer:
             case "adamw":
                 optimizer = self._instantiate_adamw(model)
-            case "soap":
-                optimizer = self._instantiate_soap(model)
             case _:
                 raise ValueError(f"Invalid optimizer: {self.optimizer}")
         if self.scheduled:
@@ -69,17 +66,6 @@ class OptimizerConfig:
             betas=self.betas,
             fused=self.fused,
             foreach=self.foreach,
-            eps=self.eps,
-        )
-
-    def _instantiate_soap(self, model: nn.Module) -> Optimizer:
-        parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
-        return SOAP(
-            parameter_groups,
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-            betas=self.betas,
-            precondition_frequency=self.precondition_frequency,
             eps=self.eps,
         )
 

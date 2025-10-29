@@ -6,7 +6,6 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
-from torch.utils.cpp_extension import load
 from torchvision.utils import make_grid
 
 
@@ -27,15 +26,26 @@ def _get_cuda_source_path() -> str:
 
 try:
     import posterize_cuda  # type: ignore
-
     _posterize_cuda = posterize_cuda
 except ImportError:
     if torch.cuda.is_available():
-        _posterize_cuda = load(
-            name="posterize_cuda",
-            sources=[_get_cuda_source_path()],
-            extra_cuda_cflags=["-O3"],
-        )
+        try:
+            from torch.utils.cpp_extension import load
+            _posterize_cuda = load(
+                name="posterize_cuda",
+                sources=[_get_cuda_source_path()],
+                extra_cuda_cflags=[
+                    "-O3",
+                    "--use_fast_math",
+                    "-gencode=arch=compute_80,code=sm_80",
+                    "-gencode=arch=compute_86,code=sm_86",
+                    "-gencode=arch=compute_89,code=sm_89",
+                    "-gencode=arch=compute_90,code=sm_90",
+                ],
+            )
+        except Exception as e:
+            print(f"Warning: Failed to compile posterize CUDA extension: {e}")
+            _posterize_cuda = None
     else:
         _posterize_cuda = None
 
