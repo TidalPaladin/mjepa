@@ -3,7 +3,7 @@
 PROJECT=mjepa
 QUALITY_DIRS=$(PROJECT) tests trainers scripts
 CLEAN_DIRS=$(PROJECT) tests trainers scripts
-PYTHON=pdm run python
+PYTHON=uv run python
 
 check: ## run quality checks and unit tests
 	$(MAKE) style
@@ -20,14 +20,12 @@ clean: ## remove cache files
 	find $(CLEAN_DIRS) -name '*.orig' -type f -delete
 
 clean-env: ## remove the virtual environment directory
-	pdm venv remove in-project
+	rm -rf .venv
 
 init: ## pulls submodules and initializes virtual environment
 	git submodule update --init --recursive
-	which pdm || pip install --user pdm
-	pdm venv create --with-pip
-	pdm install -d
-	$(PYTHON) -m pip install pybind11 "transformer-engine[torch]" --no-build-isolation
+	which uv || pip install --user uv
+	uv sync --all-groups
 
 node_modules: 
 ifeq (, $(shell which npm))
@@ -72,7 +70,7 @@ test-ci: ## runs CI-only tests
 		./tests/
 
 types: node_modules ## run pyright type checking
-	pdm run npx --no-install pyright tests $(PROJECT)
+	uv run npx --no-install pyright tests $(PROJECT)
 
 help: ## display this help message
 	@echo "Please use \`make <target>' where <target> is one of"

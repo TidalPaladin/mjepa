@@ -1,35 +1,45 @@
 [build-system]
-requires = ["pdm-pep517>=1.0"]
-build-backend = "pdm.pep517.api"
+requires = [
+    "hatchling",
+    "hatch-vcs",
+]
+build-backend = "hatchling.build"
 
 [project]
 name = "mjepa"
 description = ""
 requires-python = ">=3.11,<3.14"
 authors = [
-    {name = "Scott Chase Waggener", email = "chase.waggener@icloud.com"},
+    { name = "Scott Chase Waggener", email = "chase.waggener@icloud.com" },
 ]
 dependencies = [
-  "torch",
-  "torchvision",
-  "einops",
-  "ninja",
-  "pyyaml",
-  "torchmetrics",
-  "pandas",
-  "pyarrow",
-  "safetensors",
-  "tqdm",
-  "vit @ git+https://github.com/TidalPaladin/vit.git",
-  "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
+    "torch",
+    "torchvision",
+    "einops",
+    "ninja",
+    "pyyaml",
+    "torchmetrics",
+    "pandas",
+    "pyarrow",
+    "safetensors",
+    "tqdm",
+    "vit @ git+https://github.com/TidalPaladin/vit.git",
+    "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
 ]
 readme = "README.md"
-license = {text = "Apache"}
-dynamic = ["version"]
+dynamic = [
+    "version",
+]
+
+[project.license]
+text = "Apache"
 
 [tool.autoflake]
 remove-all-unused-imports = true
 remove-unused-variables = true
+exclude = [
+    "_version.py",
+]
 
 [tool.autopep8]
 max_line_length = 120
@@ -37,9 +47,11 @@ ignore = "E501,W6,E203"
 in-place = true
 recursive = true
 aggressive = 3
+exclude = "_version.py"
 
 [tool.black]
 line-length = 120
+extend-exclude = "_version.py"
 
 [tool.isort]
 ensure_newline_before_comments = true
@@ -49,44 +61,40 @@ line_length = 119
 lines_after_imports = 2
 multi_line_output = 3
 use_parentheses = false
+skip_glob = [
+    "*/_version.py",
+]
 
 [tool.pyright]
-include = ["mjepa", "tests", "trainers"]
-exclude = [
-  "**/node_modules",
-  "**/__pycache__",
-  "**/.pytest_cache",
+include = [
+    "mjepa",
+    "tests",
+    "trainers",
 ]
-ignore = ["src/oldstuff"]
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/_version.py",
+]
+ignore = [
+    "src/oldstuff",
+]
 pythonVersion = "3.12"
 pythonPlatform = "Linux"
 
-[tool.pdm]
-version = { source = "scm" }
-
-[tool.pdm.dev-dependencies]
-test = [
-  "pytest",
-  "pytest-mock",
-  "pytest-cov",
-  "coverage",
-  "pdbpp",
-]
-quality = [
-  "autoflake",
-  "autopep8",
-  "black",
-  "flake8",
-  "isort",
-]
-
 [tool.pytest.ini_options]
 markers = [
-  "ci_skip",
-  "cuda",
+    "ci_skip",
+    "cuda",
 ]
 filterwarnings = []
 
-# Sample script config
-#[project.scripts]
-#foo = "project.cli.__main__:main"
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "mjepa/_version.py"
+
+[tool.hatch.metadata]
+allow-direct-references = true
