@@ -106,17 +106,19 @@ class CudaBuildHook(BuildHookInterface):
                 self.app.display_info(f"Compiling {name} during build...")
                 
                 # Compile the extension
+                build_subdir = build_dir / name
+                build_subdir.mkdir(parents=True, exist_ok=True)
                 module = load(
                     name=name,
                     sources=[source_file],
                     extra_cuda_cflags=cuda_flags,
                     extra_cflags=["-O3"],
-                    build_directory=str(build_dir / name),
+                    build_directory=str(build_subdir),
                     verbose=False,
                 )
                 
                 # Find the compiled .so file and copy it to package directory
-                so_files = list((build_dir / name).glob(f"{name}*.so"))
+                so_files = list((build_subdir).glob(f"{name}*.so"))
                 
                 if so_files:
                     # Copy to package directory for inclusion in wheel

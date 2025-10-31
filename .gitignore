@@ -9,6 +9,8 @@ __pycache__/
 .pdm-python
 **/_version.py
 *.so
+dist/
+build/
 
 # Node
 node_modules/

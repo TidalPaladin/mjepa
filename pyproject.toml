@@ -107,7 +107,7 @@ allow-direct-references = true
 packages = ["mjepa"]
 artifacts = ["mjepa/*.so"]
 
-[tool.hatch.build.targets.wheel.sources]
+[tool.hatch.build.targets.wheel.force-include]
 "csrc" = "mjepa/csrc"
 
 [tool.hatch.build.targets.wheel.hooks.custom]
