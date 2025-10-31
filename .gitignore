@@ -7,6 +7,10 @@ __pycache__/
 *.pyw
 *.pyz
 .pdm-python
+**/_version.py
+*.so
+dist/
+build/
 
 # Node
 node_modules/

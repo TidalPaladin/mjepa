@@ -5,17 +5,42 @@ from torch import Tensor
 from torch.utils.cpp_extension import load
 
 
+def _get_cuda_source_path() -> str:
+    """Get path to CUDA source file, handling both development and installed package scenarios."""
+    # Try development path first (when running from source)
+    dev_path = Path(__file__).parents[2] / "csrc" / "invert.cu"
+    if dev_path.exists():
+        return str(dev_path)
+    
+    # Try installed package path
+    pkg_path = Path(__file__).parent.parent / "csrc" / "invert.cu"
+    if pkg_path.exists():
+        return str(pkg_path)
+    
+    raise FileNotFoundError(f"Could not find invert.cu in expected locations: {dev_path}, {pkg_path}")
+
+
 try:
     import invert_cuda  # type: ignore
-
     _invert_cuda = invert_cuda
 except ImportError:
     if torch.cuda.is_available():
-        _invert_cuda = load(
-            name="invert_cuda",
-            sources=[str(Path(__file__).parents[2] / "csrc" / "invert.cu")],
-            extra_cuda_cflags=["-O3"],
-        )
+        try:
+            _invert_cuda = load(
+                name="invert_cuda",
+                sources=[_get_cuda_source_path()],
+                extra_cuda_cflags=[
+                    "-O3",
+                    "--use_fast_math",
+                    "-gencode=arch=compute_80,code=sm_80",
+                    "-gencode=arch=compute_86,code=sm_86", 
+                    "-gencode=arch=compute_89,code=sm_89",
+                    "-gencode=arch=compute_90,code=sm_90",
+                ],
+            )
+        except Exception as e:
+            print(f"Warning: Failed to compile invert CUDA extension: {e}")
+            _invert_cuda = None
     else:
         _invert_cuda = None
 

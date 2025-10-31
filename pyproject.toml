@@ -2,6 +2,10 @@
 requires = [
     "hatchling",
     "hatch-vcs",
+    "torch",
+    "pybind11>=2.10.0",
+    "ninja",
+    "numpy",
 ]
 build-backend = "hatchling.build"
 
@@ -14,7 +18,8 @@ authors = [
 ]
 dependencies = [
     "torch",
-    "torchvision",
+    "torchvision", 
+    "numpy",
     "einops",
     "ninja",
     "pyyaml",
@@ -23,13 +28,12 @@ dependencies = [
     "pyarrow",
     "safetensors",
     "tqdm",
+    "pybind11",
     "vit @ git+https://github.com/TidalPaladin/vit.git",
     "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
 ]
 readme = "README.md"
-dynamic = [
-    "version",
-]
+dynamic = ["version"]
 
 [project.license]
 text = "Apache"
@@ -98,3 +102,23 @@ version-file = "mjepa/_version.py"
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["mjepa"]
+artifacts = ["mjepa/*.so"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"csrc" = "mjepa/csrc"
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build_hook.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/mjepa",
+    "/csrc",
+    "/tests", 
+    "/trainers",
+    "/scripts",
+    "/hatch_build_hook.py",
+]

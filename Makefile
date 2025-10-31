@@ -5,6 +5,9 @@ QUALITY_DIRS=$(PROJECT) tests trainers scripts
 CLEAN_DIRS=$(PROJECT) tests trainers scripts
 PYTHON=uv run python
 
+build-cuda:
+	uv run python build_extensions.py
+
 check: ## run quality checks and unit tests
 	$(MAKE) style
 	$(MAKE) quality
@@ -18,6 +21,7 @@ clean: ## remove cache files
 	find $(CLEAN_DIRS) -name '*.pyc' -type f -delete
 	find $(CLEAN_DIRS) -name '*,cover' -type f -delete
 	find $(CLEAN_DIRS) -name '*.orig' -type f -delete
+	find $(CLEAN_DIRS) -name '*.so' -type f -delete
 
 clean-env: ## remove the virtual environment directory
 	rm -rf .venv
@@ -26,6 +30,18 @@ init: ## pulls submodules and initializes virtual environment
 	git submodule update --init --recursive
 	which uv || pip install --user uv
 	uv sync --all-groups
+
+build-cuda: ## build CUDA extensions manually and copy to package directory
+	$(PYTHON) build_extensions.py
+
+install-dev: ## install package in development mode
+	pip install -e .
+
+install-dev-cuda: build-cuda ## build CUDA extensions then install in development mode
+	pip install -e .
+
+clean-cuda: ## remove compiled CUDA extensions
+	find mjepa/ -name "*_cuda.so" -delete
 
 node_modules: 
 ifeq (, $(shell which npm))
