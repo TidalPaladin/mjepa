@@ -24,3 +24,7 @@ node_modules/
 *.log
 output/
 *.gif
+
+# Runs
+# Year-based folders (e.g., 2025, 2024, etc.)
+[0-9][0-9][0-9][0-9]-*
