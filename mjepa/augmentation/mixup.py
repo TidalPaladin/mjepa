@@ -8,23 +8,24 @@ import torch
 from PIL import Image
 from torch import Tensor
 from torch.autograd import Function
-from torch.utils.cpp_extension import load
 from torchvision.utils import make_grid
 
 
-try:
-    import mixup_cuda  # type: ignore
+def _sample_beta(u: Tensor, v: Tensor, alpha: float) -> Tensor:
+    """Sample from Beta distribution using the same method as CUDA kernel.
 
-    _mixup_cuda = mixup_cuda
-except ImportError:
-    if torch.cuda.is_available():
-        _mixup_cuda = load(
-            name="mixup_cuda",
-            sources=[str(Path(__file__).parents[2] / "csrc" / "mixup.cu")],
-            extra_cuda_cflags=["-O3"],
-        )
-    else:
-        _mixup_cuda = None
+    Args:
+        u: Uniform random values [0, 1]
+        v: Uniform random values [0, 1]
+        alpha: Alpha parameter for Beta distribution
+
+    Returns:
+        Samples from Beta(alpha, alpha)
+    """
+    divisor = 1.0 / alpha
+    u_pow = u.pow(divisor)
+    v_pow = v.pow(divisor)
+    return u_pow / (u_pow + v_pow)
 
 
 @torch.no_grad()
@@ -35,12 +36,34 @@ def get_weights(
     seed: int | None = None,
     device: torch.device = torch.device("cuda"),
 ) -> Tensor:
-    if _mixup_cuda is None:
-        raise RuntimeError("MixUp is not available on this system")
+    """Get per-batch mixup weights.
 
+    Args:
+        batch_size: Number of samples in batch
+        mixup_prob: Probability of applying mixup to each sample
+        mixup_alpha: Alpha parameter for Beta distribution
+        seed: Random seed
+        device: Device to create tensor on
+
+    Returns:
+        Tensor of shape (batch_size,) with mixup weights
+    """
     if seed is None:
         seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
-    return _mixup_cuda.get_weights(batch_size, mixup_prob, mixup_alpha, seed, device)
+
+    # Generate per-batch random values
+    gen = torch.Generator(device=device).manual_seed(seed)
+    apply_mixup = torch.rand(batch_size, generator=gen, device=device) < mixup_prob
+
+    # Sample Beta distribution
+    u = torch.rand(batch_size, generator=gen, device=device)
+    v = torch.rand(batch_size, generator=gen, device=device)
+    weights = _sample_beta(u, v, mixup_alpha)
+
+    # Set weight to 1.0 for samples that don't get mixup
+    weights = torch.where(apply_mixup, weights, torch.ones_like(weights))
+
+    return weights
 
 
 @torch.no_grad()
@@ -51,12 +74,42 @@ def is_mixed(
     seed: int | None = None,
     device: torch.device = torch.device("cuda"),
 ) -> Tensor:
-    if _mixup_cuda is None:
-        raise RuntimeError("MixUp is not available on this system")
+    """Get per-batch boolean mask of which samples are mixed.
 
+    Args:
+        batch_size: Number of samples in batch
+        mixup_prob: Probability of applying mixup to each sample
+        mixup_alpha: Alpha parameter for Beta distribution
+        seed: Random seed
+        device: Device to create tensor on
+
+    Returns:
+        Boolean tensor of shape (batch_size,)
+    """
     if seed is None:
         seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
-    return _mixup_cuda.is_mixed(batch_size, mixup_prob, mixup_alpha, seed, device)
+
+    # Generate per-batch random values
+    gen = torch.Generator(device=device).manual_seed(seed)
+    apply_mixup = torch.rand(batch_size, generator=gen, device=device) < mixup_prob
+
+    return apply_mixup
+
+
+def _mixup_kernel(x: Tensor, weights: Tensor) -> Tensor:
+    """Apply mixup operation.
+
+    Args:
+        x: Input tensor (B, ...)
+        weights: Per-batch mixup weights (B,)
+
+    Returns:
+        Mixed tensor
+    """
+    batch_size = x.shape[0]
+    weights = weights.view(batch_size, *([1] * (x.ndim - 1)))
+    other = x.roll(-1, 0)
+    return x * weights + other * (1 - weights)
 
 
 @torch.no_grad()
@@ -75,35 +128,147 @@ def mixup(x: Tensor, mixup_prob: float = 0.2, mixup_alpha: float = 1.0, seed: in
     Returns:
         ``x.lerp(x.roll(1, 0), weight)``
     """
-    if _mixup_cuda is None:
-        raise RuntimeError("MixUp is not available on this system")
-
     if seed is None:
         seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
-    return _mixup_cuda.mixup(x, mixup_prob, mixup_alpha, seed)
+
+    batch_size = x.shape[0]
+    device = x.device
+
+    # Get mixup weights and ensure they match input dtype
+    weights = get_weights(batch_size, mixup_prob, mixup_alpha, seed, device).type_as(x)
+
+    # Apply mixup
+    output = _mixup_kernel(x, weights)
+
+    return output
+
+
+@torch.compile
+def _cross_entropy_mixup_fwd_kernel(
+    logits: Tensor,
+    labels: Tensor,
+    weights: Tensor,
+    apply_mixup: Tensor,
+) -> Tensor:
+    """Forward pass for cross-entropy with mixup.
+
+    Args:
+        logits: Logits tensor (B, C)
+        labels: Label tensor (B,)
+        weights: Mixup weights (B,)
+        apply_mixup: Boolean mask (B,)
+
+    Returns:
+        Loss tensor (B,)
+    """
+    batch_size, num_classes = logits.shape
+    logits.device
+
+    # Handle unknown labels (-1)
+    unknown_mask = labels == -1
+
+    # Create one-hot labels
+    valid_labels = torch.where(unknown_mask, torch.zeros_like(labels), labels)
+    labels_one_hot = torch.nn.functional.one_hot(valid_labels, num_classes).float()
+
+    # Mix labels with rolled version
+    labels_one_hot_other = labels_one_hot.roll(-1, 0)
+    weights_expanded = weights.view(batch_size, 1)
+    mixed_labels = weights_expanded * labels_one_hot + (1 - weights_expanded) * labels_one_hot_other
+
+    # Check if mixed label is unknown
+    labels_other = labels.roll(-1, 0)
+    unknown_other = labels_other == -1
+    both_unknown = unknown_mask | (apply_mixup & unknown_other)
+
+    # Compute cross-entropy loss
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    loss = -(mixed_labels * log_probs).sum(dim=-1)
+
+    # Mark unknown samples with -1
+    loss = torch.where(both_unknown, torch.full_like(loss, -1.0), loss)
+
+    return loss
+
+
+@torch.compile
+def _cross_entropy_mixup_bwd_kernel(
+    logits: Tensor,
+    labels: Tensor,
+    grad_output: Tensor,
+    weights: Tensor,
+    apply_mixup: Tensor,
+) -> Tensor:
+    """Backward pass for cross-entropy with mixup.
+
+    Args:
+        logits: Logits tensor (B, C)
+        labels: Label tensor (B,)
+        grad_output: Gradient from upstream (B,)
+        weights: Mixup weights (B,)
+        apply_mixup: Boolean mask (B,)
+
+    Returns:
+        Gradient w.r.t. logits (B, C)
+    """
+    batch_size, num_classes = logits.shape
+
+    # Handle unknown labels
+    unknown_mask = labels == -1
+    valid_labels = torch.where(unknown_mask, torch.zeros_like(labels), labels)
+    labels_one_hot = torch.nn.functional.one_hot(valid_labels, num_classes).float()
+
+    # Mix labels
+    labels_one_hot_other = labels_one_hot.roll(-1, 0)
+    weights_expanded = weights.view(batch_size, 1)
+    mixed_labels = weights_expanded * labels_one_hot + (1 - weights_expanded) * labels_one_hot_other
+
+    # Check if mixed label is unknown
+    labels_other = labels.roll(-1, 0)
+    unknown_other = labels_other == -1
+    both_unknown = unknown_mask | (apply_mixup & unknown_other)
+
+    # Compute gradient: softmax(logits) - mixed_labels
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    grad = probs - mixed_labels
+
+    # Apply chain rule with upstream gradient
+    grad = grad * grad_output.view(batch_size, 1)
+
+    # Zero out gradients for unknown samples
+    grad = torch.where(both_unknown.view(batch_size, 1), torch.zeros_like(grad), grad)
+
+    return grad
 
 
 class CrossEntropyMixup(Function):
     @staticmethod
     def forward(ctx, logits: Tensor, labels: Tensor, mixup_prob: float, mixup_alpha: float, seed: int) -> Tensor:
-        assert _mixup_cuda is not None
         ctx.mixup_prob = mixup_prob
         ctx.mixup_alpha = mixup_alpha
         ctx.seed = seed
-        loss, denom, max_val = _mixup_cuda.cross_entropy_mixup_fwd(logits, labels, mixup_prob, mixup_alpha, seed)
-        ctx.save_for_backward(logits, labels, denom, max_val)
+
+        batch_size = logits.shape[0]
+        device = logits.device
+
+        # Get mixup parameters
+        weights = get_weights(batch_size, mixup_prob, mixup_alpha, seed, device)
+        apply_mixup = is_mixed(batch_size, mixup_prob, mixup_alpha, seed, device)
+
+        ctx.save_for_backward(logits, labels, weights, apply_mixup)
+
+        # Compute loss
+        loss = _cross_entropy_mixup_fwd_kernel(logits, labels, weights, apply_mixup)
+
         return loss
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None, None, None]:
-        assert _mixup_cuda is not None
-        logits, labels, denom, max_val = ctx.saved_tensors
-        mixup_prob = ctx.mixup_prob
-        mixup_alpha = ctx.mixup_alpha
-        seed = ctx.seed
-        grad = _mixup_cuda.cross_entropy_mixup_bwd(
-            logits, labels, denom, max_val, grad_output, mixup_prob, mixup_alpha, seed
-        )
+        logits, labels, weights, apply_mixup = ctx.saved_tensors
+
+        # Compute gradient
+        grad = _cross_entropy_mixup_bwd_kernel(logits, labels, grad_output, weights, apply_mixup)
+
         return grad, None, None, None, None
 
 
@@ -136,9 +301,113 @@ def cross_entropy_mixup(
         - labels: :math:`(N,)`
         - Output: :math:`(N,)`
     """
-    if _mixup_cuda is None:
-        raise RuntimeError("MixUp is not available on this system")
     return CrossEntropyMixup.apply(logits, labels, mixup_prob, mixup_alpha, seed)
+
+
+@torch.compile
+def _bce_mixup_fwd_kernel(
+    logits: Tensor,
+    labels: Tensor,
+    weights: Tensor,
+    apply_mixup: Tensor,
+    pos_weight: float,
+) -> Tensor:
+    """Forward pass for BCE with mixup.
+
+    Args:
+        logits: Logits tensor (B, ...)
+        labels: Label tensor (B, ...)
+        weights: Mixup weights (B,)
+        apply_mixup: Boolean mask (B,)
+        pos_weight: Optional positive class weight
+
+    Returns:
+        Loss tensor (B, ...)
+    """
+    batch_size = logits.shape[0]
+
+    # Handle unknown labels (-1)
+    unknown_mask = labels == -1
+
+    # Mix labels with rolled version
+    labels_other = labels.roll(-1, 0)
+    weights_expanded = weights.view(batch_size, *([1] * (logits.ndim - 1)))
+    mixed_labels = weights_expanded * labels + (1 - weights_expanded) * labels_other
+
+    # Check if mixed label is unknown
+    unknown_other = labels_other == -1
+    unknown_mask_expanded = unknown_mask | (apply_mixup.view(batch_size, *([1] * (logits.ndim - 1))) & unknown_other)
+
+    # Compute BCE loss: softplus(logit) - logit * target
+    # Using stable computation: max(0, x) + log(1 + exp(-|x|))
+    zeros = torch.zeros_like(logits)
+    softplus = torch.maximum(logits, zeros) + torch.log1p(torch.exp(-torch.abs(logits)))
+    loss = softplus - logits * mixed_labels
+
+    # Apply pos_weight if provided
+    if pos_weight >= 0.0:
+        weight_factor = mixed_labels * pos_weight + (1 - mixed_labels) * (1 - pos_weight)
+        loss = loss * weight_factor
+
+    # Mark unknown samples with -1
+    loss = torch.where(unknown_mask_expanded, torch.full_like(loss, -1.0), loss)
+
+    return loss
+
+
+@torch.compile
+def _bce_mixup_bwd_kernel(
+    logits: Tensor,
+    labels: Tensor,
+    grad_output: Tensor,
+    weights: Tensor,
+    apply_mixup: Tensor,
+    pos_weight: float,
+) -> Tensor:
+    """Backward pass for BCE with mixup.
+
+    Args:
+        logits: Logits tensor (B, ...)
+        labels: Label tensor (B, ...)
+        grad_output: Gradient from upstream (B, ...)
+        weights: Mixup weights (B,)
+        apply_mixup: Boolean mask (B,)
+        pos_weight: Optional positive class weight
+
+    Returns:
+        Gradient w.r.t. logits (B, ...)
+    """
+    batch_size = logits.shape[0]
+
+    # Handle unknown labels
+    unknown_mask = labels == -1
+
+    # Mix labels
+    labels_other = labels.roll(-1, 0)
+    weights_expanded = weights.view(batch_size, *([1] * (logits.ndim - 1)))
+    mixed_labels = weights_expanded * labels + (1 - weights_expanded) * labels_other
+
+    # Check if mixed label is unknown
+    unknown_other = labels_other == -1
+    unknown_mask_expanded = unknown_mask | (apply_mixup.view(batch_size, *([1] * (logits.ndim - 1))) & unknown_other)
+
+    # Compute gradient: sigmoid(logit) - target
+    # Use stable sigmoid computation
+    sigmoid = torch.where(logits > 0, 1.0 / (1.0 + torch.exp(-logits)), torch.exp(logits) / (1.0 + torch.exp(logits)))
+    grad = sigmoid - mixed_labels
+
+    # Apply pos_weight if provided
+    if pos_weight >= 0.0:
+        weight_factor = mixed_labels * pos_weight + (1 - mixed_labels) * (1 - pos_weight)
+        grad = grad * weight_factor
+
+    # Apply chain rule with upstream gradient
+    grad = grad * grad_output
+
+    # Zero out gradients for unknown samples
+    grad = torch.where(unknown_mask_expanded, torch.zeros_like(grad), grad)
+
+    return grad
 
 
 class BCEMixup(Function):
@@ -152,24 +421,33 @@ class BCEMixup(Function):
         seed: int,
         pos_weight: float | None = None,
     ) -> Tensor:
-        assert _mixup_cuda is not None
         ctx.mixup_prob = mixup_prob
         ctx.mixup_alpha = mixup_alpha
         ctx.seed = seed
         ctx.pos_weight = -1.0 if pos_weight is None else pos_weight
-        loss = _mixup_cuda.bce_mixup_fwd(logits, labels, mixup_prob, mixup_alpha, ctx.pos_weight, seed)
-        ctx.save_for_backward(logits, labels)
+
+        batch_size = logits.shape[0]
+        device = logits.device
+
+        # Get mixup parameters
+        weights = get_weights(batch_size, mixup_prob, mixup_alpha, seed, device)
+        apply_mixup = is_mixed(batch_size, mixup_prob, mixup_alpha, seed, device)
+
+        ctx.save_for_backward(logits, labels, weights, apply_mixup)
+
+        # Compute loss
+        loss = _bce_mixup_fwd_kernel(logits, labels, weights, apply_mixup, ctx.pos_weight)
+
         return loss
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None, None, None, None]:
-        assert _mixup_cuda is not None
-        logits, labels = ctx.saved_tensors
-        mixup_prob = ctx.mixup_prob
-        mixup_alpha = ctx.mixup_alpha
-        seed = ctx.seed
+        logits, labels, weights, apply_mixup = ctx.saved_tensors
         pos_weight = ctx.pos_weight
-        grad = _mixup_cuda.bce_mixup_bwd(logits, labels, grad_output, mixup_prob, mixup_alpha, pos_weight, seed)
+
+        # Compute gradient
+        grad = _bce_mixup_bwd_kernel(logits, labels, grad_output, weights, apply_mixup, pos_weight)
+
         return grad, None, None, None, None, None
 
 
@@ -209,8 +487,6 @@ def bce_mixup(
         - labels: :math:`(N, ...)`
         - Output: :math:`(N, ...)`
     """
-    if _mixup_cuda is None:
-        raise RuntimeError("MixUp is not available on this system")
     if pos_weight is not None and not (0 <= pos_weight <= 1):
         raise ValueError("pos_weight must be in range [0, 1]")
     return BCEMixup.apply(logits, labels, mixup_prob, mixup_alpha, seed, pos_weight)

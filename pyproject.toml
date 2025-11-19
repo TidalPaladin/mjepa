@@ -31,6 +31,21 @@ dynamic = [
     "version",
 ]
 
+[dependency-groups]
+dev = [
+    "autoflake",
+    "autopep8",
+    "black",
+    "flake8",
+    "isort",
+    "pytest",
+    "pytest-mock",
+    "pytest-cov",
+    "pytest-env",
+    "coverage",
+    "pdbpp",
+]
+
 [project.license]
 text = "Apache"
 

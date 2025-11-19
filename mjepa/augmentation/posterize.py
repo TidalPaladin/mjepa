@@ -6,23 +6,36 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
-from torch.utils.cpp_extension import load
 from torchvision.utils import make_grid
 
 
-try:
-    import posterize_cuda  # type: ignore
+@torch.compile
+def _posterize_kernel(
+    input: Tensor,
+    posterize_mask: Tensor,
+    levels: float,
+) -> Tensor:
+    """Apply posterize operation per batch element.
 
-    _posterize_cuda = posterize_cuda
-except ImportError:
-    if torch.cuda.is_available():
-        _posterize_cuda = load(
-            name="posterize_cuda",
-            sources=[str(Path(__file__).parents[2] / "csrc" / "posterize.cu")],
-            extra_cuda_cflags=["-O3"],
-        )
-    else:
-        _posterize_cuda = None
+    Args:
+        input: Input tensor of shape (B, ...)
+        posterize_mask: Boolean mask of shape (B,) indicating which samples to posterize
+        levels: Number of levels (2^bits - 1)
+
+    Returns:
+        Output tensor with same shape as input
+    """
+    batch_size = input.shape[0]
+    # Reshape mask to broadcast over spatial dimensions
+    posterize_mask = posterize_mask.view(batch_size, *([1] * (input.ndim - 1)))
+
+    # Quantize to specified number of levels
+    posterized = (input * levels).round() / levels
+
+    # Apply mask to select which samples to posterize
+    output = torch.where(posterize_mask, posterized, input)
+
+    return output
 
 
 def posterize(
@@ -31,12 +44,38 @@ def posterize(
     bits: int,
     seed: int | None = None,
 ) -> Tensor:
-    if _posterize_cuda is None:
-        raise RuntimeError("Posterize is not available on this system")
+    """Apply posterize operation to input tensor.
+
+    Args:
+        input: Input tensor of shape (B, ...)
+        posterize_prob: Probability of posterizing each sample
+        bits: Number of bits to posterize to (1-8)
+        seed: Random seed for reproducibility
+
+    Returns:
+        Transformed tensor with same shape and dtype as input
+    """
+    if not (1 <= bits <= 8):
+        raise ValueError(f"Number of bits must be between 1 and 8, got {bits}")
 
     if seed is None:
         seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
-    return _posterize_cuda.posterize(input, posterize_prob, bits, seed)
+
+    batch_size = input.shape[0]
+    dtype = input.dtype
+    device = input.device
+
+    # Compute levels outside compiled kernel to avoid bit shift in dynamo
+    levels = float((1 << bits) - 1)
+
+    # Generate per-batch random mask
+    gen = torch.Generator(device=device).manual_seed(seed)
+    posterize_mask = torch.rand(batch_size, generator=gen, device=device) < posterize_prob
+
+    # Apply transformation
+    output = _posterize_kernel(input.float(), posterize_mask, levels)
+
+    return output.to(dtype)
 
 
 def posterize_(
@@ -45,12 +84,20 @@ def posterize_(
     bits: int,
     seed: int | None = None,
 ) -> Tensor:
-    if _posterize_cuda is None:
-        raise RuntimeError("Posterize is not available on this system")
+    """In-place version of posterize operation.
 
-    if seed is None:
-        seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
-    return _posterize_cuda.posterize_(input, posterize_prob, bits, seed)
+    Args:
+        input: Input tensor of shape (B, ...)
+        posterize_prob: Probability of posterizing each sample
+        bits: Number of bits to posterize to (1-8)
+        seed: Random seed for reproducibility
+
+    Returns:
+        Modified input tensor
+    """
+    result = posterize(input, posterize_prob, bits, seed)
+    input.copy_(result)
+    return input
 
 
 def parse_args() -> Namespace:

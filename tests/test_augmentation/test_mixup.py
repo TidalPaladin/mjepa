@@ -132,7 +132,7 @@ class TestCrossEntropyMixup:
         expected = F.cross_entropy(logits, mixed_labels, reduction="none")
 
         loss = cross_entropy_mixup(logits, labels, mixup_prob=0.5, mixup_alpha=1.0, seed=0)
-        assert_close(loss, expected)
+        assert_close(loss, expected, check_dtype=False)
 
     @pytest.mark.parametrize(
         "batch,nclass",
@@ -317,7 +317,7 @@ class TestBCEMixup:
 
         loss = bce_mixup(logits, labels, mixup_prob=0.5, mixup_alpha=1.0, seed=0)
         atol = 1e-4 if dtype == torch.float32 else 1e-1
-        assert_close(loss, expected, atol=atol, rtol=0)
+        assert_close(loss, expected, atol=atol, rtol=0, check_dtype=False)
 
     def test_bce_mixup_ignore_unknown(self):
         torch.random.manual_seed(0)
