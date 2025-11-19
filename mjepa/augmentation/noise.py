@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
-from torch.utils.cpp_extension import load
 from torchvision.utils import make_grid
 
 
@@ -20,19 +19,61 @@ SALT_PEPPER_NOISE_MIN: Final = 0.01
 SALT_PEPPER_NOISE_MAX: Final = 0.05
 DEFAULT_NOISE_PROB: Final = 0.1
 
-try:
-    import noise_cuda  # type: ignore
 
-    _noise_cuda = noise_cuda
-except ImportError:
-    if torch.cuda.is_available():
-        _noise_cuda = load(
-            name="noise_cuda",
-            sources=[str(Path(__file__).parents[2] / "csrc" / "noise.cu")],
-            extra_cuda_cflags=["-O3"],
-        )
-    else:
-        _noise_cuda = None
+@torch.compile
+def _fused_noise_kernel(
+    x: Tensor,
+    uniform_mask: Tensor,
+    mult_mask: Tensor,
+    sp_mask: Tensor,
+    uniform_noise: Tensor,
+    mult_noise: Tensor,
+    sp_prob: Tensor,
+    sp_value: Tensor,
+    sp_trigger: Tensor,
+    clip: bool,
+) -> Tensor:
+    """Apply fused noise operations.
+
+    Args:
+        x: Input tensor (B, ...)
+        uniform_mask: Per-batch mask for uniform noise (B,)
+        mult_mask: Per-batch mask for multiplicative noise (B,)
+        sp_mask: Per-batch mask for salt & pepper noise (B,)
+        uniform_noise: Per-pixel uniform noise values (B, ...)
+        mult_noise: Per-pixel multiplicative noise values (B, ...)
+        sp_prob: Per-pixel salt & pepper probabilities (B, ...)
+        sp_value: Per-pixel salt & pepper values (B, ...)
+        sp_trigger: Per-pixel salt & pepper triggers (B, ...)
+        clip: Whether to clip output to [0, 1]
+
+    Returns:
+        Output tensor with noise applied
+    """
+    # Reshape batch masks for broadcasting
+    batch_size = x.shape[0]
+    uniform_mask = uniform_mask.view(batch_size, *([1] * (x.ndim - 1)))
+    mult_mask = mult_mask.view(batch_size, *([1] * (x.ndim - 1)))
+    sp_mask = sp_mask.view(batch_size, *([1] * (x.ndim - 1)))
+
+    # Compute multiplicative factor (will be 1.0 if not applied)
+    mult_factor = torch.where(mult_mask, mult_noise, torch.ones_like(mult_noise))
+
+    # Compute additive factor (will be 0.0 if not applied)
+    add_factor = torch.where(uniform_mask, uniform_noise, torch.zeros_like(uniform_noise))
+
+    # Apply multiplicative and additive noise
+    output = x * mult_factor + add_factor
+
+    # Apply salt & pepper noise
+    sp_blend = sp_mask & (sp_trigger < sp_prob)
+    output = torch.where(sp_blend, sp_value, output)
+
+    # Clip if requested
+    if clip:
+        output = output.clamp(0.0, 1.0)
+
+    return output
 
 
 @torch.no_grad()
@@ -47,9 +88,7 @@ def apply_noise_batched(
     seed: int | None = None,
     inplace: bool = False,
 ) -> Tensor:
-    """Apply noise to a batch of images using a fused CUDA kernel.
-
-    This fused kernel is substantially faster than the unfused equivalent (~10x or more in testing).
+    """Apply noise to a batch of images using a fused kernel.
 
     Args:
         x: Input tensor
@@ -69,8 +108,6 @@ def apply_noise_batched(
     Returns:
         Input with noise applied
     """
-    if _noise_cuda is None:
-        raise ValueError("CUDA is not available")
     if not x.is_cuda:
         raise ValueError("Input tensor must be on CUDA device")
 
@@ -84,21 +121,72 @@ def apply_noise_batched(
     if seed is None:
         seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
 
-    return _noise_cuda.fused_noise(
-        x,
-        float(uniform_scale[0]),
-        float(uniform_scale[1]),
-        float(multiplicative_scale[0]),
-        float(multiplicative_scale[1]),
-        float(salt_pepper_pixel_prob[0]),
-        float(salt_pepper_pixel_prob[1]),
-        float(prob),
-        float(prob),
-        float(salt_pepper_prob),
-        bool(clip),
-        seed,
-        inplace,
+    batch_size = x.shape[0]
+    device = x.device
+    dtype = x.dtype
+
+    # Generate per-batch masks
+    batch_gen = torch.Generator(device=device).manual_seed(seed)
+    uniform_mask = torch.rand(batch_size, generator=batch_gen, device=device) < prob
+    mult_mask = torch.rand(batch_size, generator=batch_gen, device=device) < prob
+    sp_mask = torch.rand(batch_size, generator=batch_gen, device=device) < salt_pepper_prob
+
+    # Generate per-pixel random values
+    # Use a different generator to match the CUDA kernel's per-pixel RNG behavior
+    pixel_gen = torch.Generator(device=device).manual_seed(seed + 1000000)
+
+    # Uniform noise: sample range parameters per pixel, then sample noise value
+    unif_center = (uniform_scale[0] + uniform_scale[1]) / 2.0
+    unif_min_range = uniform_scale[0] + (unif_center - uniform_scale[0]) * torch.rand(
+        x.shape, generator=pixel_gen, device=device, dtype=x.dtype
     )
+    unif_max_range = unif_center + (uniform_scale[1] - unif_center) * torch.rand(
+        x.shape, generator=pixel_gen, device=device, dtype=x.dtype
+    )
+    uniform_noise = unif_min_range + (unif_max_range - unif_min_range) * torch.rand(
+        x.shape, generator=pixel_gen, device=device, dtype=x.dtype
+    )
+
+    # Multiplicative noise: sample range parameters per pixel, then sample noise value
+    mult_center = (multiplicative_scale[0] + multiplicative_scale[1]) / 2.0
+    mult_min_range = multiplicative_scale[0] + (mult_center - multiplicative_scale[0]) * torch.rand(
+        x.shape, generator=pixel_gen, device=device, dtype=x.dtype
+    )
+    mult_max_range = mult_center + (multiplicative_scale[1] - mult_center) * torch.rand(
+        x.shape, generator=pixel_gen, device=device, dtype=x.dtype
+    )
+    mult_noise = mult_min_range + (mult_max_range - mult_min_range) * torch.rand(
+        x.shape, generator=pixel_gen, device=device, dtype=x.dtype
+    )
+
+    # Salt & pepper noise: sample probability per pixel, trigger, and value
+    sp_prob = salt_pepper_pixel_prob[0] + (salt_pepper_pixel_prob[1] - salt_pepper_pixel_prob[0]) * torch.rand(
+        x.shape, generator=pixel_gen, device=device, dtype=x.dtype
+    )
+    sp_trigger = torch.rand(x.shape, generator=pixel_gen, device=device, dtype=x.dtype)
+    sp_value = (torch.rand(x.shape, generator=pixel_gen, device=device, dtype=x.dtype) < 0.5).float()
+
+    # Apply fused noise kernel
+    output = _fused_noise_kernel(
+        x.float(),
+        uniform_mask,
+        mult_mask,
+        sp_mask,
+        uniform_noise,
+        mult_noise,
+        sp_prob,
+        sp_value,
+        sp_trigger,
+        clip,
+    )
+
+    output = output.to(dtype)
+
+    if inplace:
+        x.copy_(output)
+        return x
+    else:
+        return output
 
 
 def parse_args() -> Namespace:
