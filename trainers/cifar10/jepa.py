@@ -37,6 +37,14 @@ from tqdm import tqdm
 from vit import ViT, ViTConfig
 from vit.tokens import apply_mask
 
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None  # type: ignore
+    WANDB_AVAILABLE = False
+
 from mjepa.augmentation import (
     AugmentationConfig,
     apply_invert,
@@ -172,6 +180,7 @@ def train(
     trainer_config: TrainerConfig,
     log_dir: Path | None = None,
     last_epoch: int = -1,
+    use_wandb: bool = False,
 ) -> None:
     # Module setup
     rank_zero_info(f"Starting training, logging to {log_dir if log_dir else 'console only'}")
@@ -258,20 +267,19 @@ def train(
             B = img.shape[0]
             img = img.cuda()
             label = label.cuda()
-            tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
+            Ht, Wt = cast(tuple[int, int], backbone.stem.tokenized_size(img.shape[-2:]))
             rope_seed = int(torch.randint(0, 1000000, (1,)).item())
+            rope = teacher.rope(H=Ht, W=Wt, rope_seed=rope_seed) if teacher.rope is not None else None
 
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
-                teacher_output = teacher(img, rope_seed=rope_seed)
-                rope = (
-                    teacher.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
-                    if teacher.rope is not None
-                    else None
-                )
-                teacher_output_cls = teacher.get_head("pool")(teacher_output, rope=rope)
-            teacher_output = teacher_output.clone()
+                dense_teacher_output = teacher(img, rope_seed=rope_seed)
+                if teacher.config.num_cls_tokens:
+                    teacher_output_cls = dense_teacher_output.cls_tokens
+                else:
+                    teacher_output_cls = teacher.get_head("pool")(dense_teacher_output.visual_tokens)
+            teacher_output = dense_teacher_output.visual_tokens.clone()
             teacher_output_cls = teacher_output_cls.clone()
 
             # Gram teacher forward pass (if necessary)
@@ -303,41 +311,39 @@ def train(
                 context_mask, target_mask = generate_masks(
                     backbone, img, jepa_config.context_ratio, jepa_config.target_ratio, jepa_scale
                 )
-                context = backbone(img, mask=context_mask, rope_seed=rope_seed)
+                student_output = backbone(img, mask=context_mask, rope_seed=rope_seed)
 
                 # Forward through predictor
-                pred = predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+                pred = predictor((Ht, Wt), student_output.visual_tokens, context_mask, target_mask, rope_seed=rope_seed)
 
                 # Second predictor forward with pooled token
                 # NOTE: Stop gradient on context is very important - otherwise model cheats via over-reliance on the pooled token.
                 # NOTE: Since pooled token is part of context we reuse the backbone's output norm to normalize it.
-                rope = (
-                    backbone.rope(H=tokenized_size[0], W=tokenized_size[1], rope_seed=rope_seed)
-                    if backbone.rope is not None
-                    else None
-                )
-                pred_cls = backbone.get_head("pool")(teacher_output, rope=rope)
-                context_with_cls = torch.cat([pred_cls.unsqueeze(1), context.detach()], dim=1)
-                pred_with_cls = predictor(
-                    tokenized_size, context_with_cls, context_mask, target_mask, rope_seed=rope_seed
-                )
+                pooled = backbone.get_head("pool")(teacher_output)
+                context_with_cls = torch.cat([pooled.unsqueeze(1), student_output.visual_tokens.detach()], dim=1)
+                pred_with_cls = predictor((Ht, Wt), context_with_cls, context_mask, target_mask, rope_seed=rope_seed)
 
                 # Compute JEPA loss
+                # NOTE: We add a loss for the student CLS token to match the pooled representation of the student's features
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
                 jepa_loss = F.mse_loss(pred, target) + F.mse_loss(pred_with_cls, target)
+                if teacher.config.num_cls_tokens:
+                    jepa_loss += F.mse_loss(student_output.cls_tokens.squeeze(-2), pooled.detach())
                 train_loss.update(jepa_loss)
 
                 # Compute Gram loss (if necessary)
                 if computing_gram_loss:
                     assert gram_teacher_output is not None
                     gram_target = apply_mask(context_mask, gram_teacher_output, fill_value=None)
-                    gram_loss = compute_gram_loss(context, gram_target, remove_neg=jepa_config.gram_remove_neg)
+                    gram_loss = compute_gram_loss(
+                        student_output.visual_tokens, gram_target, remove_neg=jepa_config.gram_remove_neg
+                    )
                 else:
                     gram_loss = 0.0
 
                 # Compute linear probe loss
                 probe_pred = backbone.get_head("cls")(teacher_output_cls).view(B, -1)
-                probe_pred_attn = backbone.get_head("attentive")(teacher_output, rope=rope).view(B, -1)
+                probe_pred_attn = backbone.get_head("attentive")(teacher_output).view(B, -1)
                 probe_loss = cross_entropy_mixup(
                     probe_pred, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
                 ).mean()
@@ -380,6 +386,17 @@ def train(
             )
             pbar.set_description(desc)
 
+            # Log to wandb
+            if use_wandb and is_rank_zero() and step % LOG_INTERVAL == 0 and microbatch % accumulate_grad_batches == 0:
+                log_dict = {
+                    "train/loss": train_loss.compute().item(),
+                    "train/acc": train_acc.compute().item(),
+                    "train/acc_attn": train_acc_attn.compute().item(),
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "train/epoch": epoch,
+                }
+                wandb.log(log_dict, step=step)  # type: ignore
+
         # Validation
         pbar.close()
         if val_dataloader is not None and (epoch + 1) % trainer_config.check_val_every_n_epoch == 0:
@@ -390,27 +407,35 @@ def train(
                 B = img.shape[0]
                 img = img.cuda()
                 label = label.cuda()
-                tokenized_size = backbone.stem.tokenized_size(img.shape[-2:])
+                Ht, Wt = cast(tuple[int, int], backbone.stem.tokenized_size(img.shape[-2:]))
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = backbone(img)
-                    rope = (
-                        backbone.rope(H=tokenized_size[0], W=tokenized_size[1]) if backbone.rope is not None else None
-                    )
-                    output_cls = backbone.get_head("pool")(output, rope=rope)
-                    probe_pred = backbone.get_head("cls")(output_cls).view(B, -1)
-                    probe_pred_attn = backbone.get_head("attentive")(output, rope=rope).view(B, -1)
+                    rope = backbone.rope(H=Ht, W=Wt) if backbone.rope is not None else None
+                    if backbone.config.num_cls_tokens:
+                        probe_pred = backbone.get_head("cls")(output.cls_tokens).view(B, -1)
+                    else:
+                        pooled = backbone.get_head("pool")(output.visual_tokens)
+                        probe_pred = backbone.get_head("cls")(pooled).view(B, -1)
+                    probe_pred_attn = backbone.get_head("attentive")(output.visual_tokens).view(B, -1)
                     val_acc.update(probe_pred, label)
                     val_acc_attn.update(probe_pred_attn, label)
 
             # Validation epoch end
-            rank_zero_info(
-                f"Epoch: {epoch}, Val Acc: {val_acc.compute():.4f}, Val Acc Attn: {val_acc_attn.compute():.4f}"
-            )
-            (
-                logger.log(epoch, step, microbatch, acc=val_acc.compute(), acc_attn=val_acc_attn.compute())
-                if logger
-                else None
-            )
+            val_acc_value = val_acc.compute()
+            val_acc_attn_value = val_acc_attn.compute()
+            rank_zero_info(f"Epoch: {epoch}, Val Acc: {val_acc_value:.4f}, Val Acc Attn: {val_acc_attn_value:.4f}")
+            logger.log(epoch, step, microbatch, acc=val_acc_value, acc_attn=val_acc_attn_value) if logger else None
+
+            # Log validation to wandb
+            if use_wandb and is_rank_zero():
+                wandb.log(  # type: ignore
+                    {
+                        "val/acc": val_acc_value.item(),
+                        "val/acc_attn": val_acc_attn_value.item(),
+                        "val/epoch": epoch,
+                    },
+                    step=step,
+                )
 
         gc.collect()
         torch.cuda.synchronize()
@@ -440,6 +465,10 @@ def train(
             str(log_dir / f"backbone.safetensors"),
         )
 
+    # Finish wandb run
+    if use_wandb and is_rank_zero():
+        wandb.finish()  # type: ignore
+
 
 def ddp_setup() -> None:
     dist.init_process_group(backend="nccl")
@@ -456,6 +485,7 @@ def parse_args() -> Namespace:
     parser.add_argument("-l", "--log-dir", type=Path, default=None, help="Directory to save logs")
     parser.add_argument("--local-rank", type=int, default=1, help="Local rank / device")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to checkpoint to load")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     return parser.parse_args()
 
 
@@ -524,6 +554,24 @@ def main(args: Namespace) -> None:
     else:
         log_dir = None
 
+    # Initialize wandb
+    use_wandb = args.wandb
+    if use_wandb:
+        if not WANDB_AVAILABLE:
+            raise ImportError("wandb is not available. Install it with: pip install wandb")
+        if is_rank_zero():
+            wandb.init(  # type: ignore
+                project="mjepa-cifar10",
+                name=args.name,
+                config={
+                    "backbone": backbone_config.__dict__,
+                    "jepa": jepa_config.__dict__,
+                    "augmentations": augmentation_config.__dict__,
+                    "optimizer": optimizer_config.__dict__,
+                    "trainer": trainer_config.__dict__,
+                },
+            )
+
     ignore_warnings()
     train(
         cast(Any, wrapper),
@@ -535,6 +583,7 @@ def main(args: Namespace) -> None:
         augmentation_config,
         trainer_config,
         log_dir,
+        use_wandb=use_wandb,
     )
 
 

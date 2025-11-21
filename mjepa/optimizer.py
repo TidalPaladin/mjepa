@@ -17,7 +17,6 @@ class OptimizerConfig:
     fused: bool | None = True
     foreach: bool | None = None
     eps: float = 1e-8
-    precondition_frequency: int = 10
 
     # Scheduler
     scheduled: bool = False
@@ -31,7 +30,16 @@ class OptimizerConfig:
     parameter_groups: List[Dict[str, Any]] = field(default_factory=list)
 
     def instantiate(self, model: nn.Module, total_steps: int) -> Tuple[Optimizer, LRScheduler]:
-        optimizer = self._instantiate_adamw(model)
+        parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
+        optimizer = AdamW(
+            parameter_groups,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            betas=self.betas,
+            fused=self.fused,
+            foreach=self.foreach,
+            eps=self.eps,
+        )
         if self.scheduled:
             scheduler = OneCycleLR(
                 optimizer,
@@ -51,18 +59,6 @@ class OptimizerConfig:
                 total_iters=int(total_steps * self.pct_start),
             )
         return optimizer, scheduler
-
-    def _instantiate_adamw(self, model: nn.Module) -> Optimizer:
-        parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
-        return AdamW(
-            parameter_groups,
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-            betas=self.betas,
-            fused=self.fused,
-            foreach=self.foreach,
-            eps=self.eps,
-        )
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "OptimizerConfig":

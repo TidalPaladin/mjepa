@@ -2,6 +2,7 @@ import math
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Tuple, TypeVar
+import torch.distributed as dist
 
 import torch
 import torch.nn as nn
@@ -261,7 +262,7 @@ def forward_gram_teacher(
     assert not gram_teacher.training, "Gram teacher must be in evaluation mode"
 
     # Forward pass and resize output features to original size
-    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed)
+    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed).visual_tokens
     B, _, D = gram_teacher_output.shape
     gram_teacher_output = gram_teacher_output.movedim(1, -1).reshape(B, D, *output_tokenized_size)
     gram_teacher_output = F.interpolate(
@@ -271,6 +272,48 @@ def forward_gram_teacher(
 
     assert gram_teacher_output.shape == (B, math.prod(target_tokenized_size), D)
     return gram_teacher_output
+
+
+@torch.compile
+def compute_sigreg_loss(x: Tensor, global_step: int, num_slices: int = 256) -> Tensor:
+    r"""Compute the LeJEPA SigREG loss.
+
+    This loss encourages features to follow an isotropic Gaussian distribution.
+
+    Args:
+        x: Input tensor.
+        global_step: Global step.
+        num_slices: Number of slices to use for the projection.
+
+    Returns:
+        The SigREG loss.
+    """
+    B, L, D = x.shape
+
+    proj_shape = (1, D, num_slices)
+    with torch.random.fork_rng(devices=[x.device]):
+        torch.random.manual_seed(global_step)
+        A = torch.randn(proj_shape, device=x.device)
+    A = F.normalize(A, dim=-2)
+
+    t = torch.linspace(-5, 5, 17, device=x.device)
+    exp_f = torch.exp(-0.5 * t**2)
+
+    x_t = torch.bmm(x.type_as(A), A.expand(B, -1, -1)).unsqueeze(-1) * t
+    ecf = (1j * x_t).exp().mean(-3)
+
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        ecf = dist.all_reduce(ecf, op=dist.ReduceOp.AVG)
+        assert isinstance(ecf, Tensor)
+    else:
+        world_size = 1
+
+    err = (ecf - exp_f).abs().square().mul(exp_f)
+    N = L * world_size
+    T = torch.trapz(err, t, dim=-1) * N
+    assert T.shape == (B, num_slices)
+    return T.mean()
 
 
 @dataclass
