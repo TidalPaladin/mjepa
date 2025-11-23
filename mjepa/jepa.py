@@ -56,7 +56,7 @@ class CrossAttentionPredictor(nn.Module):
         self,
         tokenized_size: Tuple[int, int],
         context: Tensor,
-        context_mask: Tensor,
+        context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
     ) -> Tensor:
@@ -80,14 +80,14 @@ class CrossAttentionPredictor(nn.Module):
             self,
             tokenized_size: Tuple[int, int],
             context: Tensor,
-            context_mask: Tensor,
+            context_mask: Tensor | None,
             target_mask: Tensor,
             rope_seed: int | None = None,
         ) -> Tensor:
             return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed)
 
     def prepare_rope(
-        self, tokenized_size: Tuple[int, int], context_mask: Tensor, target_mask: Tensor, rope_seed: int | None = None
+        self, tokenized_size: Tuple[int, int], context_mask: Tensor | None, target_mask: Tensor, rope_seed: int | None = None
     ) -> Tuple[Tensor | None, Tensor | None]:
         if self.rope is None:
             return None, None
@@ -95,15 +95,18 @@ class CrossAttentionPredictor(nn.Module):
         H, W = tokenized_size
         rope = self.rope(H=H, W=W, rope_seed=rope_seed)
         sin, cos = rope
-        B = context_mask.shape[0]
+        B = target_mask.shape[0]
 
         sin_q = apply_mask(target_mask, sin[None].expand(B, -1, -1))
         cos_q = apply_mask(target_mask, cos[None].expand(B, -1, -1))
         rope_q = torch.stack([sin_q[:, None, ...], cos_q[:, None, ...]], dim=0)
 
-        sin_k = apply_mask(context_mask, sin[None].expand(B, -1, -1))
-        cos_k = apply_mask(context_mask, cos[None].expand(B, -1, -1))
-        rope_k = torch.stack([sin_k[:, None, ...], cos_k[:, None, ...]], dim=0)
+        if context_mask is not None:
+            sin_k = apply_mask(context_mask, sin[None].expand(B, -1, -1))
+            cos_k = apply_mask(context_mask, cos[None].expand(B, -1, -1))
+            rope_k = torch.stack([sin_k[:, None, ...], cos_k[:, None, ...]], dim=0)
+        else:
+            rope_k = None
         return rope_q, rope_k
 
 

@@ -1,4 +1,5 @@
 import pytest
+import torch.distributed as dist
 import torch
 import torch.nn as nn
 import yaml
@@ -10,6 +11,7 @@ from mjepa.jepa import (
     get_momentum,
     register_constructors,
     update_teacher,
+    compute_sigreg_loss,
 )
 
 
@@ -239,3 +241,59 @@ class TestYAMLConfig:
         assert config.scale == 12
         assert config.momentum == 0.97
         assert config.predictor_depth == 5
+
+
+class TestComputeSigREGLoss:
+
+    @pytest.mark.parametrize("x_shape", [
+        (1, 32, 128), 
+        (2, 16, 128),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_compute_sigreg_loss(self, x_shape, dtype):
+        """Test the compute_sigreg_loss function."""
+        x = torch.randn(*x_shape, dtype=dtype)
+        global_step = 0
+        num_slices = 256
+        loss = compute_sigreg_loss(x, global_step, num_slices)
+        assert loss.shape == ()
+        assert loss.item() > 0
+        assert not torch.isnan(loss)
+
+    @pytest.mark.parametrize("x_shape", [
+        (1, 32, 128), 
+        (2, 16, 128),
+    ])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_compute_sigreg_loss_deterministic(self, x_shape, dtype):
+        """Test the compute_sigreg_loss function."""
+        x = torch.randn(*x_shape, dtype=dtype)
+        global_step = 0
+        num_slices = 256
+        loss1 = compute_sigreg_loss(x, global_step, num_slices)
+        loss2 = compute_sigreg_loss(x, global_step, num_slices)
+        loss3 = compute_sigreg_loss(x, global_step + 1, num_slices)
+        assert loss1 == loss2
+        assert loss1 != loss3
+
+    def test_compute_sigreg_loss_isotropic_gaussian(self):
+        """Test that SigREG loss is lower for isotropic Gaussian embeddings."""
+        B, L, D = 2, 32, 128
+        global_step = 0
+        num_slices = 256
+        
+        # Create isotropic Gaussian embeddings (should have lower loss)
+        isotropic_x = torch.randn(B, L, D)
+        
+        # Create non-isotropic embeddings (concentrated in one direction)
+        non_isotropic_x = torch.zeros(B, L, D)
+        non_isotropic_x[:, :, 0] = torch.randn(B, L) * 10  # High variance in first dimension
+        non_isotropic_x[:, :, 1:] = torch.randn(B, L, D-1) * 0.1  # Low variance in other dimensions
+        
+        isotropic_loss = compute_sigreg_loss(isotropic_x, global_step, num_slices)
+        non_isotropic_loss = compute_sigreg_loss(non_isotropic_x, global_step, num_slices)
+        
+        # Isotropic Gaussian should have lower SigREG loss
+        assert isotropic_loss < non_isotropic_loss
+        assert not torch.isnan(isotropic_loss)
+        assert not torch.isnan(non_isotropic_loss)

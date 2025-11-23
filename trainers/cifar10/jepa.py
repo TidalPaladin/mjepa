@@ -64,6 +64,7 @@ from mjepa.jepa import (
     is_gram_update_epoch,
     setup_teacher,
     update_teacher,
+    compute_sigreg_loss,
 )
 from mjepa.logging import CSVLogger
 from mjepa.optimizer import OptimizerConfig
@@ -269,16 +270,12 @@ def train(
             label = label.cuda()
             Ht, Wt = cast(tuple[int, int], backbone.stem.tokenized_size(img.shape[-2:]))
             rope_seed = int(torch.randint(0, 1000000, (1,)).item())
-            rope = teacher.rope(H=Ht, W=Wt, rope_seed=rope_seed) if teacher.rope is not None else None
 
             # Teacher forward pass (unaugmented)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.inference_mode():
                 assert not teacher.training
                 dense_teacher_output = teacher(img, rope_seed=rope_seed)
-                if teacher.config.num_cls_tokens:
-                    teacher_output_cls = dense_teacher_output.cls_tokens
-                else:
-                    teacher_output_cls = teacher.get_head("pool")(dense_teacher_output.visual_tokens)
+                teacher_output_cls = dense_teacher_output.cls_tokens
             teacher_output = dense_teacher_output.visual_tokens.clone()
             teacher_output_cls = teacher_output_cls.clone()
 
@@ -319,16 +316,12 @@ def train(
                 # Second predictor forward with pooled token
                 # NOTE: Stop gradient on context is very important - otherwise model cheats via over-reliance on the pooled token.
                 # NOTE: Since pooled token is part of context we reuse the backbone's output norm to normalize it.
-                pooled = backbone.get_head("pool")(teacher_output)
-                context_with_cls = torch.cat([pooled.unsqueeze(1), student_output.visual_tokens.detach()], dim=1)
-                pred_with_cls = predictor((Ht, Wt), context_with_cls, context_mask, target_mask, rope_seed=rope_seed)
+                pred_with_cls = predictor((Ht, Wt), student_output.cls_tokens, None, target_mask, rope_seed=rope_seed)
 
                 # Compute JEPA loss
                 # NOTE: We add a loss for the student CLS token to match the pooled representation of the student's features
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
                 jepa_loss = F.mse_loss(pred, target) + F.mse_loss(pred_with_cls, target)
-                if teacher.config.num_cls_tokens:
-                    jepa_loss += F.mse_loss(student_output.cls_tokens.squeeze(-2), pooled.detach())
                 train_loss.update(jepa_loss)
 
                 # Compute Gram loss (if necessary)
@@ -342,7 +335,7 @@ def train(
                     gram_loss = 0.0
 
                 # Compute linear probe loss
-                probe_pred = backbone.get_head("cls")(teacher_output_cls).view(B, -1)
+                probe_pred = backbone.get_head("cls")(teacher_output_cls.mean(1)).view(B, -1)
                 probe_pred_attn = backbone.get_head("attentive")(teacher_output).view(B, -1)
                 probe_loss = cross_entropy_mixup(
                     probe_pred, label, mixup_seed or 0, augmentation_config.mixup_prob, augmentation_config.mixup_alpha
@@ -410,12 +403,7 @@ def train(
                 Ht, Wt = cast(tuple[int, int], backbone.stem.tokenized_size(img.shape[-2:]))
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = backbone(img)
-                    rope = backbone.rope(H=Ht, W=Wt) if backbone.rope is not None else None
-                    if backbone.config.num_cls_tokens:
-                        probe_pred = backbone.get_head("cls")(output.cls_tokens).view(B, -1)
-                    else:
-                        pooled = backbone.get_head("pool")(output.visual_tokens)
-                        probe_pred = backbone.get_head("cls")(pooled).view(B, -1)
+                    probe_pred = backbone.get_head("cls")(output.cls_tokens.mean(1)).view(B, -1)
                     probe_pred_attn = backbone.get_head("attentive")(output.visual_tokens).view(B, -1)
                     val_acc.update(probe_pred, label)
                     val_acc_attn.update(probe_pred_attn, label)
