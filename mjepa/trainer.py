@@ -313,7 +313,7 @@ def setup_logdir(log_dir: os.PathLike | None, config_path: os.PathLike | None, n
     if name:
         subdir = f"{subdir}_{name}"
     log_dir = log_dir / subdir
-    log_dir.mkdir()
+    log_dir.mkdir(exist_ok=True)
 
     # Add file handler when log directory is provided
     file_handler = logging.FileHandler(log_dir / "run.log")
