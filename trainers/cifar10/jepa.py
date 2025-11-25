@@ -214,6 +214,10 @@ def train(
 
     # Metric setup
     train_loss = tm.RunningMean(window=WINDOW).cuda()
+    train_loss_jepa = tm.RunningMean(window=WINDOW).cuda()
+    train_loss_jepa_cls = tm.RunningMean(window=WINDOW).cuda()
+    train_loss_sigreg = tm.RunningMean(window=WINDOW).cuda()
+    train_loss_gram = tm.RunningMean(window=WINDOW).cuda()
     train_acc = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
     train_acc_attn = Running(tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES), window=WINDOW).cuda()
     val_acc = tm.Accuracy(task="multiclass", num_classes=NUM_CLASSES).cuda()
@@ -321,18 +325,38 @@ def train(
                 # Compute JEPA loss
                 # NOTE: We add a loss for the student CLS token to match the pooled representation of the student's features
                 target = apply_mask(target_mask, teacher_output, fill_value=None)
-                jepa_loss = F.mse_loss(pred, target) + F.mse_loss(pred_with_cls, target)
-                train_loss.update(jepa_loss)
+                jepa_loss = F.mse_loss(pred, target) 
+                jepa_loss_cls = F.mse_loss(pred_with_cls, target)
+                train_loss_jepa.update(jepa_loss)
+                train_loss_jepa_cls.update(jepa_loss_cls)
+
+                # Compute SigREG loss
+                if jepa_config.sigreg_loss_weight > 0:
+                    sigreg_loss = compute_sigreg_loss(student_output.cls_tokens.transpose(0, 1), step, num_slices=256)
+                    if jepa_config.sigreg_visual_token_sample_size > 0:
+                        B, L = student_output.visual_tokens.shape[:2]
+                        idx = torch.stack([torch.randperm(L, device=student_output.visual_tokens.device)[:jepa_config.sigreg_visual_token_sample_size] for _ in range(B)])
+                        sigreg_visual_tokens = student_output.visual_tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, student_output.visual_tokens.shape[-1]))
+                        sigreg_loss = sigreg_loss / 2 + compute_sigreg_loss(
+                            sigreg_visual_tokens.flatten(0, 1).unsqueeze(0), 
+                            step, 
+                            num_slices=jepa_config.sigreg_visual_token_sample_size,
+                        ) / 2
+                else:
+                    sigreg_loss = 0.0
+                train_loss_sigreg.update(sigreg_loss)
 
                 # Compute Gram loss (if necessary)
                 if computing_gram_loss:
                     assert gram_teacher_output is not None
+                    assert jepa_config.gram_loss_weight > 0
                     gram_target = apply_mask(context_mask, gram_teacher_output, fill_value=None)
                     gram_loss = compute_gram_loss(
                         student_output.visual_tokens, gram_target, remove_neg=jepa_config.gram_remove_neg
                     )
                 else:
                     gram_loss = 0.0
+                train_loss_gram.update(gram_loss)
 
                 # Compute linear probe loss
                 probe_pred = backbone.get_head("cls")(teacher_output_cls.mean(1)).view(B, -1)
@@ -349,7 +373,8 @@ def train(
                 ).mean()
 
                 # Combine losses
-                loss = jepa_loss + probe_loss + gram_loss
+                loss = jepa_loss + jepa_loss_cls + probe_loss + gram_loss * jepa_config.gram_loss_weight + sigreg_loss * jepa_config.sigreg_loss_weight
+                train_loss.update(loss)
 
             with torch.no_grad():
                 mask = is_mixed(
@@ -383,6 +408,10 @@ def train(
             if use_wandb and is_rank_zero() and step % LOG_INTERVAL == 0 and microbatch % accumulate_grad_batches == 0:
                 log_dict = {
                     "train/loss": train_loss.compute().item(),
+                    "train/loss_jepa": train_loss_jepa.compute().item(),
+                    "train/loss_jepa_cls": train_loss_jepa_cls.compute().item(),
+                    "train/loss_sigreg": train_loss_sigreg.compute().item(),
+                    "train/loss_gram": train_loss_gram.compute().item(),
                     "train/acc": train_acc.compute().item(),
                     "train/acc_attn": train_acc_attn.compute().item(),
                     "train/lr": scheduler.get_last_lr()[0],

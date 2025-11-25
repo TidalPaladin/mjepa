@@ -340,6 +340,9 @@ class JEPAConfig:
         gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
         gram_resolution_scale: The scale at which to feed inputs through the Gram teacher.
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
+        gram_loss_weight: The coefficient of the Gram loss.
+        sigreg_loss_weight: The coefficient of the SigREG loss.
+        sigreg_visual_token_sample_size: The number of visual tokens to sample for the SigREG loss.
     """
 
     context_ratio: float = 0.5
@@ -353,6 +356,9 @@ class JEPAConfig:
     gram_update_interval_epoch: int = 10
     gram_resolution_scale: float = 2.0
     gram_remove_neg: bool = False
+    gram_loss_weight: float = 1.0
+    sigreg_loss_weight: float = 1e-4
+    sigreg_visual_token_sample_size: int = 0
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
@@ -369,6 +375,12 @@ class JEPAConfig:
             raise ValueError("gram_start_epoch must be greater than or equal to gram_teacher_epoch")
         if self.gram_resolution_scale <= 0:
             raise ValueError("gram_resolution_scale must be a positive float")
+        if self.gram_loss_weight <= 0:
+            raise ValueError("gram_loss_weight must be a positive float")
+        if self.sigreg_loss_weight < 0:
+            raise ValueError("sigreg_loss_weight must be a non-negative float")
+        if self.sigreg_visual_token_sample_size < 0:
+            raise ValueError("sigreg_visual_token_sample_size must be a non-negative integer")
 
 
 def config_constructor(loader, node):
