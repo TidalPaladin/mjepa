@@ -307,7 +307,7 @@ def compute_sigreg_loss(x: Tensor, global_step: int, num_slices: int = 256) -> T
 
     if dist.is_initialized():
         world_size = dist.get_world_size()
-        ecf = dist.all_reduce(ecf, op=dist.ReduceOp.AVG)
+        dist.all_reduce(ecf, op=dist.ReduceOp.AVG)
         assert isinstance(ecf, Tensor)
     else:
         world_size = 1
