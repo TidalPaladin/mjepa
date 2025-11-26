@@ -2,6 +2,7 @@ import math
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Tuple, TypeVar
+import torch.distributed as dist
 
 import torch
 import torch.nn as nn
@@ -55,7 +56,7 @@ class CrossAttentionPredictor(nn.Module):
         self,
         tokenized_size: Tuple[int, int],
         context: Tensor,
-        context_mask: Tensor,
+        context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
     ) -> Tensor:
@@ -79,14 +80,14 @@ class CrossAttentionPredictor(nn.Module):
             self,
             tokenized_size: Tuple[int, int],
             context: Tensor,
-            context_mask: Tensor,
+            context_mask: Tensor | None,
             target_mask: Tensor,
             rope_seed: int | None = None,
         ) -> Tensor:
             return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed)
 
     def prepare_rope(
-        self, tokenized_size: Tuple[int, int], context_mask: Tensor, target_mask: Tensor, rope_seed: int | None = None
+        self, tokenized_size: Tuple[int, int], context_mask: Tensor | None, target_mask: Tensor, rope_seed: int | None = None
     ) -> Tuple[Tensor | None, Tensor | None]:
         if self.rope is None:
             return None, None
@@ -94,15 +95,18 @@ class CrossAttentionPredictor(nn.Module):
         H, W = tokenized_size
         rope = self.rope(H=H, W=W, rope_seed=rope_seed)
         sin, cos = rope
-        B = context_mask.shape[0]
+        B = target_mask.shape[0]
 
         sin_q = apply_mask(target_mask, sin[None].expand(B, -1, -1))
         cos_q = apply_mask(target_mask, cos[None].expand(B, -1, -1))
         rope_q = torch.stack([sin_q[:, None, ...], cos_q[:, None, ...]], dim=0)
 
-        sin_k = apply_mask(context_mask, sin[None].expand(B, -1, -1))
-        cos_k = apply_mask(context_mask, cos[None].expand(B, -1, -1))
-        rope_k = torch.stack([sin_k[:, None, ...], cos_k[:, None, ...]], dim=0)
+        if context_mask is not None:
+            sin_k = apply_mask(context_mask, sin[None].expand(B, -1, -1))
+            cos_k = apply_mask(context_mask, cos[None].expand(B, -1, -1))
+            rope_k = torch.stack([sin_k[:, None, ...], cos_k[:, None, ...]], dim=0)
+        else:
+            rope_k = None
         return rope_q, rope_k
 
 
@@ -261,7 +265,7 @@ def forward_gram_teacher(
     assert not gram_teacher.training, "Gram teacher must be in evaluation mode"
 
     # Forward pass and resize output features to original size
-    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed)
+    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed).visual_tokens
     B, _, D = gram_teacher_output.shape
     gram_teacher_output = gram_teacher_output.movedim(1, -1).reshape(B, D, *output_tokenized_size)
     gram_teacher_output = F.interpolate(
@@ -271,6 +275,48 @@ def forward_gram_teacher(
 
     assert gram_teacher_output.shape == (B, math.prod(target_tokenized_size), D)
     return gram_teacher_output
+
+
+@torch.compile
+def compute_sigreg_loss(x: Tensor, global_step: int, num_slices: int = 256) -> Tensor:
+    r"""Compute the LeJEPA SigREG loss.
+
+    This loss encourages features to follow an isotropic Gaussian distribution.
+
+    Args:
+        x: Input tensor.
+        global_step: Global step.
+        num_slices: Number of slices to use for the projection.
+
+    Returns:
+        The SigREG loss.
+    """
+    B, L, D = x.shape
+
+    proj_shape = (1, D, num_slices)
+    with torch.random.fork_rng(devices=[x.device]):
+        torch.random.manual_seed(global_step)
+        A = torch.randn(proj_shape, device=x.device)
+    A = F.normalize(A, dim=-2)
+
+    t = torch.linspace(-5, 5, 17, device=x.device)
+    exp_f = torch.exp(-0.5 * t**2)
+
+    x_t = torch.bmm(x.type_as(A), A.expand(B, -1, -1)).unsqueeze(-1) * t
+    ecf = (1j * x_t).exp().mean(-3)
+
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        dist.all_reduce(ecf, op=dist.ReduceOp.AVG)
+        assert isinstance(ecf, Tensor)
+    else:
+        world_size = 1
+
+    err = (ecf - exp_f).abs().square().mul(exp_f)
+    N = L * world_size
+    T = torch.trapz(err, t, dim=-1) * N
+    assert T.shape == (B, num_slices)
+    return T.mean()
 
 
 @dataclass
@@ -294,6 +340,8 @@ class JEPAConfig:
         gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
         gram_resolution_scale: The scale at which to feed inputs through the Gram teacher.
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
+        gram_loss_weight: The coefficient of the Gram loss.
+        sigreg_loss_weight: The coefficient of the SigREG loss.
     """
 
     context_ratio: float = 0.5
@@ -307,6 +355,8 @@ class JEPAConfig:
     gram_update_interval_epoch: int = 10
     gram_resolution_scale: float = 2.0
     gram_remove_neg: bool = False
+    gram_loss_weight: float = 1.0
+    sigreg_loss_weight: float = 1e-4
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
@@ -323,6 +373,10 @@ class JEPAConfig:
             raise ValueError("gram_start_epoch must be greater than or equal to gram_teacher_epoch")
         if self.gram_resolution_scale <= 0:
             raise ValueError("gram_resolution_scale must be a positive float")
+        if self.gram_loss_weight <= 0:
+            raise ValueError("gram_loss_weight must be a positive float")
+        if self.sigreg_loss_weight < 0:
+            raise ValueError("sigreg_loss_weight must be a non-negative float")
 
 
 def config_constructor(loader, node):
