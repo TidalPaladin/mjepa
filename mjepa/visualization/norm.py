@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self, Sequence, Type, cast
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # type: ignore[import]
 import safetensors.torch as st
 import torch
 import torch.nn as nn
@@ -62,7 +62,7 @@ class NormVisualizer:
         self.model = self.model.to(self.device)
         self.model.requires_grad_(False)
         self.model.eval()
-        self.model.output_norm = nn.Identity()
+        self.model.output_norm = nn.Identity()  # type: ignore[assignment]
         torch.set_float32_matmul_precision("high")
 
     @torch.inference_mode()
@@ -71,7 +71,8 @@ class NormVisualizer:
         assert not self.model.training, "Model must be in evaluation mode"
         assert img.device == self.device, "Image must be on the same device as the model"
         with torch.autocast(self.device.type, dtype=self.dtype):
-            features = cast(Tensor, self.model(img, return_register_tokens=True))
+            # Model returns features without register tokens by default
+            features = cast(Tensor, self.model(img))
         features = features.to(torch.float32)
         return features
 
@@ -95,12 +96,19 @@ class NormVisualizer:
         parser = ArgumentParser(prog="pca-visualize", description="Visualize PCA ViT output features")
         parser.add_argument("config", type=existing_file_type, help="Path to model YAML configuration file")
         parser.add_argument("checkpoint", type=existing_file_type, help="Path to safetensors checkpoint")
-        parser.add_argument(
-            "input",
-            nargs="+",
-            action=ExpandImagePathsAction if not custom_loader else None,
-            help="Path to input image(s) or directory containing .tiff files",
-        )
+        if not custom_loader:
+            parser.add_argument(
+                "input",
+                nargs="+",
+                action=ExpandImagePathsAction,
+                help="Path to input image(s) or directory containing .tiff files",
+            )
+        else:
+            parser.add_argument(
+                "input",
+                nargs="+",
+                help="Path to input image(s) or directory containing .tiff files",
+            )
         parser.add_argument("output", type=output_path_type, help="Path to output PNG file")
         parser.add_argument(
             "-s",

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self, Sequence, Type
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # type: ignore[import]
 import safetensors.torch as st
 import torch
 import yaml
@@ -77,6 +77,8 @@ class PositionVisualizer:
 
     @torch.inference_mode()
     def _get_positions(self) -> Tensor:
+        if self.model.stem.pos_enc is None:
+            raise ValueError("Model does not have positional encoding")
         size = self.model.stem.pos_enc.spatial_size
         with torch.autocast(self.device.type, dtype=self.dtype):
             positions = self.model.stem.pos_enc(size)

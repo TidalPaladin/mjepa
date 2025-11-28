@@ -2,9 +2,9 @@ import math
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, Sequence, Tuple, Type
+from typing import Self, Sequence, Tuple, Type, cast
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # type: ignore[import]
 import safetensors.torch as st
 import torch
 import torch.nn.functional as F
@@ -24,8 +24,9 @@ register_constructors()
 
 
 def _apply_colormap(x: Tensor) -> Tensor:
-    x = torch.from_numpy(plt.cm.inferno(x.squeeze().cpu())[..., :3]).float()
-    return x
+    x_np = x.squeeze().cpu().numpy()
+    result = torch.from_numpy(plt.cm.inferno(x_np)[..., :3]).float()
+    return result
 
 
 def _process_weights(
@@ -36,7 +37,7 @@ def _process_weights(
     batch_idx: int,
     head_idx: int,
     caption: str | None = None,
-) -> Tensor:
+) -> None:
     weights = F.interpolate(weights.view(1, 1, *grid_size), size=original_img_shape, mode="nearest").view(
         1, *original_img_shape
     )
@@ -197,10 +198,10 @@ def visualize_attention_weights(
 
     # Choose layout based on number of heads
     if H == 1:
-        _visualize_single_head_layout(axes, image, weights, original_img_shape, grid, B, nrows, ncols)
+        _visualize_single_head_layout(axes, image, weights, (original_img_shape[0], original_img_shape[1]), (grid[0], grid[1]), B, nrows, ncols)
         top_adjust = 0.88
     else:
-        _visualize_multi_head_layout(axes, image, weights, original_img_shape, grid, B, H)
+        _visualize_multi_head_layout(axes, image, weights, (original_img_shape[0], original_img_shape[1]), (grid[0], grid[1]), B, H)
         top_adjust = 0.92
 
     # Finalize figure
@@ -232,11 +233,17 @@ class AttentionVisualizer:
 
     @property
     def head(self) -> Head | MLPHead:
-        return self.model.heads[self.head_key]
+        head = self.model.heads[self.head_key]
+        if not isinstance(head, (Head, MLPHead)):
+            raise ValueError(f"Head {self.head_key} is not a valid head type")
+        return head
 
     @property
     def pooling(self) -> AttentivePool:
-        return self.head.pool
+        pool = self.head.pool
+        if not isinstance(pool, AttentivePool):
+            raise ValueError(f"Head {self.head_key} does not have an attention pool")
+        return pool
 
     @property
     def num_attention_heads(self) -> int:
@@ -250,7 +257,7 @@ class AttentionVisualizer:
         B = img.shape[0]
         H = self.num_attention_heads
         with torch.autocast(self.device.type, dtype=self.dtype):
-            features = self.model(img)
+            features = cast(Tensor, self.model(img))
             rope = self.model.rope(H=tokenized_size[0], W=tokenized_size[1]) if self.model.rope is not None else None
             weights = self.pooling.forward_weights(features, rope=rope).view(B, H, *tokenized_size).movedim(1, -1)
             pred = self.head(features)
@@ -276,12 +283,19 @@ class AttentionVisualizer:
         parser = ArgumentParser(prog="attention-visualize", description="Visualize attention weights of a ViT model")
         parser.add_argument("config", type=existing_file_type, help="Path to model YAML configuration file")
         parser.add_argument("checkpoint", type=existing_file_type, help="Path to safetensors checkpoint")
-        parser.add_argument(
-            "input",
-            nargs="+",
-            action=ExpandImagePathsAction if not custom_loader else None,
-            help="Path to input image(s) or directory containing .tiff files",
-        )
+        if not custom_loader:
+            parser.add_argument(
+                "input",
+                nargs="+",
+                action=ExpandImagePathsAction,
+                help="Path to input image(s) or directory containing .tiff files",
+            )
+        else:
+            parser.add_argument(
+                "input",
+                nargs="+",
+                help="Path to input image(s) or directory containing .tiff files",
+            )
         parser.add_argument("output", type=output_path_type, help="Path to output file")
         parser.add_argument(
             "-s",
