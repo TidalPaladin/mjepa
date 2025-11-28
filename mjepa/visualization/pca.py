@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Self, Sequence, Type, cast
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # type: ignore[import]
 import safetensors.torch as st
 import torch
 import torch.nn as nn
@@ -160,7 +160,7 @@ class PCAVisualizer:
         self.model.requires_grad_(False)
         self.model.eval()
         if self.no_output_norm:
-            self.model.output_norm = nn.Identity()
+            self.model.output_norm = nn.Identity()  # type: ignore[assignment]
         torch.set_float32_matmul_precision("high")
 
     @torch.inference_mode()
@@ -171,7 +171,8 @@ class PCAVisualizer:
         with torch.autocast(self.device.type, dtype=self.dtype):
             features = cast(Tensor, self.model(img))
         features = features.to(torch.float32)
-        Ht, Wt = self.model.stem.tokenized_size((H, W))
+        tokenized_size = self.model.stem.tokenized_size((H, W))
+        Ht, Wt = tokenized_size[0], tokenized_size[1]
         features = rearrange(features, "n (ht wt) d -> n ht wt d", ht=Ht, wt=Wt)
         return features
 
@@ -222,12 +223,13 @@ class PCAVisualizer:
                 features = self._forward_features(_img[None])
                 feature_list.append(features)
 
+            assert self.size is not None, "size must be set for animation"
             pca = self._compute_pca(torch.cat(feature_list, dim=0), self.size).chunk(img.shape[0], dim=0)
             grids: List[Tensor] = [self._create_grid(i[None], p) for i, p in zip(img, pca)]
             return torch.stack(grids, dim=0)
         else:
             features = self._forward_features(img)
-            pca = self._compute_pca(features, img.shape[-2:])
+            pca = self._compute_pca(features, tuple(img.shape[-2:]))
             grid = self._create_grid(img, pca)
             return grid
 
@@ -250,12 +252,19 @@ class PCAVisualizer:
         parser = ArgumentParser(prog="pca-visualize", description="Visualize PCA ViT output features")
         parser.add_argument("config", type=existing_file_type, help="Path to model YAML configuration file")
         parser.add_argument("checkpoint", type=existing_file_type, help="Path to safetensors checkpoint")
-        parser.add_argument(
-            "input",
-            nargs="+",
-            action=ExpandImagePathsAction if not custom_loader else None,
-            help="Path to input image(s) or directory containing .tiff files",
-        )
+        if not custom_loader:
+            parser.add_argument(
+                "input",
+                nargs="+",
+                action=ExpandImagePathsAction,
+                help="Path to input image(s) or directory containing .tiff files",
+            )
+        else:
+            parser.add_argument(
+                "input",
+                nargs="+",
+                help="Path to input image(s) or directory containing .tiff files",
+            )
         parser.add_argument("output", type=output_path_type, help="Path to output PNG file")
         parser.add_argument(
             "-s",

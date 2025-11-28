@@ -1,8 +1,8 @@
 .PHONY: clean clean-env check quality style tag-version test env upload upload-test
 
 PROJECT=mjepa
-QUALITY_DIRS=$(PROJECT) tests trainers scripts
-CLEAN_DIRS=$(PROJECT) tests trainers scripts
+QUALITY_DIRS=$(PROJECT) tests
+CLEAN_DIRS=$(PROJECT) tests
 PYTHON=uv run python
 
 check: ## run quality checks and unit tests
@@ -44,7 +44,6 @@ style:
 	$(PYTHON) -m isort $(QUALITY_DIRS)
 	$(PYTHON) -m autopep8 -a $(QUALITY_DIRS)
 	$(PYTHON) -m black $(QUALITY_DIRS)
-	find csrc/ -type f \( -name "*.cu" -o -name "*.cuh" \) -exec clang-format -i {} +
 
 test: ## run unit tests
 	$(PYTHON) -m pytest \

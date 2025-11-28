@@ -365,6 +365,26 @@ def assert_all_trainable_params_have_grad(model: nn.Module, step: int | None = N
             raise AssertionError(f"Parameter {name} should have a gradient, but does not")
 
 
+@torch.inference_mode()
+def assert_all_ranks_synced(model: nn.Module, atol: float = 1e-4, rtol: float = 0) -> None:
+    r"""Assert that all parameters are synced across all ranks.
+
+    Args:
+        model: The model to check.
+        atol: Absolute tolerance.
+        rtol: Relative tolerance.
+    """
+    if not dist.is_initialized():
+        return
+
+    local_rank = dist.get_rank()
+    for name, param in model.named_parameters():
+        param_all_ranks = param.data.clone()
+        dist.all_reduce(param_all_ranks, op=dist.ReduceOp.AVG)
+        if not torch.allclose(param.data, param_all_ranks, atol=atol, rtol=rtol):
+            raise AssertionError(f"Parameter {name} on rank {local_rank} is not synced with other ranks")
+
+
 def size_change(
     size_config: "ResolutionConfig",
     batch_size: int,

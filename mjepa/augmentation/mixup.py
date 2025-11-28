@@ -263,7 +263,7 @@ class CrossEntropyMixup(Function):
         return loss
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None, None, None]:
+    def backward(ctx, grad_output: Tensor, *grad_outputs) -> Tuple[Tensor, None, None, None, None]:  # type: ignore[override]
         logits, labels, weights, apply_mixup = ctx.saved_tensors
 
         # Compute gradient
@@ -301,7 +301,9 @@ def cross_entropy_mixup(
         - labels: :math:`(N,)`
         - Output: :math:`(N,)`
     """
-    return CrossEntropyMixup.apply(logits, labels, mixup_prob, mixup_alpha, seed)
+    result = CrossEntropyMixup.apply(logits, labels, mixup_prob, mixup_alpha, seed)
+    assert result is not None
+    return result
 
 
 @torch.compile
@@ -441,7 +443,7 @@ class BCEMixup(Function):
         return loss
 
     @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None, None, None, None]:
+    def backward(ctx, grad_output: Tensor, *grad_outputs) -> Tuple[Tensor, None, None, None, None, None]:  # type: ignore[override]
         logits, labels, weights, apply_mixup = ctx.saved_tensors
         pos_weight = ctx.pos_weight
 
@@ -489,7 +491,9 @@ def bce_mixup(
     """
     if pos_weight is not None and not (0 <= pos_weight <= 1):
         raise ValueError("pos_weight must be in range [0, 1]")
-    return BCEMixup.apply(logits, labels, mixup_prob, mixup_alpha, seed, pos_weight)
+    result = BCEMixup.apply(logits, labels, mixup_prob, mixup_alpha, seed, pos_weight)
+    assert result is not None
+    return result
 
 
 def parse_args() -> Namespace:

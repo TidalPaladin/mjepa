@@ -4,7 +4,7 @@ from pathlib import Path
 from time import time
 from typing import Dict, Final, List, Self, Sequence, Type
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # type: ignore[import]
 import numpy as np
 import torch
 import yaml
