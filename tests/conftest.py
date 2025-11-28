@@ -37,14 +37,11 @@ def vit_config():
     return ViTConfig(
         in_channels=3,
         hidden_size=128,
-        patch_size=[16, 16],
+        patch_size=[4, 4],
         depth=2,
         num_attention_heads=4,
         ffn_hidden_size=256,
-        activation="gelu",
-        normalization="LayerNorm",
-        backend="pytorch",
-        checkpoint=False,
+        img_size=[32, 32],
     )
 
 

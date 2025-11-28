@@ -2,9 +2,9 @@ import math
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Tuple, TypeVar
-import torch.distributed as dist
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
@@ -41,8 +41,6 @@ class CrossAttentionPredictor(nn.Module):
         out_dim: int | None = None,
     ):
         super().__init__()
-        # NOTE: This specific setup seems very important to high CIFAR-10 probe performance.
-        # Changes should be made with care.
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
         self.rope = backbone.rope
@@ -87,7 +85,11 @@ class CrossAttentionPredictor(nn.Module):
             return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed)
 
     def prepare_rope(
-        self, tokenized_size: Tuple[int, int], context_mask: Tensor | None, target_mask: Tensor, rope_seed: int | None = None
+        self,
+        tokenized_size: Tuple[int, int],
+        context_mask: Tensor | None,
+        target_mask: Tensor,
+        rope_seed: int | None = None,
     ) -> Tuple[Tensor | None, Tensor | None]:
         if self.rope is None:
             return None, None
@@ -287,6 +289,10 @@ def compute_sigreg_loss(x: Tensor, global_step: int, num_slices: int = 256) -> T
         x: Input tensor.
         global_step: Global step.
         num_slices: Number of slices to use for the projection.
+
+    Shapes:
+        x: :math:`(*, L, D)`
+        Output: Scalar
 
     Returns:
         The SigREG loss.

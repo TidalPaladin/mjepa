@@ -1,6 +1,6 @@
-# Python Template
+# MJEPA
 
-Template repository for Python projects. Uses [pdm](https://github.com/pdm-project/pdm) as the package manager.
+Library implementing MJEPA, a JEPA-based architecture for self supervised pre-training of vision transformer models.
 
 ## Usage
 

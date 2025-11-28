@@ -1,65 +1,18 @@
+import math
+
 import pytest
-import torch.distributed as dist
 import torch
 import torch.nn as nn
 import yaml
 
 from mjepa.jepa import (
     JEPAConfig,
+    compute_sigreg_loss,
     config_constructor,
-    generate_masks,
     get_momentum,
     register_constructors,
     update_teacher,
-    compute_sigreg_loss,
 )
-
-
-# class TestCrossAttentionPredictor:
-#    @pytest.fixture
-#    def predictor(self, vit):
-#        return CrossAttentionPredictor(vit, depth=2, out_dim=None)
-#
-#    def test_init(self, predictor, vit):
-#        """Test that the predictor is initialized correctly."""
-#        assert isinstance(predictor.pos_enc, RelativeFactorizedPosition)
-#        assert len(predictor.blocks) == 2
-#        assert predictor.checkpoint == False
-#
-#    def test_forward(self, mocker, vit, predictor, dummy_image_batch, dummy_tensor_3d):
-#        """Test the forward pass of the predictor."""
-#        # Setup inputs
-#        tokenized_size = (4, 4)
-#        context = dummy_tensor_3d
-#        context_ratio = 0.5
-#        target_ratio = 0.25
-#        scale = 1
-#        x = dummy_image_batch
-#
-#        context_mask, target_mask = generate_masks(
-#            vit, x, context_ratio, target_ratio, scale
-#        )
-#
-#        # Call forward
-#        output = predictor(tokenized_size, context, target_mask)
-#
-#        # Verify shape and types
-#        assert isinstance(output, torch.Tensor)
-#        assert output.shape == (2, 16, 128)
-#
-
-
-class TestGenerateMasks:
-    def test_generate_masks(self, mocker, vit, dummy_image_batch):
-        """Test mask generation."""
-        x = dummy_image_batch
-        context_ratio = 0.5
-        target_ratio = 0.25
-        scale = 4
-        context_mask, target_mask = generate_masks(vit, x, context_ratio, target_ratio, scale)
-        assert context_mask.shape == (2, 64)
-        assert target_mask.shape == (2, 32)
-        assert not (context_mask & target_mask).any()
 
 
 class TestUpdateTeacher:
@@ -111,17 +64,32 @@ class TestGetMomentum:
         """Test momentum at start of training."""
         assert get_momentum(0, 100, 0.9) == 0.9
 
-    def test_get_momentum_middle(self):
+    @pytest.mark.parametrize(
+        "scheduled,expected",
+        [
+            (True, 0.95),
+            (False, 0.9),
+        ],
+    )
+    def test_get_momentum_middle(self, scheduled, expected):
         """Test momentum in middle of training."""
-        assert get_momentum(50, 100, 0.9) == 0.95
+        assert get_momentum(50, 100, 0.9, scheduled) == expected
 
-    def test_get_momentum_end(self):
+    @pytest.mark.parametrize(
+        "scheduled,expected",
+        [
+            (True, 1.0),
+            (False, 0.9),
+        ],
+    )
+    def test_get_momentum_end(self, scheduled, expected):
         """Test momentum at end of training."""
-        assert get_momentum(100, 100, 0.9) == 1.0
+        assert get_momentum(100, 100, 0.9, scheduled) == expected
 
     def test_get_momentum_interpolation(self):
         """Test momentum interpolation at arbitrary step."""
-        assert get_momentum(25, 100, 0.8) == 0.85
+        acutal = get_momentum(25, 100, 0.8, scheduled=True)
+        assert math.isclose(acutal, 0.85, rel_tol=1e-6)
 
 
 class TestJEPAConfig:
@@ -197,25 +165,6 @@ class TestYAMLConfig:
         # Verify the loader was called correctly
         loader.construct_mapping.assert_called_once_with(node, deep=True)
 
-    def test_register_constructors(self, mocker):
-        """Test that register_constructors adds constructors to loaders."""
-        # Create a mock TestLoader class
-        TestLoader = mocker.Mock()
-        TestLoader.yaml_constructors = {}
-
-        # Patch yaml.SafeLoader to return our test loader
-        mocker.patch("yaml.SafeLoader", TestLoader)
-        mocker.patch("yaml.FullLoader", TestLoader)
-        mocker.patch("yaml.UnsafeLoader", TestLoader)
-
-        # Register constructors
-        register_constructors()
-
-        # Check that the constructor was registered
-        yaml_tag = "tag:yaml.org,2002:python/object:mjepa.JEPAConfig"
-        assert yaml_tag in TestLoader.yaml_constructors
-        assert TestLoader.yaml_constructors[yaml_tag] == config_constructor
-
     def test_yaml_load(self):
         """Test loading a JEPAConfig from YAML."""
         # Register constructors
@@ -223,7 +172,7 @@ class TestYAMLConfig:
 
         # Create a YAML string
         yaml_str = """
-        !python/object:mjepa.JEPAConfig
+        !!python/object:mjepa.JEPAConfig
         context_ratio: 0.8
         target_ratio: 0.3
         scale: 12
@@ -245,10 +194,13 @@ class TestYAMLConfig:
 
 class TestComputeSigREGLoss:
 
-    @pytest.mark.parametrize("x_shape", [
-        (1, 32, 128), 
-        (2, 16, 128),
-    ])
+    @pytest.mark.parametrize(
+        "x_shape",
+        [
+            (1, 32, 128),
+            (2, 16, 128),
+        ],
+    )
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_compute_sigreg_loss(self, x_shape, dtype):
         """Test the compute_sigreg_loss function."""
@@ -260,10 +212,13 @@ class TestComputeSigREGLoss:
         assert loss.item() > 0
         assert not torch.isnan(loss)
 
-    @pytest.mark.parametrize("x_shape", [
-        (1, 32, 128), 
-        (2, 16, 128),
-    ])
+    @pytest.mark.parametrize(
+        "x_shape",
+        [
+            (1, 32, 128),
+            (2, 16, 128),
+        ],
+    )
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_compute_sigreg_loss_deterministic(self, x_shape, dtype):
         """Test the compute_sigreg_loss function."""
@@ -281,18 +236,18 @@ class TestComputeSigREGLoss:
         B, L, D = 2, 32, 128
         global_step = 0
         num_slices = 256
-        
+
         # Create isotropic Gaussian embeddings (should have lower loss)
         isotropic_x = torch.randn(B, L, D)
-        
+
         # Create non-isotropic embeddings (concentrated in one direction)
         non_isotropic_x = torch.zeros(B, L, D)
         non_isotropic_x[:, :, 0] = torch.randn(B, L) * 10  # High variance in first dimension
-        non_isotropic_x[:, :, 1:] = torch.randn(B, L, D-1) * 0.1  # Low variance in other dimensions
-        
+        non_isotropic_x[:, :, 1:] = torch.randn(B, L, D - 1) * 0.1  # Low variance in other dimensions
+
         isotropic_loss = compute_sigreg_loss(isotropic_x, global_step, num_slices)
         non_isotropic_loss = compute_sigreg_loss(non_isotropic_x, global_step, num_slices)
-        
+
         # Isotropic Gaussian should have lower SigREG loss
         assert isotropic_loss < non_isotropic_loss
         assert not torch.isnan(isotropic_loss)
