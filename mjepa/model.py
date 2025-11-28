@@ -21,6 +21,7 @@ from .jepa import (
     setup_teacher,
     update_teacher,
 )
+from .trainer import assert_all_ranks_synced, assert_all_trainable_params_have_grad
 
 
 @dataclass
@@ -223,6 +224,18 @@ class MJEPA(nn.Module):
     def update_teacher(self, step: int, total_steps: int) -> None:
         current_momentum = get_momentum(step, total_steps, self.config.momentum, self.config.scheduled)
         update_teacher(self.student, self.teacher, current_momentum)
+
+    def assert_student_params_have_grad(self, step: int | None = None) -> None:
+        assert_all_trainable_params_have_grad(self.student, step)
+
+    def assert_predictor_params_have_grad(self, step: int | None = None) -> None:
+        assert_all_trainable_params_have_grad(self.predictor, step)
+
+    def assert_student_params_synced(self, atol: float = 1e-4, rtol: float = 0) -> None:
+        assert_all_ranks_synced(self.student, atol, rtol)
+
+    def assert_predictor_params_synced(self, atol: float = 1e-4, rtol: float = 0) -> None:
+        assert_all_ranks_synced(self.predictor, atol, rtol)
 
     if TYPE_CHECKING:
 

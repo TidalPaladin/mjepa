@@ -198,10 +198,14 @@ def visualize_attention_weights(
 
     # Choose layout based on number of heads
     if H == 1:
-        _visualize_single_head_layout(axes, image, weights, (original_img_shape[0], original_img_shape[1]), (grid[0], grid[1]), B, nrows, ncols)
+        _visualize_single_head_layout(
+            axes, image, weights, (original_img_shape[0], original_img_shape[1]), (grid[0], grid[1]), B, nrows, ncols
+        )
         top_adjust = 0.88
     else:
-        _visualize_multi_head_layout(axes, image, weights, (original_img_shape[0], original_img_shape[1]), (grid[0], grid[1]), B, H)
+        _visualize_multi_head_layout(
+            axes, image, weights, (original_img_shape[0], original_img_shape[1]), (grid[0], grid[1]), B, H
+        )
         top_adjust = 0.92
 
     # Finalize figure
