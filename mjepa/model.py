@@ -82,10 +82,9 @@ class MJEPA(nn.Module):
     def img_size(self) -> tuple[int, int]:
         return cast(tuple[int, int], self.student.config.img_size)
 
-    @torch.inference_mode()
     def forward_teacher(self, x: Tensor) -> ViTFeatures:
         self.teacher.eval()
-        with torch.autocast(device_type=x.device.type, dtype=self.dtype):
+        with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
             output = self.teacher(x)
         return ViTFeatures(output.dense_features.clone(), output.num_register_tokens, output.num_cls_tokens)
 
@@ -106,13 +105,12 @@ class MJEPA(nn.Module):
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
         return dict()
 
-    @torch.inference_mode()
     def forward_gram_teacher(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> Tensor:
         if self.gram_teacher is None:
             raise ValueError("Gram teacher is not initialized")
 
         self.gram_teacher.eval()
-        with torch.autocast(device_type=x.device.type, dtype=self.dtype):
+        with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
             gram_teacher_output = forward_gram_teacher(
                 self.gram_teacher,
                 x,
@@ -164,7 +162,7 @@ class MJEPA(nn.Module):
             sigreg_loss_weight=self.config.sigreg_loss_weight,
         )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def apply_augmentations(
         self, img: Tensor, teacher_output: ViTFeatures, config: AugmentationConfig
     ) -> tuple[Tensor, ViTFeatures, int | None]:
