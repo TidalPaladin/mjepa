@@ -32,6 +32,8 @@ class CrossAttentionPredictor(nn.Module):
         context_pos_emb: Whether to introduce positional encoding to the context.
         out_dim: Output dimension of the predictor.
             If ``None``, the output dimension will be the same as the input dimension.
+        device: Device to place the predictor on.
+        dtype: Data type to place the predictor on.
     """
 
     def __init__(
@@ -39,16 +41,24 @@ class CrossAttentionPredictor(nn.Module):
         backbone: ViT,
         depth: int,
         out_dim: int | None = None,
+        device: torch.device | None = None,
     ):
         super().__init__()
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
-        self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size)
+        self.pos_enc_target = LearnablePosition(
+            backbone.config.hidden_size, spatial_size, device=device, dtype=backbone.config.dtype
+        )
         self.rope = backbone.rope
 
         # Predictor blocks and output projection
-        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for _ in range(depth)])
+        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer(device=device) for _ in range(depth)])
 
-        self.predictor_proj = nn.Linear(backbone.config.hidden_size, out_dim or backbone.config.hidden_size)
+        self.predictor_proj = nn.Linear(
+            backbone.config.hidden_size,
+            out_dim or backbone.config.hidden_size,
+            device=device,
+            dtype=backbone.config.dtype,
+        )
 
     def forward(
         self,

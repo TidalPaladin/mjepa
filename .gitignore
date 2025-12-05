@@ -8,6 +8,7 @@ __pycache__/
 *.pyz
 .pdm-python
 **/_version.py
+.coverage
 
 # Node
 node_modules/
