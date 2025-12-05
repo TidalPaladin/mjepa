@@ -78,15 +78,13 @@ class MJEPA(nn.Module):
         self.gram_teacher = setup_teacher(backbone) if config.gram_start_epoch is not None else None
         self.dtype = dtype
 
-    @property
-    def img_size(self) -> tuple[int, int]:
-        return cast(tuple[int, int], self.student.config.img_size)
-
     def forward_teacher(self, x: Tensor) -> ViTFeatures:
         self.teacher.eval()
         with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
             output = self.teacher(x)
-        return ViTFeatures(output.dense_features.clone(), output.num_register_tokens, output.num_cls_tokens)
+        return ViTFeatures(
+            output.dense_features.clone(), output.num_register_tokens, output.num_cls_tokens, output.tokenized_size
+        )
 
     def forward_student(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> ViTFeatures:
         with torch.autocast(device_type=x.device.type, dtype=self.dtype):
@@ -175,7 +173,7 @@ class MJEPA(nn.Module):
         img = apply_invert(config, img)[0]
         img = apply_posterize(config, img)[0]
         teacher_output = ViTFeatures.from_separate_features(
-            teacher_output_cls, teacher_output.register_tokens, teacher_output_visual
+            teacher_output_cls, teacher_output.register_tokens, teacher_output_visual, teacher_output.tokenized_size
         )
         return img, teacher_output, mixup_seed
 
