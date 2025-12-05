@@ -78,6 +78,10 @@ class MJEPA(nn.Module):
         self.gram_teacher = setup_teacher(backbone) if config.gram_start_epoch is not None else None
         self.dtype = dtype
 
+    @property
+    def img_size(self) -> tuple[int, int]:
+        return cast(tuple[int, int], self.student.config.img_size)
+
     def forward_teacher(self, x: Tensor) -> ViTFeatures:
         self.teacher.eval()
         with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
