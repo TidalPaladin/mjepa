@@ -51,7 +51,7 @@ class CrossAttentionPredictor(nn.Module):
         self.rope = backbone.rope
 
         # Predictor blocks and output projection
-        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer() for _ in range(depth)])
+        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer(device=device) for _ in range(depth)])
 
         self.predictor_proj = nn.Linear(
             backbone.config.hidden_size,
