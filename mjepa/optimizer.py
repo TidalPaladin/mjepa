@@ -41,9 +41,10 @@ class OptimizerConfig:
             eps=self.eps,
         )
         if self.scheduled:
+            max_lrs = [group["lr"] for group in optimizer.param_groups]
             scheduler = OneCycleLR(
                 optimizer,
-                max_lr=self.lr,
+                max_lr=max_lrs,
                 total_steps=total_steps,
                 pct_start=self.pct_start,
                 base_momentum=self.base_momentum,
