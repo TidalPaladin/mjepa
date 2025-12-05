@@ -23,7 +23,7 @@ dependencies = [
     "pyarrow",
     "safetensors",
     "tqdm",
-    "vit @ git+https://github.com/TidalPaladin/vit.git@feat/dtype",
+    "vit @ git+https://github.com/TidalPaladin/vit.git",
     "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
     "wandb>=0.23.0",
 ]

@@ -467,7 +467,7 @@ requires-dist = [
     { name = "torchmetrics" },
     { name = "torchvision" },
     { name = "tqdm" },
-    { name = "vit", git = "https://github.com/TidalPaladin/vit.git?rev=feat%2Fdtype" },
+    { name = "vit", git = "https://github.com/TidalPaladin/vit.git" },
     { name = "wandb", specifier = ">=0.23.0" },
 ]
 
@@ -1471,8 +1471,8 @@ wheels = [
 
 [[package]]
 name = "vit"
-version = "0.1.1.dev17+geb6c5147f"
-source = { git = "https://github.com/TidalPaladin/vit.git?rev=feat%2Fdtype#eb6c5147f4a297493a313654e26904ca26e95866" }
+version = "0.1.1.dev16+g24a5a48f6"
+source = { git = "https://github.com/TidalPaladin/vit.git#24a5a48f684f0d8f4303742bce323344e717c565" }
 dependencies = [
     { name = "numpy" },
     { name = "pyyaml" },
