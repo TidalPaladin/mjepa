@@ -135,13 +135,13 @@ class MJEPA(nn.Module):
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         # Compute JEPA loss
-        target = apply_mask(output.target_mask, output.teacher_output.visual_tokens, fill_value=None)
-        jepa_loss = F.mse_loss(output.pred, target)
-        jepa_loss_cls = F.mse_loss(output.pred_with_cls, target) if output.pred_with_cls is not None else 0.0
+        target = apply_mask(output.target_mask, output.teacher_output.visual_tokens, fill_value=None).float()
+        jepa_loss = F.mse_loss(output.pred.float(), target)
+        jepa_loss_cls = F.mse_loss(output.pred_with_cls.float(), target) if output.pred_with_cls is not None else 0.0
 
         # Compute SigREG loss
         sigreg_loss = (
-            compute_sigreg_loss(output.student_output.cls_tokens.transpose(0, 1), step, num_slices=256)
+            compute_sigreg_loss(output.student_output.cls_tokens.transpose(0, 1).float(), step, num_slices=256)
             if self.config.sigreg_loss_weight > 0
             else 0.0
         )
@@ -151,7 +151,9 @@ class MJEPA(nn.Module):
             assert output.gram_teacher_output is not None
             assert self.config.gram_loss_weight > 0
             gram_loss = compute_gram_loss(
-                output.student_output.visual_tokens, output.gram_teacher_output, remove_neg=self.config.gram_remove_neg
+                output.student_output.visual_tokens.float(),
+                output.gram_teacher_output.float(),
+                remove_neg=self.config.gram_remove_neg,
             )
         else:
             gram_loss = 0.0
