@@ -164,8 +164,7 @@ def update_teacher(student: nn.Module, teacher: nn.Module, momentum: float = 0.0
     if momentum == 1.0:
         return
     weight = 1 - momentum
-    for teacher_param, student_param in zip(teacher.parameters(), student.parameters()):
-        teacher_param.lerp_(student_param, weight)
+    torch._foreach_lerp_(list(teacher.parameters()), list(student.parameters()), weight)
 
 
 def get_momentum(step: int, total_steps: int, momentum: float, scheduled: bool = False) -> float:

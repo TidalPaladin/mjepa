@@ -102,7 +102,8 @@ class MJEPA(nn.Module):
         target_mask: Tensor,
         rope_seed: int | None = None,
     ) -> Tensor:
-        return self.predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+        with torch.autocast(device_type=context.device.type, dtype=self.dtype):
+            return self.predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
 
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
         return dict()
@@ -209,6 +210,9 @@ class MJEPA(nn.Module):
             else None
         )
 
+        with torch.autocast(device_type=pred.device.type, dtype=self.dtype):
+            probes = self.forward_probe(teacher_output)
+
         return MJEPAPredictions(
             pred=pred,
             pred_with_cls=pred_with_cls,
@@ -218,7 +222,7 @@ class MJEPA(nn.Module):
             target_mask=target_mask,
             gram_teacher_output=gram_teacher_output,
             mixup_seed=mixup_seed,
-            probes=self.forward_probe(teacher_output),
+            probes=probes,
         )
 
     def update_teacher(self, step: int, total_steps: int) -> None:
