@@ -2,7 +2,6 @@ import pytest
 import torch
 from vit import ViT, ViTConfig, ViTFeatures
 
-from mjepa.augmentation import AugmentationConfig
 from mjepa.jepa import CrossAttentionPredictor, JEPAConfig
 from mjepa.model import MJEPA, MJEPALosses, MJEPAPredictions
 
@@ -44,20 +43,6 @@ def jepa_config_no_gram():
 
 
 @pytest.fixture
-def augmentation_config():
-    """Create an augmentation configuration for testing."""
-    return AugmentationConfig(
-        mixup_prob=0.2,
-        mixup_alpha=1.0,
-        use_noise=False,
-        noise_prob=0.0,
-        invert_prob=0.0,
-        solarize_prob=0.0,
-        posterize_prob=0.0,
-    )
-
-
-@pytest.fixture
 def small_vit_config():
     """Create a small ViT configuration for testing."""
     return ViTConfig(
@@ -73,6 +58,7 @@ def small_vit_config():
         num_cls_tokens=2,
         pos_enc="rope",
         rope_base=100,
+        dtype=torch.float32,
     )
 
 
@@ -89,15 +75,15 @@ def predictor(small_vit):
 
 
 @pytest.fixture
-def mjepa_model(jepa_config, augmentation_config, small_vit, predictor):
+def mjepa_model(jepa_config, small_vit, predictor):
     """Create an MJEPA model for testing."""
-    return MJEPA(jepa_config, augmentation_config, small_vit, predictor, dtype=torch.float32)
+    return MJEPA(jepa_config, small_vit, predictor, dtype=torch.float32)
 
 
 @pytest.fixture
-def mjepa_model_no_gram(jepa_config_no_gram, augmentation_config, small_vit, predictor):
+def mjepa_model_no_gram(jepa_config_no_gram, small_vit, predictor):
     """Create an MJEPA model without Gram teacher for testing."""
-    return MJEPA(jepa_config_no_gram, augmentation_config, small_vit, predictor, dtype=torch.float32)
+    return MJEPA(jepa_config_no_gram, small_vit, predictor, dtype=torch.float32)
 
 
 @pytest.fixture
@@ -242,7 +228,6 @@ class TestMJEPAPredictions:
         assert torch.all(predictions.context_mask == context_mask)
         assert torch.all(predictions.target_mask == target_mask)
         assert predictions.gram_teacher_output is None
-        assert predictions.mixup_seed is None
         assert predictions.probes == {}
 
     def test_initialization_with_optional_fields(self, dummy_vit_features):
@@ -252,7 +237,6 @@ class TestMJEPAPredictions:
         context_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
         target_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
         gram_teacher_output = torch.randn(2, 64, 64)
-        mixup_seed = 12345
         probes = {"probe1": torch.randn(2, 10)}
 
         predictions = MJEPAPredictions(
@@ -263,13 +247,11 @@ class TestMJEPAPredictions:
             context_mask=context_mask,
             target_mask=target_mask,
             gram_teacher_output=gram_teacher_output,
-            mixup_seed=mixup_seed,
             probes=probes,
         )
 
         assert predictions.gram_teacher_output is not None
         assert torch.allclose(predictions.gram_teacher_output, gram_teacher_output)
-        assert predictions.mixup_seed == mixup_seed
         assert "probe1" in predictions.probes
         assert torch.allclose(predictions.probes["probe1"], probes["probe1"])
 
@@ -281,13 +263,11 @@ class TestMJEPAInitialization:
         self,
         mjepa_model: MJEPA,
         jepa_config: JEPAConfig,
-        augmentation_config: AugmentationConfig,
         small_vit: ViT,
         predictor: CrossAttentionPredictor,
     ):
         """Test that MJEPA model is initialized correctly."""
         assert mjepa_model.config == jepa_config
-        assert mjepa_model.augmentations == augmentation_config
         assert mjepa_model.student == small_vit
         assert mjepa_model.predictor == predictor
         assert mjepa_model.dtype == torch.float32
@@ -436,7 +416,6 @@ class TestMJEPATeacherUpdate:
             scheduled=True,
             gram_start_epoch=None,
         )
-        augmentation_config = AugmentationConfig(mixup_prob=0.0, use_noise=False)
         vit_config = ViTConfig(
             in_channels=3,
             hidden_size=64,
@@ -448,7 +427,7 @@ class TestMJEPATeacherUpdate:
         )
         backbone = vit_config.instantiate()
         predictor = CrossAttentionPredictor(backbone, depth=2)
-        model = MJEPA(config, augmentation_config, backbone, predictor)
+        model = MJEPA(config, backbone, predictor)
 
         # Store initial teacher weights
         initial_weight = model.teacher.stem.patch.weight.data.clone()
@@ -583,7 +562,6 @@ class TestMJEPAComputeLosses:
             sigreg_loss_weight=1e-4,
             gram_start_epoch=None,
         )
-        augmentation_config = AugmentationConfig(mixup_prob=0.0, use_noise=False)
         vit_config = ViTConfig(
             in_channels=3,
             hidden_size=64,
@@ -596,7 +574,7 @@ class TestMJEPAComputeLosses:
         )
         backbone = vit_config.instantiate()
         predictor = CrossAttentionPredictor(backbone, depth=2)
-        model = MJEPA(config, augmentation_config, backbone, predictor)
+        model = MJEPA(config, backbone, predictor)
 
         pred = torch.randn(2, 16, 64)
         pred_with_cls = torch.randn(2, 16, 64)
@@ -730,75 +708,6 @@ class TestMJEPAComputeLosses:
         )
 
         assert isinstance(losses.gram_loss, torch.Tensor)
-
-
-class TestMJEPAAugmentations:
-    """Test MJEPA augmentation application."""
-
-    @pytest.mark.cuda
-    def test_apply_augmentations_no_mixup(self):
-        """Test augmentation application without mixup."""
-        config = JEPAConfig(gram_start_epoch=None)
-        augmentation_config = AugmentationConfig(mixup_prob=0.0, use_noise=False)
-        vit_config = ViTConfig(
-            in_channels=3,
-            hidden_size=64,
-            patch_size=[4, 4],
-            img_size=[32, 32],
-            depth=2,
-            num_attention_heads=4,
-            ffn_hidden_size=128,
-        )
-        backbone = vit_config.instantiate()
-        predictor = CrossAttentionPredictor(backbone, depth=2)
-        model = MJEPA(config, augmentation_config, backbone, predictor)
-
-        img = torch.randn(2, 3, 32, 32, device="cuda")
-        batch_size = 2
-        num_tokens = 64
-        hidden_size = 64
-        dense_features = torch.randn(batch_size, num_tokens, hidden_size, device="cuda")
-        teacher_output = ViTFeatures(dense_features, 0, 0)
-
-        img_aug, teacher_output_aug, mixup_seed = model.apply_augmentations(img, teacher_output, augmentation_config)
-
-        # With no mixup, output should be similar to input (may differ due to noise/invert/posterize)
-        assert img_aug.shape == img.shape
-        assert teacher_output_aug.dense_features.shape == teacher_output.dense_features.shape
-        assert mixup_seed == 0  # No mixup seed when mixup is disabled
-
-    @pytest.mark.cuda
-    def test_apply_augmentations_with_mixup(self):
-        """Test augmentation application with mixup."""
-        config = JEPAConfig(gram_start_epoch=None)
-        augmentation_config = AugmentationConfig(mixup_prob=1.0, mixup_alpha=1.0, use_noise=False)
-        vit_config = ViTConfig(
-            in_channels=3,
-            hidden_size=64,
-            patch_size=[4, 4],
-            img_size=[32, 32],
-            depth=2,
-            num_attention_heads=4,
-            ffn_hidden_size=128,
-            num_cls_tokens=2,
-        )
-        backbone = vit_config.instantiate()
-        predictor = CrossAttentionPredictor(backbone, depth=2)
-        model = MJEPA(config, augmentation_config, backbone, predictor)
-
-        img = torch.randn(2, 3, 32, 32, device="cuda")
-        batch_size = 2
-        num_tokens = 64
-        hidden_size = 64
-        dense_features = torch.randn(batch_size, num_tokens + 2, hidden_size, device="cuda")
-        teacher_output = ViTFeatures(dense_features, 0, 2)
-
-        img_aug, teacher_output_aug, mixup_seed = model.apply_augmentations(img, teacher_output, augmentation_config)
-
-        assert img_aug.shape == img.shape
-        assert teacher_output_aug.dense_features.shape == teacher_output.dense_features.shape
-        assert isinstance(mixup_seed, int)
-        assert mixup_seed > 0
 
 
 class TestMJEPAForward:
@@ -944,17 +853,8 @@ class TestMJEPAEndToEnd:
         assert not torch.allclose(updated_weight, initial_weight)
 
     @pytest.mark.cuda
-    def test_full_workflow_with_augmentations(self):
-        """Test full workflow with augmentations enabled."""
+    def test_full_workflow(self):
         config = JEPAConfig(gram_start_epoch=None, sigreg_loss_weight=0.0)
-        augmentation_config = AugmentationConfig(
-            mixup_prob=0.5,
-            mixup_alpha=1.0,
-            use_noise=True,
-            noise_prob=0.1,
-            invert_prob=0.1,
-            posterize_prob=0.1,
-        )
         vit_config = ViTConfig(
             in_channels=3,
             hidden_size=64,
@@ -966,7 +866,7 @@ class TestMJEPAEndToEnd:
         )
         backbone = vit_config.instantiate()
         predictor = CrossAttentionPredictor(backbone, depth=2)
-        model = MJEPA(config, augmentation_config, backbone, predictor).to("cuda")
+        model = MJEPA(config, backbone, predictor).to("cuda")
         model.train()
 
         dummy_batch = torch.randn(2, 3, 32, 32, device="cuda")

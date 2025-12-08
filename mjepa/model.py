@@ -8,7 +8,6 @@ from torch import Tensor
 from vit import ViT, ViTFeatures
 from vit.tokens import apply_mask
 
-from .augmentation import AugmentationConfig, apply_invert, apply_mixup, apply_noise, apply_posterize
 from .jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
@@ -55,7 +54,6 @@ class MJEPAPredictions:
     target_mask: Tensor
 
     gram_teacher_output: Tensor | None = None
-    mixup_seed: int | None = None
     probes: dict[str, Tensor] = field(default_factory=dict)
 
 
@@ -64,14 +62,12 @@ class MJEPA(nn.Module):
     def __init__(
         self,
         config: JEPAConfig,
-        augmentations: AugmentationConfig,
         backbone: ViT,
         predictor: CrossAttentionPredictor,
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.config = config
-        self.augmentations = augmentations
         self.student = backbone
         self.teacher = setup_teacher(backbone)
         self.predictor = predictor
@@ -167,23 +163,6 @@ class MJEPA(nn.Module):
             sigreg_loss_weight=self.config.sigreg_loss_weight,
         )
 
-    @torch.no_grad()
-    def apply_augmentations(
-        self, img: Tensor, teacher_output: ViTFeatures, config: AugmentationConfig
-    ) -> tuple[Tensor, ViTFeatures, int | None]:
-        img = apply_noise(config, img)
-        teacher_output_visual = teacher_output.visual_tokens
-        teacher_output_cls = teacher_output.cls_tokens
-        mixup_seed, (img, teacher_output_visual, teacher_output_cls) = apply_mixup(
-            config, img, teacher_output_visual, teacher_output_cls
-        )
-        img = apply_invert(config, img)[0]
-        img = apply_posterize(config, img)[0]
-        teacher_output = ViTFeatures.from_separate_features(
-            teacher_output_cls, teacher_output.register_tokens, teacher_output_visual, teacher_output.tokenized_size
-        )
-        return img, teacher_output, mixup_seed
-
     def forward(self, x: Tensor, jepa_scale: int, epoch: int) -> MJEPAPredictions:
         # NOTE: For DDP to work, all components must execute in the forward pass when training
         context_mask, target_mask = generate_masks(
@@ -199,7 +178,6 @@ class MJEPA(nn.Module):
             else None
         )
 
-        x, teacher_output, mixup_seed = self.apply_augmentations(x, teacher_output, self.augmentations)
         Ht, Wt = cast(tuple[int, int], self.student.stem.tokenized_size(x.shape[-2:]))
 
         student_output = self.forward_student(x, context_mask, rope_seed=rope_seed)
@@ -223,7 +201,6 @@ class MJEPA(nn.Module):
             context_mask=context_mask,
             target_mask=target_mask,
             gram_teacher_output=gram_teacher_output,
-            mixup_seed=mixup_seed,
             probes=probes,
         )
 
