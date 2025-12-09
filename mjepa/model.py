@@ -224,3 +224,110 @@ class MJEPA(nn.Module):
 
         def __call__(self, x: Tensor, jepa_scale: int, epoch: int) -> MJEPAPredictions:
             return self.forward(x, jepa_scale, epoch)
+
+
+@dataclass
+class LeJEPAPredictions:
+    student_output1: ViTFeatures
+    student_output2: ViTFeatures
+    teacher_output: ViTFeatures
+    mask1: Tensor
+    mask2: Tensor
+
+    probes: dict[str, Tensor] = field(default_factory=dict)
+
+
+@dataclass
+class LeJEPALosses:
+    jepa_loss: Tensor
+    sigreg_loss: Tensor | float
+    sigreg_loss_weight: float = 1e-4
+
+    def reduce(self) -> Tensor:
+        loss = self.jepa_loss * (1 - self.sigreg_loss_weight) + self.sigreg_loss * self.sigreg_loss_weight
+        assert isinstance(loss, Tensor)
+        return loss
+
+
+class LeJEPA(nn.Module):
+
+    def __init__(
+        self,
+        config: JEPAConfig,
+        backbone: ViT,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        self.config = config
+        self.student = backbone
+        self.dtype = dtype
+
+    @property
+    def img_size(self) -> tuple[int, int]:
+        return cast(tuple[int, int], self.student.config.img_size)
+
+    def forward_teacher(self, x: Tensor) -> ViTFeatures:
+        self.student.eval()
+        with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
+            output = self.student(x)
+        self.student.train(mode=self.training)
+        return ViTFeatures(
+            output.dense_features.clone(), output.num_register_tokens, output.num_cls_tokens, output.tokenized_size
+        )
+
+    def forward_student(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> ViTFeatures:
+        with torch.autocast(device_type=x.device.type, dtype=self.dtype):
+            return self.student(x, mask=context_mask, rope_seed=rope_seed)
+
+    def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
+        return dict()
+
+    def compute_losses(self, output: LeJEPAPredictions, step: int, epoch: int) -> LeJEPALosses:
+        # Compute JEPA loss
+        jepa_loss = F.mse_loss(output.student_output1.cls_tokens.float(), output.student_output2.cls_tokens.float())
+
+        # Compute SigREG loss
+        all_cls_tokens = torch.cat([output.student_output1.cls_tokens, output.student_output2.cls_tokens], dim=0)
+        sigreg_loss = (
+            compute_sigreg_loss(all_cls_tokens.transpose(0, 1).float(), step, num_slices=256)
+            if self.config.sigreg_loss_weight > 0
+            else 0.0
+        )
+
+        return LeJEPALosses(
+            jepa_loss=jepa_loss,
+            sigreg_loss=sigreg_loss,
+            sigreg_loss_weight=self.config.sigreg_loss_weight,
+        )
+
+    def forward(self, x: Tensor, jepa_scale: int, epoch: int) -> LeJEPAPredictions:
+        # NOTE: For DDP to work, all components must execute in the forward pass when training
+        context_mask = self.student.create_mask(x, self.config.context_ratio, jepa_scale, roll=True)
+        target_mask = ~context_mask
+
+        student_output1 = self.forward_student(x, context_mask)
+        student_output2 = self.forward_student(x, target_mask)
+        teacher_output = self.forward_teacher(x)
+
+        with torch.autocast(device_type=x.device.type, dtype=self.dtype):
+            probes = self.forward_probe(teacher_output)
+
+        return LeJEPAPredictions(
+            student_output1=student_output1,
+            student_output2=student_output2,
+            teacher_output=teacher_output,
+            mask1=context_mask,
+            mask2=target_mask,
+            probes=probes,
+        )
+
+    def assert_student_params_have_grad(self, step: int | None = None) -> None:
+        assert_all_trainable_params_have_grad(self.student, step)
+
+    def assert_student_params_synced(self, atol: float = 1e-4, rtol: float = 0) -> None:
+        assert_all_ranks_synced(self.student, atol, rtol)
+
+    if TYPE_CHECKING:
+
+        def __call__(self, x: Tensor, jepa_scale: int, epoch: int) -> LeJEPAPredictions:
+            return self.forward(x, jepa_scale, epoch)
