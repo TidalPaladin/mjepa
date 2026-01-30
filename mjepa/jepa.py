@@ -309,7 +309,8 @@ def compute_sigreg_loss(x: Tensor, global_step: int, num_slices: int = 256) -> T
     B, L, D = x.shape
 
     proj_shape = (1, D, num_slices)
-    with torch.random.fork_rng(devices=[x.device]):
+    devices = [x.device] if x.device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
         torch.random.manual_seed(global_step)
         A = torch.randn(proj_shape, device=x.device)
     A = F.normalize(A, dim=-2)
