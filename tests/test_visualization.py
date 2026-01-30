@@ -2,19 +2,17 @@ import pytest
 import torch
 
 # Skip entire module if matplotlib is not available
-pytest.importorskip("matplotlib")
-
-import matplotlib
-
+# This must happen BEFORE importing from mjepa.visualization since those modules import matplotlib
+matplotlib = pytest.importorskip("matplotlib")
 matplotlib.use("Agg")  # Use non-interactive backend for testing
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # type: ignore[import]  # noqa: E402
 
-from mjepa.visualization.cosine import cosine_similarity_heatmap
-from mjepa.visualization.norm import create_norm_histogram
-from mjepa.visualization.pca import pca_topk
-from mjepa.visualization.pos_enc import create_pos_enc_maps
-from mjepa.visualization.runtime import plot_times
+from mjepa.visualization.cosine import cosine_similarity_heatmap  # noqa: E402
+from mjepa.visualization.norm import create_norm_histogram  # noqa: E402
+from mjepa.visualization.pca import pca_topk  # noqa: E402
+from mjepa.visualization.pos_enc import create_pos_enc_maps  # noqa: E402
+from mjepa.visualization.runtime import plot_times  # noqa: E402
 
 
 class TestPCATopK:
@@ -270,7 +268,7 @@ class TestPlotTimes:
         }
         device = torch.device("cpu")
 
-        fig = plot_times(times, device, batch_size=1)
+        fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
@@ -282,7 +280,7 @@ class TestPlotTimes:
         }
         device = torch.device("cpu")
 
-        fig = plot_times(times, device, batch_size=1)
+        fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
@@ -295,7 +293,7 @@ class TestPlotTimes:
         }
         device = torch.device("cpu")
 
-        fig = plot_times(times, device, batch_size=1)
+        fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
@@ -308,7 +306,7 @@ class TestPlotTimes:
         }
         device = torch.device("cpu")
 
-        fig = plot_times(times, device, batch_size=1)
+        fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
@@ -320,7 +318,7 @@ class TestPlotTimes:
         }
         device = torch.device("cpu")
 
-        fig = plot_times(times, device, batch_size=8)
+        fig = plot_times(times, device, batch_size=8)  # type: ignore[arg-type]
 
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
@@ -333,7 +331,7 @@ class TestPlotTimes:
         }
         device = torch.device("cpu")
 
-        fig = plot_times(times, device, batch_size=1)
+        fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
         assert len(fig.axes) >= 1
         plt.close(fig)
@@ -346,7 +344,7 @@ class TestPlotTimes:
         }
         device = torch.device("cpu")
 
-        fig = plot_times(times, device, batch_size=1)
+        fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
         assert isinstance(fig, plt.Figure)
         plt.close(fig)

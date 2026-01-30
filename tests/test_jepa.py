@@ -434,9 +434,7 @@ class TestGenerateMasks:
     def test_masks_are_boolean(self, backbone):
         """Test that generated masks are boolean tensors."""
         x = torch.randn(2, 3, 32, 32)
-        context_mask, target_mask = generate_masks(
-            backbone, x, context_ratio=0.5, target_ratio=0.25, scale=2
-        )
+        context_mask, target_mask = generate_masks(backbone, x, context_ratio=0.5, target_ratio=0.25, scale=2)
 
         assert context_mask.dtype == torch.bool
         assert target_mask.dtype == torch.bool
@@ -444,9 +442,7 @@ class TestGenerateMasks:
     def test_masks_have_correct_shape(self, backbone):
         """Test that masks have correct batch and token dimensions."""
         x = torch.randn(2, 3, 32, 32)
-        context_mask, target_mask = generate_masks(
-            backbone, x, context_ratio=0.5, target_ratio=0.25, scale=2
-        )
+        context_mask, target_mask = generate_masks(backbone, x, context_ratio=0.5, target_ratio=0.25, scale=2)
 
         # Masks should have shape (batch, num_tokens)
         batch_size = x.shape[0]
@@ -459,9 +455,7 @@ class TestGenerateMasks:
     def test_masks_non_overlapping(self, backbone):
         """Test that context and target masks do not overlap."""
         x = torch.randn(2, 3, 32, 32)
-        context_mask, target_mask = generate_masks(
-            backbone, x, context_ratio=0.5, target_ratio=0.25, scale=2
-        )
+        context_mask, target_mask = generate_masks(backbone, x, context_ratio=0.5, target_ratio=0.25, scale=2)
 
         # No position should be True in both masks
         overlap = context_mask & target_mask
@@ -471,9 +465,7 @@ class TestGenerateMasks:
         """Test that context mask has approximately the expected ratio of True values."""
         x = torch.randn(4, 3, 32, 32)
         context_ratio = 0.5
-        context_mask, _ = generate_masks(
-            backbone, x, context_ratio=context_ratio, target_ratio=0.25, scale=2
-        )
+        context_mask, _ = generate_masks(backbone, x, context_ratio=context_ratio, target_ratio=0.25, scale=2)
 
         actual_ratio = context_mask.float().mean().item()
         # Allow some tolerance due to discrete masking
@@ -484,9 +476,7 @@ class TestGenerateMasks:
         x = torch.randn(2, 3, 32, 32)
 
         for scale in [1, 2, 4]:
-            context_mask, target_mask = generate_masks(
-                backbone, x, context_ratio=0.5, target_ratio=0.25, scale=scale
-            )
+            context_mask, target_mask = generate_masks(backbone, x, context_ratio=0.5, target_ratio=0.25, scale=scale)
 
             # Masks should still have correct shapes
             assert context_mask.shape == target_mask.shape

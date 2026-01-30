@@ -44,7 +44,7 @@ class TestCSVLoggerInit:
             # Create file with existing content
             path.write_text("existing,data\n1,2\n")
 
-            logger = CSVLogger(path)
+            CSVLogger(path)
             assert path.exists()
             # File content should be preserved
             assert path.read_text() == "existing,data\n1,2\n"

@@ -2,7 +2,6 @@ import tempfile
 from pathlib import Path
 
 import pytest
-import torch
 import torch.nn as nn
 import yaml
 from torch.optim import AdamW
