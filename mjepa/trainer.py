@@ -1,12 +1,13 @@
 import logging
 import os
 import random
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from shutil import copyfile
-from typing import Callable, Dict, Literal, Sequence, Tuple, overload
+from typing import Literal, overload
 from warnings import filterwarnings
 
 import numpy as np
@@ -201,7 +202,7 @@ def load_checkpoint(
     scheduler: LRScheduler,
     strict: bool = True,
     mode: Literal["resume", "fresh"] = "resume",
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     r"""Load a checkpoint.
 
     Weights are loaded in-place.
@@ -391,7 +392,7 @@ def size_change(
     accumulate_grad_batches: int,
     train_dataloader_fn: DataLoaderFn,
     val_dataloader_fn: DataLoaderFn | None = None,
-) -> Tuple[DataLoader, DataLoader | None, int]:
+) -> tuple[DataLoader, DataLoader | None, int]:
     r"""Reconstruct dataloaders for a given resolution configuration.
 
     The resolution and batch size are updated to the values given in the size configuration.
@@ -450,7 +451,7 @@ class TrainerConfig:
     accumulate_grad_batches: int = 1
     log_interval: int = 50
     check_val_every_n_epoch: int = 1
-    sizes: Dict[int, ResolutionConfig] = field(default_factory=dict)
+    sizes: dict[int, ResolutionConfig] = field(default_factory=dict)
 
     def is_size_change_epoch(self, epoch: int) -> bool:
         return epoch in self.sizes

@@ -1,7 +1,7 @@
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -62,7 +62,7 @@ class CrossAttentionPredictor(nn.Module):
 
     def forward(
         self,
-        tokenized_size: Tuple[int, int],
+        tokenized_size: tuple[int, int],
         context: Tensor,
         context_mask: Tensor | None,
         target_mask: Tensor,
@@ -86,7 +86,7 @@ class CrossAttentionPredictor(nn.Module):
 
         def __call__(
             self,
-            tokenized_size: Tuple[int, int],
+            tokenized_size: tuple[int, int],
             context: Tensor,
             context_mask: Tensor | None,
             target_mask: Tensor,
@@ -96,11 +96,11 @@ class CrossAttentionPredictor(nn.Module):
 
     def prepare_rope(
         self,
-        tokenized_size: Tuple[int, int],
+        tokenized_size: tuple[int, int],
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
-    ) -> Tuple[Tensor | None, Tensor | None]:
+    ) -> tuple[Tensor | None, Tensor | None]:
         if self.rope is None:
             return None, None
 
@@ -130,7 +130,7 @@ def generate_masks(
     target_ratio: float,
     scale: int,
     roll: bool = True,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     r"""Generate non-overlapping and non-ragged context and target masks.
 
     Args:

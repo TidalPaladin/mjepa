@@ -1,7 +1,8 @@
 from argparse import Action, ArgumentParser, Namespace
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Self, Sequence, Tuple, Type, cast
+from typing import Any, Self, cast
 
 import matplotlib.pyplot as plt  # type: ignore[import]
 import safetensors.torch as st
@@ -24,7 +25,7 @@ register_constructors()
 
 def cosine_similarity_heatmap(
     features: Tensor,
-    target_coords: List[Tuple[int, int]],
+    target_coords: list[tuple[int, int]],
     normalize: Sequence[str] = ["spatial"],
     combine_coords: bool = False,
 ) -> Tensor:
@@ -125,7 +126,7 @@ def torch_dtype_type(value: str) -> torch.dtype:
             raise ValueError(f"Invalid data type: {value}")
 
 
-def coordinate_type(value: str) -> Tuple[int, int]:
+def coordinate_type(value: str) -> tuple[int, int]:
     """Parse coordinate string in format 'row,col'."""
     try:
         parts = value.split(",")
@@ -141,12 +142,12 @@ class ExpandImagePathsAction(Action):
     """Custom action that expands directory paths to .tiff files and validates all paths exist."""
 
     def __call__(
-        self, parser: ArgumentParser, namespace: Namespace, values: Any, option_string: Optional[str] = None
+        self, parser: ArgumentParser, namespace: Namespace, values: Any, option_string: str | None = None
     ) -> None:
         if not isinstance(values, list):
             values = [values]
 
-        expanded_paths: List[Path] = []
+        expanded_paths: list[Path] = []
         for value in values:
             path = Path(value)
             if path.is_dir():
@@ -167,7 +168,7 @@ class CosineVisualizer:
     """Visualizer for cosine similarity heatmaps between target tokens and all other tokens."""
 
     model: ViT
-    target_coords: List[Tuple[int, int]]
+    target_coords: list[tuple[int, int]]
     device: torch.device = torch.device("cpu")
     dtype: torch.dtype = torch.float32
     invert: bool = False
@@ -208,7 +209,7 @@ class CosineVisualizer:
         x = rearrange(x, "... h w c -> ... c h w").to(self.device)
         return x
 
-    def _draw_red_box(self, img: Tensor, coords: Tuple[int, int], token_size: Tuple[float, float]) -> Tensor:
+    def _draw_red_box(self, img: Tensor, coords: tuple[int, int], token_size: tuple[float, float]) -> Tensor:
         """Draw a red box covering the entire token at the specified coordinate.
 
         Args:
@@ -248,7 +249,7 @@ class CosineVisualizer:
     def _compute_cosine_heatmaps(self, features: Tensor, output_size: Sequence[int]) -> Tensor:
         """Compute cosine similarity heatmaps for all target coordinates."""
         heatmaps = cosine_similarity_heatmap(features, self.target_coords, self.normalize, self.combine_coords)
-        visualizations: List[Tensor] = []
+        visualizations: list[Tensor] = []
 
         for i in range(heatmaps.shape[-1]):
             heatmap_i = heatmaps[..., i].unsqueeze_(1)
@@ -259,7 +260,7 @@ class CosineVisualizer:
         # Concatenate multiple heatmaps along the width axis
         return torch.cat(visualizations, dim=-1)
 
-    def _create_grid(self, img: Tensor, heatmaps: Tensor, features_shape: Tuple[int, ...], **kwargs) -> Tensor:
+    def _create_grid(self, img: Tensor, heatmaps: Tensor, features_shape: tuple[int, ...], **kwargs) -> Tensor:
         """Create visualization grid with original image and heatmaps."""
         # Expand grayscale to RGB if needed
         img = img.expand(-1, 3, -1, -1)
@@ -328,7 +329,7 @@ class CosineVisualizer:
         save_image(grid, output)
 
     @classmethod
-    def create_parser(cls: Type[Self], custom_loader: bool = False) -> ArgumentParser:
+    def create_parser(cls: type[Self], custom_loader: bool = False) -> ArgumentParser:
         """Create argument parser with built-in validation."""
         parser = ArgumentParser(
             prog="cosine-visualize", description="Visualize cosine similarity heatmaps for ViT token features"
@@ -381,7 +382,7 @@ class CosineVisualizer:
         return parser
 
     @classmethod
-    def from_args(cls: Type[Self], args: Namespace) -> Self:
+    def from_args(cls: type[Self], args: Namespace) -> Self:
         """Create visualizer from command line arguments."""
         # Create model
         config = yaml.full_load(args.config.read_text())["backbone"]
@@ -414,7 +415,7 @@ def main() -> None:
     visualizer = CosineVisualizer.from_args(args)
 
     # Process all input images
-    all_grids: List[Tensor] = []
+    all_grids: list[Tensor] = []
     for img_path in tqdm(args.input, desc="Processing images"):
         img = load_image(img_path, visualizer.size or (224, 224))
         grid = visualizer(img)

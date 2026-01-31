@@ -27,23 +27,14 @@ init: ## pulls submodules and initializes virtual environment
 	which uv || pip install --user uv
 	uv sync --all-groups
 
-node_modules: 
-ifeq (, $(shell which npm))
-	$(error "No npm in $(PATH), please install it to run pyright type checking")
-else
-	npm install
-endif
-
 quality:
 	$(MAKE) clean
-	$(PYTHON) -m black --check $(QUALITY_DIRS)
-	$(PYTHON) -m autopep8 -a $(QUALITY_DIRS)
+	$(PYTHON) -m ruff check $(QUALITY_DIRS)
+	$(PYTHON) -m ruff format --check $(QUALITY_DIRS)
 
 style:
-	$(PYTHON) -m autoflake -r -i $(QUALITY_DIRS)
-	$(PYTHON) -m isort $(QUALITY_DIRS)
-	$(PYTHON) -m autopep8 -a $(QUALITY_DIRS)
-	$(PYTHON) -m black $(QUALITY_DIRS)
+	$(PYTHON) -m ruff check --fix $(QUALITY_DIRS)
+	$(PYTHON) -m ruff format $(QUALITY_DIRS)
 
 test: ## run unit tests
 	$(PYTHON) -m pytest \
@@ -68,8 +59,8 @@ test-ci: ## runs CI-only tests
 		--cov-report=term \
 		./tests/
 
-types: node_modules ## run pyright type checking
-	uv run npx --no-install pyright tests $(PROJECT)
+types: ## run basedpyright type checking
+	$(PYTHON) -m basedpyright $(QUALITY_DIRS)
 
 help: ## display this help message
 	@echo "Please use \`make <target>' where <target> is one of"
