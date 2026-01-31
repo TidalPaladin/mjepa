@@ -1,7 +1,8 @@
 from argparse import ArgumentParser, Namespace
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, Sequence, Type, cast
+from typing import Self, cast
 
 import matplotlib.pyplot as plt  # type: ignore[import]
 import safetensors.torch as st
@@ -91,7 +92,7 @@ class NormVisualizer:
         fig.savefig(output, dpi=300, bbox_inches="tight")
 
     @classmethod
-    def create_parser(cls: Type[Self], custom_loader: bool = False) -> ArgumentParser:
+    def create_parser(cls: type[Self], custom_loader: bool = False) -> ArgumentParser:
         """Create argument parser with built-in validation."""
         parser = ArgumentParser(prog="pca-visualize", description="Visualize PCA ViT output features")
         parser.add_argument("config", type=existing_file_type, help="Path to model YAML configuration file")
@@ -125,7 +126,7 @@ class NormVisualizer:
         return parser
 
     @classmethod
-    def from_args(cls: Type[Self], args: Namespace) -> Self:
+    def from_args(cls: type[Self], args: Namespace) -> Self:
         # Create model
         config = yaml.full_load(args.config.read_text())["backbone"]
         assert isinstance(config, ViTConfig)

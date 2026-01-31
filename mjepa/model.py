@@ -58,7 +58,6 @@ class MJEPAPredictions:
 
 
 class MJEPA(nn.Module):
-
     def __init__(
         self,
         config: JEPAConfig,

@@ -1,8 +1,9 @@
 from argparse import ArgumentParser, Namespace
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from typing import Dict, Final, List, Self, Sequence, Type
+from typing import Final, Self
 
 import matplotlib.pyplot as plt  # type: ignore[import]
 import numpy as np
@@ -20,7 +21,7 @@ NUM_WARMUP_RUNS: Final = 3
 register_constructors()
 
 
-def plot_times(times: Dict[Sequence[int], List[float]], device: torch.device, batch_size: int) -> plt.Figure:
+def plot_times(times: dict[Sequence[int], list[float]], device: torch.device, batch_size: int) -> plt.Figure:
     """Create a box plot comparing inference times for different input sizes."""
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -83,10 +84,10 @@ class RuntimeVisualizer:
         torch.set_float32_matmul_precision("high")
 
     @torch.inference_mode()
-    def _get_runtime(self, size: Sequence[int]) -> List[float]:
+    def _get_runtime(self, size: Sequence[int]) -> list[float]:
         B, C = self.batch_size, self.model.config.in_channels
         x = torch.randn(B, C, *size, device=self.device)
-        times: List[float] = []
+        times: list[float] = []
         with torch.autocast(self.device.type, dtype=self.dtype):
             # First pass for warmup/compile
             for _ in range(NUM_WARMUP_RUNS):
@@ -113,7 +114,7 @@ class RuntimeVisualizer:
         fig.savefig(output, dpi=300, bbox_inches="tight")
 
     @classmethod
-    def create_parser(cls: Type[Self], custom_loader: bool = False) -> ArgumentParser:
+    def create_parser(cls: type[Self], custom_loader: bool = False) -> ArgumentParser:
         """Create argument parser with built-in validation."""
         parser = ArgumentParser(prog="pca-visualize", description="Visualize PCA ViT output features")
         parser.add_argument("config", type=existing_file_type, help="Path to model YAML configuration file")
@@ -154,7 +155,7 @@ class RuntimeVisualizer:
         return parser
 
     @classmethod
-    def from_args(cls: Type[Self], args: Namespace) -> Self:
+    def from_args(cls: type[Self], args: Namespace) -> Self:
         # Create model
         config = yaml.full_load(args.config.read_text())["backbone"]
         assert isinstance(config, ViTConfig)

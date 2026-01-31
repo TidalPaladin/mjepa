@@ -1,7 +1,8 @@
 from argparse import Action, ArgumentParser, Namespace
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Self, Sequence, Type, cast
+from typing import Any, Self, cast
 
 import matplotlib.pyplot as plt  # type: ignore[import]
 import safetensors.torch as st
@@ -118,12 +119,12 @@ class ExpandImagePathsAction(Action):
     """Custom action that expands directory paths to .tiff files and validates all paths exist."""
 
     def __call__(
-        self, parser: ArgumentParser, namespace: Namespace, values: Any, option_string: Optional[str] = None
+        self, parser: ArgumentParser, namespace: Namespace, values: Any, option_string: str | None = None
     ) -> None:
         if not isinstance(values, list):
             values = [values]
 
-        expanded_paths: List[Path] = []
+        expanded_paths: list[Path] = []
         for value in values:
             path = Path(value)
             if path.is_dir():
@@ -183,7 +184,7 @@ class PCAVisualizer:
 
     def _compute_pca(self, features: Tensor, output_size: Sequence[int]) -> Tensor:
         pca = pca_topk(features, self.offset, k=self.num_components, normalize=self.normalize)
-        visualizations: List[Tensor] = []
+        visualizations: list[Tensor] = []
         for i in range(pca.shape[-1]):
             pca_i = pca[..., i].unsqueeze_(1)
             pca_i = F.interpolate(pca_i, size=output_size, mode="nearest")
@@ -217,7 +218,7 @@ class PCAVisualizer:
         img = F.interpolate(img, size=self.size, mode="bilinear", align_corners=False)
 
         if self.animate:
-            feature_list: List[Tensor] = []
+            feature_list: list[Tensor] = []
             for _img in tqdm(img, desc="Animating"):
                 # Compute zoom window boundaries that shrink towards center
                 features = self._forward_features(_img[None])
@@ -225,7 +226,7 @@ class PCAVisualizer:
 
             assert self.size is not None, "size must be set for animation"
             pca = self._compute_pca(torch.cat(feature_list, dim=0), self.size).chunk(img.shape[0], dim=0)
-            grids: List[Tensor] = [self._create_grid(i[None], p) for i, p in zip(img, pca)]
+            grids: list[Tensor] = [self._create_grid(i[None], p) for i, p in zip(img, pca)]
             return torch.stack(grids, dim=0)
         else:
             features = self._forward_features(img)
@@ -247,7 +248,7 @@ class PCAVisualizer:
             save_image(grid, output)
 
     @classmethod
-    def create_parser(cls: Type[Self], custom_loader: bool = False) -> ArgumentParser:
+    def create_parser(cls: type[Self], custom_loader: bool = False) -> ArgumentParser:
         """Create argument parser with built-in validation."""
         parser = ArgumentParser(prog="pca-visualize", description="Visualize PCA ViT output features")
         parser.add_argument("config", type=existing_file_type, help="Path to model YAML configuration file")
@@ -305,7 +306,7 @@ class PCAVisualizer:
         return parser
 
     @classmethod
-    def from_args(cls: Type[Self], args: Namespace) -> Self:
+    def from_args(cls: type[Self], args: Namespace) -> Self:
         # Create model
         config = yaml.full_load(args.config.read_text())["backbone"]
         assert isinstance(config, ViTConfig)

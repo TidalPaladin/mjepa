@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+
 # Skip entire module if matplotlib is not available
 # This must happen BEFORE importing from mjepa.visualization since those modules import matplotlib
 matplotlib = pytest.importorskip("matplotlib")

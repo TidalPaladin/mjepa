@@ -49,9 +49,6 @@ jobs:
                 name: Run tests
                 command: make test-ci
             - run:
-                name: Install static type checker
-                command: npm ci
-            - run:
                 name: Run static type checking
                 command: make types
             - codecov/upload:

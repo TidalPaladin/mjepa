@@ -1,6 +1,7 @@
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from os import PathLike
-from typing import Any, Dict, Iterator, List, Set, Tuple
+from typing import Any
 
 import torch.nn as nn
 import yaml
@@ -13,7 +14,7 @@ class OptimizerConfig:
     # Optimizer
     lr: float
     weight_decay: float
-    betas: Tuple[float, float]
+    betas: tuple[float, float]
     fused: bool | None = True
     foreach: bool | None = None
     eps: float = 1e-8
@@ -27,9 +28,9 @@ class OptimizerConfig:
     final_div_factor: float = 1e4
 
     # Parameter groups
-    parameter_groups: List[Dict[str, Any]] = field(default_factory=list)
+    parameter_groups: list[dict[str, Any]] = field(default_factory=list)
 
-    def instantiate(self, model: nn.Module, total_steps: int) -> Tuple[Optimizer, LRScheduler]:
+    def instantiate(self, model: nn.Module, total_steps: int) -> tuple[Optimizer, LRScheduler]:
         parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
         optimizer = AdamW(
             parameter_groups,
@@ -63,13 +64,13 @@ class OptimizerConfig:
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "OptimizerConfig":
-        with open(path, "r") as f:
+        with open(path) as f:
             return cls(**yaml.full_load(f))
 
 
 def _match_parameters(
     module: nn.Module,
-    keys: Tuple[str, ...],
+    keys: tuple[str, ...],
     prefix: str = "",
 ) -> Iterator[nn.Parameter]:
     # Check direct parameters of the current module
@@ -91,10 +92,10 @@ def _match_parameters(
 
 def _assign_parameter_groups(
     model: nn.Module,
-    parameter_groups: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    assigned_groups: List[Dict[str, Any]] = []
-    assigned_params: Set[nn.Parameter] = set()
+    parameter_groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    assigned_groups: list[dict[str, Any]] = []
+    assigned_params: set[nn.Parameter] = set()
     for config in parameter_groups:
         keys = config["params"]
         params = set(p for p in _match_parameters(model, keys) if p.requires_grad)

@@ -199,7 +199,6 @@ class TestYAMLConfig:
 
 
 class TestComputeSigREGLoss:
-
     @pytest.mark.parametrize(
         "x_shape",
         [
@@ -344,9 +343,9 @@ class TestCrossAttentionPredictor:
         param_count = 0
         for name, param in predictor.named_parameters():
             param_count += 1
-            assert (
-                param.dtype == backbone.config.dtype
-            ), f"Parameter {name} has dtype {param.dtype}, expected {backbone.config.dtype}"
+            assert param.dtype == backbone.config.dtype, (
+                f"Parameter {name} has dtype {param.dtype}, expected {backbone.config.dtype}"
+            )
 
         # Ensure we actually checked some parameters
         assert param_count > 0, "No parameters found in predictor"
