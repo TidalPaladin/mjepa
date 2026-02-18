@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -9,11 +12,16 @@ matplotlib.use("Agg")  # Use non-interactive backend for testing
 
 import matplotlib.pyplot as plt  # type: ignore[import]  # noqa: E402
 
-from mjepa.visualization.cosine import cosine_similarity_heatmap  # noqa: E402
+from mjepa.visualization.cosine import cosine_similarity_heatmap, load_image as cosine_load_image  # noqa: E402
 from mjepa.visualization.norm import create_norm_histogram  # noqa: E402
-from mjepa.visualization.pca import pca_topk  # noqa: E402
+from mjepa.visualization.pca import load_image as pca_load_image, pca_topk  # noqa: E402
 from mjepa.visualization.pos_enc import create_pos_enc_maps  # noqa: E402
 from mjepa.visualization.runtime import plot_times  # noqa: E402
+
+
+TEST_IMAGE_SIZE = (8, 8)
+TEST_IMAGE_PATH = Path("missing-image.tiff")
+MISSING_DICOM_IMPORT_HINT = "pip install mjepa\\[dicom\\]"
 
 
 class TestPCATopK:
@@ -349,3 +357,12 @@ class TestPlotTimes:
 
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
+
+
+class TestOptionalDicomDependency:
+    @pytest.mark.parametrize("load_image_func", [pca_load_image, cosine_load_image])
+    def test_load_image_requires_dicom_extra(self, monkeypatch: pytest.MonkeyPatch, load_image_func):
+        monkeypatch.setitem(sys.modules, "dicom_preprocessing", None)
+
+        with pytest.raises(ModuleNotFoundError, match=MISSING_DICOM_IMPORT_HINT):
+            load_image_func(TEST_IMAGE_PATH, TEST_IMAGE_SIZE)
