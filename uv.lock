@@ -351,7 +351,6 @@ wheels = [
 name = "mjepa"
 source = { editable = "." }
 dependencies = [
-    { name = "dicom-preprocessing" },
     { name = "einops" },
     { name = "ninja" },
     { name = "pandas" },
@@ -364,6 +363,11 @@ dependencies = [
     { name = "tqdm" },
     { name = "vit" },
     { name = "wandb" },
+]
+
+[package.optional-dependencies]
+dicom = [
+    { name = "dicom-preprocessing" },
 ]
 
 [package.dev-dependencies]
@@ -380,7 +384,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dicom-preprocessing", git = "https://github.com/medcognetics/dicom-preprocessing.git" },
+    { name = "dicom-preprocessing", marker = "extra == 'dicom'", git = "https://github.com/medcognetics/dicom-preprocessing.git" },
     { name = "einops" },
     { name = "ninja" },
     { name = "pandas" },
@@ -394,6 +398,7 @@ requires-dist = [
     { name = "vit", git = "https://github.com/TidalPaladin/vit.git" },
     { name = "wandb", specifier = ">=0.23.0" },
 ]
+provides-extras = ["dicom"]
 
 [package.metadata.requires-dev]
 dev = [

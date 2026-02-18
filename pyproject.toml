@@ -24,12 +24,16 @@ dependencies = [
     "safetensors",
     "tqdm",
     "vit @ git+https://github.com/TidalPaladin/vit.git",
-    "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
     "wandb>=0.23.0",
 ]
 readme = "README.md"
 dynamic = [
     "version",
+]
+
+[project.optional-dependencies]
+dicom = [
+    "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
 ]
 
 [dependency-groups]

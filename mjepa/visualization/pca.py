@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from dicom_preprocessing import load_tiff_f32
 from einops import rearrange, reduce
 from torch import Tensor
 from torchvision.transforms.v2.functional import to_pil_image
@@ -80,6 +79,13 @@ def pca_topk(features: Tensor, offset: int = 0, k: int = 3, normalize: Sequence[
 def load_image(path: Path, size: Sequence[int]) -> Tensor:
     """Load and preprocess an image file."""
     if path.suffix.lower() in (".tiff", ".tif"):
+        try:
+            from dicom_preprocessing import load_tiff_f32
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "TIFF loading requires optional dependency 'dicom-preprocessing'. "
+                "Install with `pip install mjepa[dicom]`."
+            ) from exc
         img = load_tiff_f32(path)
         img = rearrange(img, "n h w c -> n c h w")
         img = torch.from_numpy(img)
