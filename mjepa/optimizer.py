@@ -29,9 +29,14 @@ class OptimizerConfig:
 
     # Parameter groups
     parameter_groups: list[dict[str, Any]] = field(default_factory=list)
+    skip_weight_decay_on_1d: bool = False
 
     def instantiate(self, model: nn.Module, total_steps: int) -> tuple[Optimizer, LRScheduler]:
-        parameter_groups = _assign_parameter_groups(model, self.parameter_groups)
+        parameter_groups = _assign_parameter_groups(
+            model,
+            self.parameter_groups,
+            skip_weight_decay_on_1d=self.skip_weight_decay_on_1d,
+        )
         optimizer = AdamW(
             parameter_groups,
             lr=self.lr,
@@ -93,6 +98,7 @@ def _match_parameters(
 def _assign_parameter_groups(
     model: nn.Module,
     parameter_groups: list[dict[str, Any]],
+    skip_weight_decay_on_1d: bool = False,
 ) -> list[dict[str, Any]]:
     assigned_groups: list[dict[str, Any]] = []
     assigned_params: set[nn.Parameter] = set()
@@ -105,8 +111,17 @@ def _assign_parameter_groups(
             kwargs = {k: v for k, v in config.items() if k != "params"}
             assigned_groups.append({"params": list(params), **kwargs})
         assigned_params.update(params)
+
+    remaining_trainable_params = [p for p in model.parameters() if p.requires_grad and p not in assigned_params]
+    if skip_weight_decay_on_1d:
+        no_decay_1d_params = [p for p in remaining_trainable_params if p.ndim == 1]
+        if no_decay_1d_params:
+            assigned_groups.append({"params": no_decay_1d_params, "weight_decay": 0.0})
+            assigned_params.update(no_decay_1d_params)
+            remaining_trainable_params = [p for p in remaining_trainable_params if p.ndim != 1]
+
     # Default param group
-    assigned_groups.append({"params": [p for p in model.parameters() if p not in assigned_params and p.requires_grad]})
+    assigned_groups.append({"params": remaining_trainable_params})
     return assigned_groups
 
 

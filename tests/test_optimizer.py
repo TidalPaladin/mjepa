@@ -39,6 +39,7 @@ class TestOptimizerConfigInit:
         assert config.div_factor == 10.0
         assert config.final_div_factor == 1e4
         assert config.parameter_groups == []
+        assert config.skip_weight_decay_on_1d is False
 
     def test_custom_values(self):
         """Test OptimizerConfig with custom values."""
@@ -56,6 +57,7 @@ class TestOptimizerConfigInit:
             div_factor=5.0,
             final_div_factor=1e3,
             parameter_groups=[{"params": ("bias",), "weight_decay": 0.0}],
+            skip_weight_decay_on_1d=True,
         )
         assert config.lr == 5e-4
         assert config.weight_decay == 0.05
@@ -70,6 +72,7 @@ class TestOptimizerConfigInit:
         assert config.div_factor == 5.0
         assert config.final_div_factor == 1e3
         assert len(config.parameter_groups) == 1
+        assert config.skip_weight_decay_on_1d is True
 
     def test_frozen_dataclass(self):
         """Test that OptimizerConfig is frozen (immutable)."""
@@ -142,6 +145,27 @@ class TestOptimizerConfigInstantiate:
         # Should have at least 2 parameter groups: bias group and default group
         assert len(optimizer.param_groups) >= 2
 
+    def test_instantiate_skip_weight_decay_on_1d(self, simple_model):
+        """Test instantiate can disable weight decay on 1D parameters."""
+        base_weight_decay = 0.01
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=base_weight_decay,
+            betas=(0.9, 0.999),
+            scheduled=False,
+            fused=False,
+            skip_weight_decay_on_1d=True,
+        )
+        optimizer, _ = config.instantiate(simple_model, total_steps=1000)
+
+        weight_decay_by_param_id = {
+            id(param): group["weight_decay"] for group in optimizer.param_groups for param in group["params"]
+        }
+
+        for param in simple_model.parameters():
+            expected_weight_decay = 0.0 if param.ndim == 1 else base_weight_decay
+            assert weight_decay_by_param_id[id(param)] == expected_weight_decay
+
     def test_instantiate_linear_scheduler_warmup_steps(self, simple_model):
         """Test LinearLR has correct warmup steps based on pct_start."""
         config = OptimizerConfig(
@@ -202,6 +226,7 @@ scheduled: false
         # YAML loads lists, not tuples
         assert list(config.betas) == [0.9, 0.999]
         assert config.scheduled is False
+        assert config.skip_weight_decay_on_1d is False
 
     def test_from_yaml_with_parameter_groups(self):
         """Test loading OptimizerConfig with parameter groups from YAML."""
@@ -226,6 +251,23 @@ parameter_groups:
         assert config.scheduled is True
         assert len(config.parameter_groups) == 1
         assert config.parameter_groups[0]["weight_decay"] == 0.0
+
+    def test_from_yaml_with_skip_weight_decay_on_1d(self):
+        """Test loading OptimizerConfig with 1D weight decay skip."""
+        yaml_content = """
+lr: 0.001
+weight_decay: 0.01
+betas:
+  - 0.9
+  - 0.999
+skip_weight_decay_on_1d: true
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            config = OptimizerConfig.from_yaml(Path(f.name))
+
+        assert config.skip_weight_decay_on_1d is True
 
 
 class TestYAMLConfig:
@@ -402,3 +444,13 @@ class TestAssignParameterGroups:
         total_params = sum(len(g["params"]) for g in groups)
         trainable_params = sum(1 for p in simple_model.parameters() if p.requires_grad)
         assert total_params == trainable_params
+
+    def test_skip_weight_decay_on_1d_groups(self, simple_model):
+        """Test 1D trainable parameters get assigned to no-decay group."""
+        groups = _assign_parameter_groups(simple_model, [], skip_weight_decay_on_1d=True)
+
+        no_decay_group = next((group for group in groups if group.get("weight_decay") == 0.0), None)
+        expected_1d_params = [param for param in simple_model.parameters() if param.requires_grad and param.ndim == 1]
+        assert no_decay_group is not None
+        assert all(param.ndim == 1 for param in no_decay_group["params"])
+        assert len(no_decay_group["params"]) == len(expected_1d_params)
