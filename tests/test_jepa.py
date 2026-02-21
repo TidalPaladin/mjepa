@@ -9,6 +9,7 @@ from vit import ViTConfig
 from mjepa.jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
+    compute_cls_patch_ortho_energy,
     compute_gram_loss,
     compute_sigreg_loss,
     config_constructor,
@@ -107,6 +108,7 @@ class TestJEPAConfig:
         assert config.scale == 4
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
+        assert config.cls_patch_ortho_loss_weight == 0.0
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -257,6 +259,39 @@ class TestComputeSigREGLoss:
         assert isotropic_loss < non_isotropic_loss
         assert not torch.isnan(isotropic_loss)
         assert not torch.isnan(non_isotropic_loss)
+
+
+class TestComputeClsPatchOrthoEnergy:
+    def test_basic_cls_patch_ortho_energy(self):
+        """Test basic orthogonality energy computation."""
+        cls_tokens = torch.randn(2, 3, 16)
+        patch_tokens = torch.randn(2, 8, 16)
+
+        loss = compute_cls_patch_ortho_energy(cls_tokens, patch_tokens)
+
+        assert loss.shape == ()
+        assert loss.item() >= 0
+        assert not torch.isnan(loss)
+
+    def test_cls_patch_ortho_energy_deterministic(self):
+        """Test orthogonality energy is deterministic for identical inputs."""
+        cls_tokens = torch.randn(2, 3, 16)
+        patch_tokens = torch.randn(2, 8, 16)
+
+        loss1 = compute_cls_patch_ortho_energy(cls_tokens, patch_tokens)
+        loss2 = compute_cls_patch_ortho_energy(cls_tokens, patch_tokens)
+
+        assert torch.allclose(loss1, loss2)
+
+    def test_cls_patch_ortho_energy_orthogonal_case(self):
+        """Test orthogonality energy is near zero for orthogonal vectors."""
+        cls_tokens = torch.tensor([[[1.0, 0.0]]])
+        patch_tokens = torch.tensor([[[0.0, 1.0]]])
+
+        loss = compute_cls_patch_ortho_energy(cls_tokens, patch_tokens)
+
+        assert loss.item() >= 0
+        assert loss.item() < 1e-8
 
 
 class TestCrossAttentionPredictor:
@@ -700,6 +735,11 @@ class TestJEPAConfigValidation:
         with pytest.raises(ValueError):
             JEPAConfig(sigreg_loss_weight=-0.1)
 
+    def test_invalid_cls_patch_ortho_loss_weight(self):
+        """Test invalid cls_patch_ortho_loss_weight."""
+        with pytest.raises(ValueError):
+            JEPAConfig(cls_patch_ortho_loss_weight=-0.1)
+
     def test_valid_gram_config(self):
         """Test valid Gram configuration."""
         config = JEPAConfig(
@@ -710,6 +750,8 @@ class TestJEPAConfigValidation:
             gram_remove_neg=True,
             gram_loss_weight=0.5,
             sigreg_loss_weight=1e-3,
+            cls_patch_ortho_loss_weight=0.01,
         )
         assert config.gram_teacher_epoch == 50
         assert config.gram_start_epoch == 100
+        assert config.cls_patch_ortho_loss_weight == 0.01

@@ -232,6 +232,25 @@ def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True, 
     return F.mse_loss(student_sim, teacher_sim)
 
 
+def compute_cls_patch_ortho_energy(cls_tokens: Tensor, patch_tokens: Tensor) -> Tensor:
+    r"""Penalize squared projection of CLS tokens on patch-token directions.
+
+    Args:
+        cls_tokens: CLS tokens.
+        patch_tokens: Patch tokens.
+
+    Shapes:
+        cls_tokens: :math:`(B, C, D)`
+        patch_tokens: :math:`(B, N, D)`
+        Output: Scalar
+
+    Returns:
+        The orthogonality energy.
+    """
+    projections = torch.einsum("bcd,bnd->bcn", cls_tokens, patch_tokens)
+    return projections.square().mean()
+
+
 def is_gram_update_epoch(epoch: int, gram_start_epoch: int | None, gram_update_interval_epoch: int) -> bool:
     r"""Check if the current epoch is a Gram update epoch.
 
@@ -359,6 +378,7 @@ class JEPAConfig:
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
         gram_loss_weight: The coefficient of the Gram loss.
         sigreg_loss_weight: The coefficient of the SigREG loss.
+        cls_patch_ortho_loss_weight: The coefficient of the CLS-patch orthogonality loss.
     """
 
     context_ratio: float = 0.5
@@ -374,6 +394,7 @@ class JEPAConfig:
     gram_remove_neg: bool = False
     gram_loss_weight: float = 1.0
     sigreg_loss_weight: float = 1e-4
+    cls_patch_ortho_loss_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0 < self.context_ratio <= 1:
@@ -394,6 +415,8 @@ class JEPAConfig:
             raise ValueError("gram_loss_weight must be a positive float")
         if self.sigreg_loss_weight < 0:
             raise ValueError("sigreg_loss_weight must be a non-negative float")
+        if self.cls_patch_ortho_loss_weight < 0:
+            raise ValueError("cls_patch_ortho_loss_weight must be a non-negative float")
 
 
 def config_constructor(loader, node):
