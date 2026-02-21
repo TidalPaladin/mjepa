@@ -11,6 +11,7 @@ from vit.tokens import apply_mask
 from .jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
+    compute_cls_patch_ortho_energy,
     compute_gram_loss,
     compute_sigreg_loss,
     forward_gram_teacher,
@@ -29,9 +30,11 @@ class MJEPALosses:
     jepa_loss_cls: Tensor | float
     sigreg_loss: Tensor | float
     gram_loss: Tensor | float
+    cls_patch_ortho_loss: Tensor | float
 
     gram_loss_weight: float = 1.0
     sigreg_loss_weight: float = 1e-4
+    cls_patch_ortho_loss_weight: float = 0.0
 
     def reduce(self) -> Tensor:
         loss = (
@@ -39,6 +42,7 @@ class MJEPALosses:
             + self.jepa_loss_cls
             + self.gram_loss * self.gram_loss_weight
             + self.sigreg_loss * self.sigreg_loss_weight
+            + self.cls_patch_ortho_loss * self.cls_patch_ortho_loss_weight
         )
         assert isinstance(loss, Tensor)
         return loss
@@ -153,13 +157,26 @@ class MJEPA(nn.Module):
         else:
             gram_loss = 0.0
 
+        # Compute CLS-patch orthogonality loss
+        cls_tokens = output.student_output.cls_tokens
+        patch_tokens = output.student_output.visual_tokens
+        if self.config.cls_patch_ortho_loss_weight > 0 and cls_tokens.numel() > 0 and patch_tokens.numel() > 0:
+            cls_patch_ortho_loss = compute_cls_patch_ortho_energy(
+                cls_tokens.float(),
+                patch_tokens.float(),
+            )
+        else:
+            cls_patch_ortho_loss = 0.0
+
         return MJEPALosses(
             jepa_loss=jepa_loss,
             jepa_loss_cls=jepa_loss_cls,
             sigreg_loss=sigreg_loss,
             gram_loss=gram_loss,
+            cls_patch_ortho_loss=cls_patch_ortho_loss,
             gram_loss_weight=self.config.gram_loss_weight,
             sigreg_loss_weight=self.config.sigreg_loss_weight,
+            cls_patch_ortho_loss_weight=self.config.cls_patch_ortho_loss_weight,
         )
 
     def forward(self, x: Tensor, jepa_scale: int, epoch: int) -> MJEPAPredictions:

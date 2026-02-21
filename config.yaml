@@ -68,6 +68,7 @@ jepa: !!python/object:mjepa.JEPAConfig
   gram_remove_neg: false
   gram_loss_weight: 1.0
   sigreg_loss_weight: 0.0001
+  cls_patch_ortho_loss_weight: 0.0
 
 optimizer: !!python/object:mjepa.OptimizerConfig
   lr: 0.0005

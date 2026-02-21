@@ -23,6 +23,7 @@ def jepa_config():
         gram_remove_neg=False,
         gram_loss_weight=1.0,
         sigreg_loss_weight=0.0001,
+        cls_patch_ortho_loss_weight=0.0,
     )
 
 
@@ -39,6 +40,7 @@ def jepa_config_no_gram():
         gram_start_epoch=None,
         gram_loss_weight=1.0,
         sigreg_loss_weight=0.0001,
+        cls_patch_ortho_loss_weight=0.0,
     )
 
 
@@ -115,22 +117,27 @@ class TestMJEPALosses:
         jepa_loss_cls = torch.tensor(0.5)
         sigreg_loss = torch.tensor(0.01)
         gram_loss = torch.tensor(0.1)
+        cls_patch_ortho_loss = torch.tensor(0.2)
 
         losses = MJEPALosses(
             jepa_loss=jepa_loss,
             jepa_loss_cls=jepa_loss_cls,
             sigreg_loss=sigreg_loss,
             gram_loss=gram_loss,
+            cls_patch_ortho_loss=cls_patch_ortho_loss,
             gram_loss_weight=1.0,
             sigreg_loss_weight=1e-4,
+            cls_patch_ortho_loss_weight=0.01,
         )
 
         assert losses.jepa_loss == jepa_loss
         assert losses.jepa_loss_cls == jepa_loss_cls
         assert losses.sigreg_loss == sigreg_loss
         assert losses.gram_loss == gram_loss
+        assert losses.cls_patch_ortho_loss == cls_patch_ortho_loss
         assert losses.gram_loss_weight == 1.0
         assert losses.sigreg_loss_weight == 1e-4
+        assert losses.cls_patch_ortho_loss_weight == 0.01
 
     def test_initialization_with_float_losses(self):
         """Test that MJEPALosses can be initialized with float values."""
@@ -141,39 +148,50 @@ class TestMJEPALosses:
             jepa_loss_cls=0.5,
             sigreg_loss=0.01,
             gram_loss=0.1,
+            cls_patch_ortho_loss=0.2,
         )
 
         assert losses.jepa_loss == jepa_loss
         assert losses.jepa_loss_cls == 0.5
         assert losses.sigreg_loss == 0.01
         assert losses.gram_loss == 0.1
+        assert losses.cls_patch_ortho_loss == 0.2
 
     @pytest.mark.parametrize(
-        "gram_weight,sigreg_weight",
+        "gram_weight,sigreg_weight,cls_patch_ortho_weight",
         [
-            (1.0, 1e-4),
-            (0.5, 1e-3),
-            (2.0, 0.0),
+            (1.0, 1e-4, 0.01),
+            (0.5, 1e-3, 0.0),
+            (2.0, 0.0, 0.5),
         ],
     )
-    def test_reduce(self, gram_weight, sigreg_weight):
+    def test_reduce(self, gram_weight, sigreg_weight, cls_patch_ortho_weight):
         """Test that reduce combines losses correctly."""
         jepa_loss = torch.tensor(1.0)
         jepa_loss_cls = torch.tensor(0.5)
         sigreg_loss = torch.tensor(0.01)
         gram_loss = torch.tensor(0.1)
+        cls_patch_ortho_loss = torch.tensor(0.2)
 
         losses = MJEPALosses(
             jepa_loss=jepa_loss,
             jepa_loss_cls=jepa_loss_cls,
             sigreg_loss=sigreg_loss,
             gram_loss=gram_loss,
+            cls_patch_ortho_loss=cls_patch_ortho_loss,
             gram_loss_weight=gram_weight,
             sigreg_loss_weight=sigreg_weight,
+            cls_patch_ortho_loss_weight=cls_patch_ortho_weight,
         )
 
         reduced = losses.reduce()
-        expected = jepa_loss + jepa_loss_cls + gram_loss * gram_weight + sigreg_loss * sigreg_weight
+        expected = (
+            jepa_loss
+            + jepa_loss_cls
+            + gram_loss * gram_weight
+            + sigreg_loss * sigreg_weight
+            + cls_patch_ortho_loss * cls_patch_ortho_weight
+        )
 
         assert isinstance(reduced, torch.Tensor)
         assert torch.allclose(reduced, expected)
@@ -184,14 +202,17 @@ class TestMJEPALosses:
         jepa_loss_cls = torch.tensor(0.5)
         sigreg_loss = 0.01
         gram_loss = 0.1
+        cls_patch_ortho_loss = 0.2
 
         losses = MJEPALosses(
             jepa_loss=jepa_loss,
             jepa_loss_cls=jepa_loss_cls,
             sigreg_loss=sigreg_loss,
             gram_loss=gram_loss,
+            cls_patch_ortho_loss=cls_patch_ortho_loss,
             gram_loss_weight=0.0,
             sigreg_loss_weight=0.0,
+            cls_patch_ortho_loss_weight=0.0,
         )
 
         reduced = losses.reduce()
@@ -520,6 +541,58 @@ class TestMJEPATeacherUpdate:
 class TestMJEPAComputeLosses:
     """Test MJEPA loss computation."""
 
+    BATCH_SIZE = 2
+    NUM_TARGET_TOKENS = 16
+    NUM_PATCH_TOKENS = 64
+    HIDDEN_SIZE = 64
+
+    @classmethod
+    def _build_model_and_predictions(
+        cls,
+        *,
+        num_cls_tokens: int,
+        sigreg_loss_weight: float,
+        cls_patch_ortho_loss_weight: float,
+    ) -> tuple[MJEPA, MJEPAPredictions]:
+        config = JEPAConfig(
+            gram_start_epoch=None,
+            sigreg_loss_weight=sigreg_loss_weight,
+            cls_patch_ortho_loss_weight=cls_patch_ortho_loss_weight,
+        )
+        vit_config = ViTConfig(
+            in_channels=3,
+            hidden_size=cls.HIDDEN_SIZE,
+            patch_size=[4, 4],
+            img_size=[32, 32],
+            depth=2,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            num_cls_tokens=num_cls_tokens,
+        )
+        backbone = vit_config.instantiate()
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        model = MJEPA(config, backbone, predictor)
+
+        pred = torch.randn(cls.BATCH_SIZE, cls.NUM_TARGET_TOKENS, cls.HIDDEN_SIZE)
+        pred_with_cls = (
+            torch.randn(cls.BATCH_SIZE, cls.NUM_TARGET_TOKENS, cls.HIDDEN_SIZE) if num_cls_tokens > 0 else None
+        )
+        dense_features = torch.randn(cls.BATCH_SIZE, cls.NUM_PATCH_TOKENS + num_cls_tokens, cls.HIDDEN_SIZE)
+        student_output = ViTFeatures(dense_features, 0, num_cls_tokens)
+        teacher_output = ViTFeatures(dense_features.clone(), 0, num_cls_tokens)
+        target_mask = torch.zeros(cls.BATCH_SIZE, cls.NUM_PATCH_TOKENS, dtype=torch.bool)
+        target_mask[:, : cls.NUM_TARGET_TOKENS] = True
+
+        predictions = MJEPAPredictions(
+            pred=pred,
+            pred_with_cls=pred_with_cls,
+            student_output=student_output,
+            teacher_output=teacher_output,
+            target_mask=target_mask,
+            context_mask=target_mask,
+        )
+        return model, predictions
+
     def test_compute_losses_basic(self, mjepa_model_no_gram: MJEPA):
         """Test basic loss computation without gram loss."""
         pred = torch.randn(2, 16, 64)
@@ -555,47 +628,14 @@ class TestMJEPAComputeLosses:
         # sigreg_loss can be a Tensor or 0.0 depending on config
         assert isinstance(losses.sigreg_loss, (torch.Tensor, float))
         assert losses.gram_loss == 0.0  # no gram teacher
+        assert losses.cls_patch_ortho_loss == 0.0
 
     def test_compute_losses_with_sigreg(self):
         """Test loss computation with SigREG loss enabled."""
-        config = JEPAConfig(
-            sigreg_loss_weight=1e-4,
-            gram_start_epoch=None,
-        )
-        vit_config = ViTConfig(
-            in_channels=3,
-            hidden_size=64,
-            patch_size=[4, 4],
-            img_size=[32, 32],
-            depth=2,
-            num_attention_heads=4,
-            ffn_hidden_size=128,
+        model, predictions = self._build_model_and_predictions(
             num_cls_tokens=2,
-        )
-        backbone = vit_config.instantiate()
-        predictor = CrossAttentionPredictor(backbone, depth=2)
-        model = MJEPA(config, backbone, predictor)
-
-        pred = torch.randn(2, 16, 64)
-        pred_with_cls = torch.randn(2, 16, 64)
-
-        batch_size = 2
-        num_tokens = 64
-        hidden_size = 64
-        dense_features = torch.randn(batch_size, num_tokens + 2, hidden_size)
-        student_output = ViTFeatures(dense_features, 0, 2)
-        teacher_output = ViTFeatures(dense_features.clone(), 0, 2)
-
-        target_mask = torch.zeros(2, 64, dtype=torch.bool)
-        target_mask[:, :16] = True
-
-        predictions = MJEPAPredictions(
-            pred=pred,
-            pred_with_cls=pred_with_cls,
-            student_output=student_output,
-            teacher_output=teacher_output,
-            target_mask=target_mask,
-            context_mask=target_mask,
+            sigreg_loss_weight=1e-4,
+            cls_patch_ortho_loss_weight=0.0,
         )
         losses = model.compute_losses(
             output=predictions,
@@ -605,6 +645,39 @@ class TestMJEPAComputeLosses:
 
         assert isinstance(losses.sigreg_loss, torch.Tensor)
         assert losses.sigreg_loss.item() > 0
+        assert losses.cls_patch_ortho_loss == 0.0
+
+    def test_compute_losses_with_cls_patch_ortho(self):
+        """Test loss computation with CLS-patch orthogonality loss enabled."""
+        model, predictions = self._build_model_and_predictions(
+            num_cls_tokens=2,
+            sigreg_loss_weight=0.0,
+            cls_patch_ortho_loss_weight=0.1,
+        )
+        losses = model.compute_losses(
+            output=predictions,
+            step=0,
+            epoch=0,
+        )
+
+        assert isinstance(losses.cls_patch_ortho_loss, torch.Tensor)
+        assert torch.isfinite(losses.cls_patch_ortho_loss)
+        assert losses.cls_patch_ortho_loss.item() >= 0
+
+    def test_compute_losses_cls_patch_ortho_no_cls_tokens(self):
+        """Test CLS-patch orthogonality loss is zero when no CLS tokens exist."""
+        model, predictions = self._build_model_and_predictions(
+            num_cls_tokens=0,
+            sigreg_loss_weight=0.0,
+            cls_patch_ortho_loss_weight=0.1,
+        )
+        losses = model.compute_losses(
+            output=predictions,
+            step=0,
+            epoch=0,
+        )
+
+        assert losses.cls_patch_ortho_loss == 0.0
 
     def test_compute_losses_with_gram(self, mjepa_model: MJEPA):
         """Test loss computation with Gram loss."""
