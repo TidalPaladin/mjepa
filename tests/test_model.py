@@ -356,6 +356,16 @@ class TestMJEPAForwardPasses:
         assert torch.allclose(output, expected)
         assert not output.requires_grad
 
+    def test_forward_gram_anchor_stop_gradient(self, mjepa_model: MJEPA, dummy_batch):
+        """Test that Gram anchor output is explicitly detached from autograd."""
+        context_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
+        dummy_batch.requires_grad_(True)
+
+        output = mjepa_model.forward_gram_anchor(dummy_batch, context_mask)
+
+        assert not output.requires_grad
+        assert output.grad_fn is None
+
 
 class TestMJEPATeacherUpdate:
     """Test MJEPA teacher update methods."""
