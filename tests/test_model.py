@@ -1,6 +1,7 @@
 import pytest
 import torch
 from vit import ViT, ViTConfig, ViTFeatures
+from vit.tokens import apply_mask
 
 from mjepa.jepa import CrossAttentionPredictor, JEPAConfig
 from mjepa.model import MJEPA, MJEPALosses, MJEPAPredictions
@@ -16,10 +17,7 @@ def jepa_config():
         momentum=0.98,
         predictor_depth=2,
         scheduled=False,
-        gram_teacher_epoch=10,
         gram_start_epoch=20,
-        gram_update_interval_epoch=5,
-        gram_resolution_scale=1.0,
         gram_remove_neg=False,
         gram_loss_weight=1.0,
         sigreg_loss_weight=0.0001,
@@ -82,7 +80,7 @@ def mjepa_model(jepa_config, small_vit, predictor):
 
 @pytest.fixture
 def mjepa_model_no_gram(jepa_config_no_gram, small_vit, predictor):
-    """Create an MJEPA model without Gram teacher for testing."""
+    """Create an MJEPA model without Gram loss for testing."""
     return MJEPA(jepa_config_no_gram, small_vit, predictor, dtype=torch.float32)
 
 
@@ -227,7 +225,7 @@ class TestMJEPAPredictions:
         assert predictions.teacher_output == dummy_vit_features
         assert torch.all(predictions.context_mask == context_mask)
         assert torch.all(predictions.target_mask == target_mask)
-        assert predictions.gram_teacher_output is None
+        assert predictions.gram_anchor_output is None
         assert predictions.probes == {}
 
     def test_initialization_with_optional_fields(self, dummy_vit_features):
@@ -236,7 +234,7 @@ class TestMJEPAPredictions:
         pred_with_cls = torch.randn(2, 16, 64)
         context_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
         target_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
-        gram_teacher_output = torch.randn(2, 64, 64)
+        gram_anchor_output = torch.randn(2, 64, 64)
         probes = {"probe1": torch.randn(2, 10)}
 
         predictions = MJEPAPredictions(
@@ -246,12 +244,12 @@ class TestMJEPAPredictions:
             teacher_output=dummy_vit_features,
             context_mask=context_mask,
             target_mask=target_mask,
-            gram_teacher_output=gram_teacher_output,
+            gram_anchor_output=gram_anchor_output,
             probes=probes,
         )
 
-        assert predictions.gram_teacher_output is not None
-        assert torch.allclose(predictions.gram_teacher_output, gram_teacher_output)
+        assert predictions.gram_anchor_output is not None
+        assert torch.allclose(predictions.gram_anchor_output, gram_anchor_output)
         assert "probe1" in predictions.probes
         assert torch.allclose(predictions.probes["probe1"], probes["probe1"])
 
@@ -272,22 +270,14 @@ class TestMJEPAInitialization:
         assert mjepa_model.predictor == predictor
         assert mjepa_model.dtype == torch.float32
         assert mjepa_model.teacher is not None
-        assert mjepa_model.gram_teacher is not None
 
     def test_initialization_no_gram(self, mjepa_model_no_gram):
-        """Test that MJEPA model without Gram teacher is initialized correctly."""
-        assert mjepa_model_no_gram.gram_teacher is None
+        """Test that MJEPA model without Gram loss is initialized correctly."""
         assert mjepa_model_no_gram.config.gram_start_epoch is None
 
     def test_teacher_frozen(self, mjepa_model):
         """Test that teacher parameters are frozen."""
         for param in mjepa_model.teacher.parameters():
-            assert not param.requires_grad
-
-    def test_gram_teacher_frozen(self, mjepa_model):
-        """Test that gram teacher parameters are frozen."""
-        assert mjepa_model.gram_teacher is not None
-        for param in mjepa_model.gram_teacher.parameters():
             assert not param.requires_grad
 
     def test_img_size_property(self, mjepa_model):
@@ -355,37 +345,16 @@ class TestMJEPAForwardPasses:
         assert isinstance(output, dict)
         assert len(output) == 0
 
-    def test_forward_gram_teacher(self, mjepa_model: MJEPA, dummy_batch):
-        """Test forward pass through gram teacher."""
+    def test_forward_gram_anchor(self, mjepa_model: MJEPA, dummy_batch):
+        """Test forward pass through detached stem-based Gram anchor."""
         context_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
-        output = mjepa_model.forward_gram_teacher(dummy_batch, context_mask)
+        output = mjepa_model.forward_gram_anchor(dummy_batch, context_mask)
+        expected = apply_mask(context_mask, mjepa_model.student.stem(dummy_batch), fill_value=None)
 
         assert isinstance(output, torch.Tensor)
         assert output.shape[0] == dummy_batch.shape[0]
-
-    def test_forward_gram_teacher_with_rope_seed(self, mjepa_model: MJEPA, dummy_batch):
-        """Test forward pass through gram teacher with rope seed."""
-        context_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
-        rope_seed = 12345
-        output = mjepa_model.forward_gram_teacher(dummy_batch, context_mask, rope_seed=rope_seed)
-
-        assert isinstance(output, torch.Tensor)
-        assert output.shape[0] == dummy_batch.shape[0]
-
-    def test_forward_gram_teacher_not_initialized(self, mjepa_model_no_gram: MJEPA, dummy_batch):
-        """Test that forward_gram_teacher raises error when gram teacher is not initialized."""
-        context_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
-
-        with pytest.raises(ValueError, match="Gram teacher is not initialized"):
-            mjepa_model_no_gram.forward_gram_teacher(dummy_batch, context_mask)
-
-    def test_forward_gram_teacher_eval_mode(self, mjepa_model: MJEPA, dummy_batch):
-        """Test that gram teacher is in eval mode during forward pass."""
-        context_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
-        assert mjepa_model.gram_teacher is not None
-        mjepa_model.gram_teacher.train()
-        _ = mjepa_model.forward_gram_teacher(dummy_batch, context_mask)
-        assert not mjepa_model.gram_teacher.training
+        assert torch.allclose(output, expected)
+        assert not output.requires_grad
 
 
 class TestMJEPATeacherUpdate:
@@ -446,76 +415,6 @@ class TestMJEPATeacherUpdate:
         assert not torch.allclose(weight_step_0, initial_weight)
         assert not torch.allclose(weight_step_50, weight_step_0)
 
-    def test_update_gram_teacher_initial_setup(self, mjepa_model: MJEPA):
-        """Test gram teacher initial setup at gram_teacher_epoch."""
-        # Modify regular teacher
-        mjepa_model.teacher.stem.patch.weight.data.fill_(1.0)
-
-        # Store initial gram teacher weights
-        assert mjepa_model.gram_teacher is not None
-        initial_gram_weight = mjepa_model.gram_teacher.stem.patch.weight.data.clone()
-
-        # Update gram teacher at gram_teacher_epoch (should copy from teacher)
-        mjepa_model.update_gram_teacher(current_epoch=10)
-
-        # Gram teacher should now match regular teacher
-        assert torch.allclose(
-            mjepa_model.gram_teacher.stem.patch.weight.data,
-            mjepa_model.teacher.stem.patch.weight.data,
-        )
-        assert not torch.allclose(
-            mjepa_model.gram_teacher.stem.patch.weight.data,
-            initial_gram_weight,
-        )
-
-    def test_update_gram_teacher_periodic_update(self, mjepa_model: MJEPA):
-        """Test gram teacher periodic update."""
-        # First initialize gram teacher at epoch 10
-        mjepa_model.update_gram_teacher(current_epoch=10)
-
-        # Modify teacher weights
-        mjepa_model.teacher.stem.patch.weight.data.fill_(2.0)
-
-        # Store gram teacher weights before update
-        assert mjepa_model.gram_teacher is not None
-        weights_before = mjepa_model.gram_teacher.stem.patch.weight.data.clone()
-
-        # Update at epoch 25 (gram_start_epoch=20, interval=5, so 20+5=25)
-        mjepa_model.update_gram_teacher(current_epoch=25)
-
-        # Gram teacher should be updated
-        assert not torch.allclose(
-            mjepa_model.gram_teacher.stem.patch.weight.data,
-            weights_before,
-        )
-
-    def test_update_gram_teacher_no_update_between_intervals(self, mjepa_model: MJEPA):
-        """Test that gram teacher is not updated between intervals."""
-        # Initialize at epoch 10
-        mjepa_model.update_gram_teacher(current_epoch=10)
-
-        # Store weights
-        assert mjepa_model.gram_teacher is not None
-        weights_after_init = mjepa_model.gram_teacher.stem.patch.weight.data.clone()
-
-        # Modify teacher
-        mjepa_model.teacher.stem.patch.weight.data.fill_(2.0)
-
-        # Update at epoch 22 (not at interval boundary)
-        mjepa_model.update_gram_teacher(current_epoch=22)
-
-        # Gram teacher should not have changed
-        assert torch.allclose(
-            mjepa_model.gram_teacher.stem.patch.weight.data,
-            weights_after_init,
-        )
-
-    def test_update_gram_teacher_no_gram(self, mjepa_model_no_gram):
-        """Test that update_gram_teacher does nothing when gram teacher is None."""
-        # Should not raise any errors
-        mjepa_model_no_gram.update_gram_teacher(current_epoch=10)
-        mjepa_model_no_gram.update_gram_teacher(current_epoch=20)
-
 
 class TestMJEPAComputeLosses:
     """Test MJEPA loss computation."""
@@ -554,7 +453,7 @@ class TestMJEPAComputeLosses:
         assert isinstance(losses.jepa_loss_cls, torch.Tensor)
         # sigreg_loss can be a Tensor or 0.0 depending on config
         assert isinstance(losses.sigreg_loss, (torch.Tensor, float))
-        assert losses.gram_loss == 0.0  # no gram teacher
+        assert losses.gram_loss == 0.0  # no gram anchor
 
     def test_compute_losses_with_sigreg(self):
         """Test loss computation with SigREG loss enabled."""
@@ -621,7 +520,7 @@ class TestMJEPAComputeLosses:
         target_mask = torch.zeros(2, 64, dtype=torch.bool)
         target_mask[:, :16] = True
 
-        gram_teacher_output = torch.randn(2, 64, 64)
+        gram_anchor_output = torch.randn(2, 64, 64)
 
         # Test with epoch >= gram_start_epoch
         predictions = MJEPAPredictions(
@@ -631,7 +530,7 @@ class TestMJEPAComputeLosses:
             teacher_output=teacher_output,
             target_mask=target_mask,
             context_mask=target_mask,
-            gram_teacher_output=gram_teacher_output,
+            gram_anchor_output=gram_anchor_output,
         )
         losses = mjepa_model.compute_losses(
             output=predictions,
@@ -690,7 +589,7 @@ class TestMJEPAComputeLosses:
         target_mask = torch.zeros(2, 64, dtype=torch.bool)
         target_mask[:, :16] = True
 
-        gram_teacher_output = torch.randn(2, 64, 64)
+        gram_anchor_output = torch.randn(2, 64, 64)
 
         predictions = MJEPAPredictions(
             pred=pred,
@@ -699,7 +598,7 @@ class TestMJEPAComputeLosses:
             teacher_output=teacher_output,
             target_mask=target_mask,
             context_mask=target_mask,
-            gram_teacher_output=gram_teacher_output,
+            gram_anchor_output=gram_anchor_output,
         )
         losses = mjepa_model.compute_losses(
             output=predictions,
@@ -714,7 +613,7 @@ class TestMJEPAForward:
     """Test the main MJEPA forward pass."""
 
     def test_forward_basic(self, mjepa_model_no_gram: MJEPA, dummy_batch):
-        """Test basic forward pass without gram teacher."""
+        """Test basic forward pass without Gram anchor."""
         mjepa_model_no_gram.eval()
 
         with torch.no_grad():
@@ -728,22 +627,22 @@ class TestMJEPAForward:
         assert isinstance(predictions.teacher_output, ViTFeatures)
         assert predictions.context_mask.shape[0] == dummy_batch.shape[0]
         assert predictions.target_mask.shape[0] == dummy_batch.shape[0]
-        assert predictions.gram_teacher_output is None
+        assert predictions.gram_anchor_output is None
 
     def test_forward_with_gram(self, mjepa_model, dummy_batch):
-        """Test forward pass with gram teacher."""
+        """Test forward pass with detached stem Gram anchor."""
         mjepa_model.eval()
 
         # Test before gram_start_epoch
         with torch.no_grad():
             predictions_before = mjepa_model(dummy_batch, jepa_scale=2, epoch=15)
-        assert predictions_before.gram_teacher_output is None
+        assert predictions_before.gram_anchor_output is None
 
         # Test after gram_start_epoch
         with torch.no_grad():
             predictions_after = mjepa_model(dummy_batch, jepa_scale=2, epoch=20)
-        assert predictions_after.gram_teacher_output is not None
-        assert isinstance(predictions_after.gram_teacher_output, torch.Tensor)
+        assert predictions_after.gram_anchor_output is not None
+        assert isinstance(predictions_after.gram_anchor_output, torch.Tensor)
 
     @pytest.mark.parametrize("jepa_scale", [1, 2, 4])
     def test_forward_different_scales(self, mjepa_model_no_gram, dummy_batch, jepa_scale):
@@ -833,23 +732,6 @@ class TestMJEPAEndToEnd:
 
         # Check that teacher was updated
         updated_weight = mjepa_model_no_gram.teacher.stem.patch.weight.data
-        assert not torch.allclose(updated_weight, initial_weight)
-
-    def test_gram_teacher_workflow(self, mjepa_model: MJEPA):
-        """Test the gram teacher update workflow."""
-        # Initialize gram teacher at epoch 10
-        mjepa_model.update_gram_teacher(current_epoch=10)
-        assert mjepa_model.gram_teacher is not None
-        initial_weight = mjepa_model.gram_teacher.stem.patch.weight.data.clone()
-
-        # Modify regular teacher
-        mjepa_model.teacher.stem.patch.weight.data.fill_(2.0)
-
-        # Update gram teacher at epoch 25
-        mjepa_model.update_gram_teacher(current_epoch=25)
-
-        # Check that gram teacher was updated
-        updated_weight = mjepa_model.gram_teacher.stem.patch.weight.data
         assert not torch.allclose(updated_weight, initial_weight)
 
     @pytest.mark.cuda

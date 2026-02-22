@@ -13,10 +13,8 @@ from .jepa import (
     JEPAConfig,
     compute_gram_loss,
     compute_sigreg_loss,
-    forward_gram_teacher,
     generate_masks,
     get_momentum,
-    is_gram_update_epoch,
     setup_teacher,
     update_teacher,
 )
@@ -53,7 +51,7 @@ class MJEPAPredictions:
     context_mask: Tensor
     target_mask: Tensor
 
-    gram_teacher_output: Tensor | None = None
+    gram_anchor_output: Tensor | None = None
     probes: dict[str, Tensor] = field(default_factory=dict)
 
 
@@ -70,7 +68,6 @@ class MJEPA(nn.Module):
         self.student = backbone
         self.teacher = setup_teacher(backbone)
         self.predictor = predictor
-        self.gram_teacher = setup_teacher(backbone) if config.gram_start_epoch is not None else None
         self.dtype = dtype
 
     @property
@@ -103,30 +100,11 @@ class MJEPA(nn.Module):
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
         return dict()
 
-    def forward_gram_teacher(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> Tensor:
-        if self.gram_teacher is None:
-            raise ValueError("Gram teacher is not initialized")
-
-        self.gram_teacher.eval()
+    def forward_gram_anchor(self, x: Tensor, context_mask: Tensor) -> Tensor:
         with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
-            gram_teacher_output = forward_gram_teacher(
-                self.gram_teacher,
-                x,
-                rope_seed=rope_seed,
-                resolution_scale=self.config.gram_resolution_scale,
-            )
-            gram_teacher_output = apply_mask(context_mask, gram_teacher_output, fill_value=None)
-        return gram_teacher_output.clone()
-
-    def update_gram_teacher(self, current_epoch: int):
-        if self.gram_teacher is None:
-            return
-        # Initial Gram teacher setup (if necessary)
-        if current_epoch == self.config.gram_teacher_epoch:
-            update_teacher(self.teacher, self.gram_teacher)
-        # Gram teacher update
-        if is_gram_update_epoch(current_epoch, self.config.gram_start_epoch, self.config.gram_update_interval_epoch):
-            update_teacher(self.teacher, self.gram_teacher)
+            stem_tokens = self.student.stem(x)
+            gram_anchor_output = apply_mask(context_mask, stem_tokens, fill_value=None)
+        return gram_anchor_output.clone()
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         # Compute JEPA loss
@@ -143,11 +121,11 @@ class MJEPA(nn.Module):
 
         # Compute Gram loss (if necessary)
         if self.config.gram_start_epoch is not None and epoch >= self.config.gram_start_epoch:
-            assert output.gram_teacher_output is not None
+            assert output.gram_anchor_output is not None
             assert self.config.gram_loss_weight > 0
             gram_loss = compute_gram_loss(
                 output.student_output.visual_tokens.float(),
-                output.gram_teacher_output.float(),
+                output.gram_anchor_output.float(),
                 remove_neg=self.config.gram_remove_neg,
             )
         else:
@@ -169,10 +147,10 @@ class MJEPA(nn.Module):
         )
 
         rope_seed = int(torch.randint(0, 1000000, (1,)).item())
-        # Teacher / Gram teacher forward pass
+        # Teacher / Gram anchor forward pass
         teacher_output = self.forward_teacher(x)
-        gram_teacher_output = (
-            self.forward_gram_teacher(x, context_mask, rope_seed)
+        gram_anchor_output = (
+            self.forward_gram_anchor(x, context_mask)
             if self.config.gram_start_epoch is not None and epoch >= self.config.gram_start_epoch
             else None
         )
@@ -199,7 +177,7 @@ class MJEPA(nn.Module):
             teacher_output=teacher_output,
             context_mask=context_mask,
             target_mask=target_mask,
-            gram_teacher_output=gram_teacher_output,
+            gram_anchor_output=gram_anchor_output,
             probes=probes,
         )
 
