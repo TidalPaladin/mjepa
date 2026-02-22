@@ -104,7 +104,7 @@ class MJEPA(nn.Module):
         with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
             stem_tokens = self.student.stem(x)
             gram_anchor_output = apply_mask(context_mask, stem_tokens, fill_value=None)
-        return gram_anchor_output.clone().detach()
+        return gram_anchor_output.detach()
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         # Compute JEPA loss
