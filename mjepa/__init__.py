@@ -1,6 +1,7 @@
 import importlib.metadata
 
 from .jepa import CrossAttentionPredictor, JEPAConfig
+from .metrics import CLSPatchAlignmentMetric
 from .optimizer import OptimizerConfig
 from .trainer import ResolutionConfig, TrainerConfig
 
@@ -12,4 +13,5 @@ __all__ = [
     "OptimizerConfig",
     "CrossAttentionPredictor",
     "ResolutionConfig",
+    "CLSPatchAlignmentMetric",
 ]
