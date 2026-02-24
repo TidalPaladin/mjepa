@@ -119,17 +119,15 @@ class MJEPA(nn.Module):
             else 0.0
         )
 
-        # Compute Gram loss (if necessary)
-        if self.config.gram_start_epoch is not None and epoch >= self.config.gram_start_epoch:
-            assert output.gram_anchor_output is not None
-            assert self.config.gram_loss_weight > 0
-            gram_loss = compute_gram_loss(
-                output.student_output.visual_tokens.float(),
-                output.gram_anchor_output.float(),
-                remove_neg=self.config.gram_remove_neg,
-            )
-        else:
-            gram_loss = 0.0
+        # Always compute Gram distance; detach before gram_start_epoch so it does not train the model.
+        assert output.gram_anchor_output is not None
+        gram_loss = compute_gram_loss(
+            output.student_output.visual_tokens.float(),
+            output.gram_anchor_output.float(),
+            remove_neg=self.config.gram_remove_neg,
+        )
+        if self.config.gram_start_epoch is None or epoch < self.config.gram_start_epoch:
+            gram_loss = gram_loss.detach()
 
         return MJEPALosses(
             jepa_loss=jepa_loss,
@@ -149,11 +147,7 @@ class MJEPA(nn.Module):
         rope_seed = int(torch.randint(0, 1000000, (1,)).item())
         # Teacher / Gram anchor forward pass
         teacher_output = self.forward_teacher(x)
-        gram_anchor_output = (
-            self.forward_gram_anchor(x, context_mask)
-            if self.config.gram_start_epoch is not None and epoch >= self.config.gram_start_epoch
-            else None
-        )
+        gram_anchor_output = self.forward_gram_anchor(x, context_mask)
 
         Ht, Wt = cast(tuple[int, int], self.student.stem.tokenized_size(x.shape[-2:]))
 

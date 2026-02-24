@@ -430,7 +430,7 @@ class TestMJEPAComputeLosses:
     """Test MJEPA loss computation."""
 
     def test_compute_losses_basic(self, mjepa_model_no_gram: MJEPA):
-        """Test basic loss computation without gram loss."""
+        """Test basic loss computation with always-on Gram distance."""
         pred = torch.randn(2, 16, 64)
         pred_with_cls = torch.randn(2, 16, 64)
 
@@ -451,6 +451,7 @@ class TestMJEPAComputeLosses:
             teacher_output=teacher_output,
             target_mask=target_mask,
             context_mask=target_mask,
+            gram_anchor_output=torch.randn(2, 64, 64),
         )
         losses = mjepa_model_no_gram.compute_losses(
             output=predictions,
@@ -463,7 +464,8 @@ class TestMJEPAComputeLosses:
         assert isinstance(losses.jepa_loss_cls, torch.Tensor)
         # sigreg_loss can be a Tensor or 0.0 depending on config
         assert isinstance(losses.sigreg_loss, (torch.Tensor, float))
-        assert losses.gram_loss == 0.0  # no gram anchor
+        assert isinstance(losses.gram_loss, torch.Tensor)
+        assert losses.gram_loss.item() >= 0
 
     def test_compute_losses_with_sigreg(self):
         """Test loss computation with SigREG loss enabled."""
@@ -505,6 +507,7 @@ class TestMJEPAComputeLosses:
             teacher_output=teacher_output,
             target_mask=target_mask,
             context_mask=target_mask,
+            gram_anchor_output=torch.randn(2, 64, 64),
         )
         losses = model.compute_losses(
             output=predictions,
@@ -523,7 +526,7 @@ class TestMJEPAComputeLosses:
         batch_size = 2
         num_tokens = 64
         hidden_size = 64
-        dense_features = torch.randn(batch_size, num_tokens + 4, hidden_size)
+        dense_features = torch.randn(batch_size, num_tokens + 4, hidden_size, requires_grad=True)
         student_output = ViTFeatures(dense_features, 2, 2)
         teacher_output = ViTFeatures(dense_features.clone(), 2, 2)
 
@@ -550,16 +553,17 @@ class TestMJEPAComputeLosses:
 
         assert isinstance(losses.gram_loss, torch.Tensor)
         assert losses.gram_loss.item() > 0
+        assert losses.gram_loss.requires_grad
 
     def test_compute_losses_gram_before_start_epoch(self, mjepa_model: MJEPA):
-        """Test that gram loss is zero before gram_start_epoch."""
+        """Test that gram loss is detached before gram_start_epoch."""
         pred = torch.randn(2, 16, 64)
         pred_with_cls = torch.randn(2, 16, 64)
 
         batch_size = 2
         num_tokens = 64
         hidden_size = 64
-        dense_features = torch.randn(batch_size, num_tokens + 4, hidden_size)
+        dense_features = torch.randn(batch_size, num_tokens + 4, hidden_size, requires_grad=True)
         student_output = ViTFeatures(dense_features, 2, 2)
         teacher_output = ViTFeatures(dense_features.clone(), 2, 2)
 
@@ -574,6 +578,7 @@ class TestMJEPAComputeLosses:
             teacher_output=teacher_output,
             target_mask=target_mask,
             context_mask=target_mask,
+            gram_anchor_output=torch.randn(2, 64, 64),
         )
         losses = mjepa_model.compute_losses(
             output=predictions,
@@ -581,7 +586,9 @@ class TestMJEPAComputeLosses:
             epoch=15,  # < gram_start_epoch (20)
         )
 
-        assert losses.gram_loss == 0.0
+        assert isinstance(losses.gram_loss, torch.Tensor)
+        assert losses.gram_loss.item() >= 0
+        assert not losses.gram_loss.requires_grad
 
     @pytest.mark.parametrize("epoch", [20, 25, 30])
     def test_compute_losses_gram_different_epochs(self, mjepa_model: MJEPA, epoch):
@@ -623,7 +630,7 @@ class TestMJEPAForward:
     """Test the main MJEPA forward pass."""
 
     def test_forward_basic(self, mjepa_model_no_gram: MJEPA, dummy_batch):
-        """Test basic forward pass without Gram anchor."""
+        """Test basic forward pass with always-on Gram anchor."""
         mjepa_model_no_gram.eval()
 
         with torch.no_grad():
@@ -637,7 +644,8 @@ class TestMJEPAForward:
         assert isinstance(predictions.teacher_output, ViTFeatures)
         assert predictions.context_mask.shape[0] == dummy_batch.shape[0]
         assert predictions.target_mask.shape[0] == dummy_batch.shape[0]
-        assert predictions.gram_anchor_output is None
+        assert predictions.gram_anchor_output is not None
+        assert isinstance(predictions.gram_anchor_output, torch.Tensor)
 
     def test_forward_with_gram(self, mjepa_model, dummy_batch):
         """Test forward pass with detached stem Gram anchor."""
@@ -646,7 +654,7 @@ class TestMJEPAForward:
         # Test before gram_start_epoch
         with torch.no_grad():
             predictions_before = mjepa_model(dummy_batch, jepa_scale=2, epoch=15)
-        assert predictions_before.gram_anchor_output is None
+        assert predictions_before.gram_anchor_output is not None
 
         # Test after gram_start_epoch
         with torch.no_grad():
