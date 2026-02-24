@@ -9,6 +9,17 @@ from torch import Tensor
 from torchmetrics import Metric
 
 
+SIMILARITY_MIN = -1.0
+SIMILARITY_MAX = 1.0
+SIMILARITY_SPAN = SIMILARITY_MAX - SIMILARITY_MIN
+CPA_P90 = 0.90
+CPA_P99 = 0.99
+
+
+def _nan_like(reference: Tensor) -> Tensor:
+    return torch.tensor(float("nan"), dtype=reference.dtype, device=reference.device)
+
+
 class CLSPatchAlignmentMetric(Metric):
     """Measure how much patch tokens align with CLS tokens.
 
@@ -27,7 +38,7 @@ class CLSPatchAlignmentMetric(Metric):
 
         self.num_bins = num_bins
         self.eps = eps
-        self._bin_width = 2.0 / float(num_bins)
+        self._bin_width = SIMILARITY_SPAN / float(num_bins)
 
         self.add_state("count", default=torch.tensor(0, dtype=torch.long), dist_reduce_fx="sum")
         self.add_state("sum", default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
@@ -53,7 +64,7 @@ class CLSPatchAlignmentMetric(Metric):
         patch_norm = F.normalize(patch_tokens, dim=-1, eps=self.eps)
 
         sims = torch.einsum("bcd,bnd->bcn", cls_norm, patch_norm).reshape(-1)
-        sims = sims.clamp(-1.0, 1.0)
+        sims = sims.clamp(SIMILARITY_MIN, SIMILARITY_MAX)
         sims64 = sims.to(dtype=torch.float64)
 
         count_state = cast(Tensor, self.count)
@@ -65,7 +76,7 @@ class CLSPatchAlignmentMetric(Metric):
         sum_state.add_(sims64.sum())
         sum_sq_state.add_(torch.square(sims64).sum())
 
-        bin_indices = torch.floor((sims64 + 1.0) / 2.0 * self.num_bins).to(dtype=torch.long)
+        bin_indices = torch.floor((sims64 - SIMILARITY_MIN) / SIMILARITY_SPAN * self.num_bins).to(dtype=torch.long)
         bin_indices = bin_indices.clamp(min=0, max=self.num_bins - 1)
         hist_update = torch.bincount(bin_indices, minlength=self.num_bins).to(hist_state.dtype)
         hist_state.add_(hist_update)
@@ -76,7 +87,7 @@ class CLSPatchAlignmentMetric(Metric):
         hist_state = cast(Tensor, self.hist)
 
         if count_state <= 0:
-            return torch.tensor(float("nan"), dtype=sum_state.dtype, device=sum_state.device)
+            return _nan_like(sum_state)
 
         count = count_state.to(dtype=sum_state.dtype)
         cdf = torch.cumsum(hist_state, dim=0)
@@ -93,7 +104,7 @@ class CLSPatchAlignmentMetric(Metric):
         frac = (rank - prev_cdf) / safe_bin_count
         frac = frac.clamp(0.0, 1.0)
 
-        bin_left = -1.0 + idx.to(dtype=sum_state.dtype) * self._bin_width
+        bin_left = SIMILARITY_MIN + idx.to(dtype=sum_state.dtype) * self._bin_width
         return bin_left + frac * self._bin_width
 
     def compute(self) -> dict[str, Tensor]:
@@ -102,7 +113,7 @@ class CLSPatchAlignmentMetric(Metric):
         sum_sq_state = cast(Tensor, self.sum_sq)
 
         if count_state <= 0:
-            nan = torch.tensor(float("nan"), dtype=sum_state.dtype, device=sum_state.device)
+            nan = _nan_like(sum_state)
             return {
                 "cpa_mean": nan,
                 "cpa_std": nan,
@@ -119,8 +130,8 @@ class CLSPatchAlignmentMetric(Metric):
         return {
             "cpa_mean": mean,
             "cpa_std": std,
-            "cpa_p90": self._compute_quantile_from_hist(0.90),
-            "cpa_p99": self._compute_quantile_from_hist(0.99),
+            "cpa_p90": self._compute_quantile_from_hist(CPA_P90),
+            "cpa_p99": self._compute_quantile_from_hist(CPA_P99),
         }
 
     def plot(self, val: Any = None, ax: Any = None) -> Any:
@@ -214,7 +225,7 @@ class SimilarityDistanceCouplingMetric(Metric):
         rho_weighted_sum_state = cast(Tensor, self.rho_weighted_sum)
 
         if pair_count_state <= 0:
-            nan = torch.tensor(float("nan"), dtype=rho_weighted_sum_state.dtype, device=rho_weighted_sum_state.device)
+            nan = _nan_like(rho_weighted_sum_state)
             return {"sdc_spearman_proxy": nan}
 
         pair_count = pair_count_state.to(dtype=rho_weighted_sum_state.dtype)

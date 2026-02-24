@@ -293,8 +293,8 @@ class JEPAConfig:
             from this value to 1.0 over the course of training if scheduled is ``True``.
         scheduled: Whether to schedule the momentum.
         predictor_depth: Depth of the predictor network.
-        gram_start_epoch: The epoch at which to begin computing the Gram loss.
-            If ``None``, the Gram loss will not be computed.
+        gram_start_epoch: The epoch at which Gram loss begins contributing gradients.
+            If ``None``, Gram loss is tracked but excluded from optimization updates.
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
         gram_loss_weight: The coefficient of the Gram loss.
         sigreg_loss_weight: The coefficient of the SigREG loss.

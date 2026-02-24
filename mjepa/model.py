@@ -21,6 +21,9 @@ from .jepa import (
 from .trainer import assert_all_ranks_synced, assert_all_trainable_params_have_grad
 
 
+ROPE_SEED_UPPER_BOUND = 1_000_000
+
+
 @dataclass
 class MJEPALosses:
     jepa_loss: Tensor
@@ -104,7 +107,7 @@ class MJEPA(nn.Module):
         with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
             stem_tokens = self.student.stem(x)
             gram_anchor_output = apply_mask(context_mask, stem_tokens, fill_value=None)
-        return gram_anchor_output.clone().detach()
+        return gram_anchor_output.detach().clone()
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         # Compute JEPA loss
@@ -144,7 +147,7 @@ class MJEPA(nn.Module):
             self.student, x, self.config.context_ratio, self.config.target_ratio, jepa_scale
         )
 
-        rope_seed = int(torch.randint(0, 1000000, (1,)).item())
+        rope_seed = int(torch.randint(0, ROPE_SEED_UPPER_BOUND, (1,)).item())
         # Teacher / Gram anchor forward pass
         teacher_output = self.forward_teacher(x)
         gram_anchor_output = self.forward_gram_anchor(x, context_mask)
