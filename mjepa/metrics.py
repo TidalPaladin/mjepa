@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Any, cast
 
 import torch
@@ -124,3 +125,100 @@ class CLSPatchAlignmentMetric(Metric):
 
     def plot(self, val: Any = None, ax: Any = None) -> Any:
         raise NotImplementedError("Plotting is not implemented for CLSPatchAlignmentMetric")
+
+
+class SimilarityDistanceCouplingMetric(Metric):
+    """Measure how strongly similarity is coupled to spatial proximity.
+
+    Samples patch pairs, computes cosine similarity and Euclidean distance, then
+    estimates a Spearman-style correlation by running Pearson on rank-normalized
+    values. Aggregation across updates is a pair-count weighted mean.
+    """
+
+    full_state_update = False
+
+    def __init__(self, pairs_per_img: int = 2048, eps: float = 1e-12, sync_on_compute: bool = True) -> None:
+        super().__init__(sync_on_compute=sync_on_compute)
+        if pairs_per_img <= 0:
+            raise ValueError("pairs_per_img must be positive")
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+
+        self.pairs_per_img = pairs_per_img
+        self.eps = eps
+
+        self.add_state("pair_count", default=torch.tensor(0, dtype=torch.long), dist_reduce_fx="sum")
+        self.add_state("rho_weighted_sum", default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
+
+    def _rank_normalize(self, values: Tensor) -> Tensor:
+        ranks = torch.argsort(torch.argsort(values)).to(dtype=torch.float64)
+        mean = ranks.mean()
+        std = ranks.std(unbiased=False)
+        return (ranks - mean) / (std + self.eps)
+
+    def update(self, patch_tokens: Tensor, grid_hw: tuple[int, int] | list[int]) -> None:
+        if patch_tokens.ndim != 3:
+            raise ValueError("patch_tokens must have shape [B, N, D]")
+
+        if len(grid_hw) != 2:
+            raise ValueError("grid_hw must have length 2 as (H, W)")
+
+        h_raw, w_raw = grid_hw
+        if not isinstance(h_raw, Integral) or not isinstance(w_raw, Integral):
+            raise ValueError("grid_hw entries must be integers")
+
+        h = int(h_raw)
+        w = int(w_raw)
+        if h <= 0 or w <= 0:
+            raise ValueError("grid_hw entries must be positive")
+
+        batch_size, num_patches, dim = patch_tokens.shape
+        expected_patches = h * w
+        if num_patches != expected_patches:
+            raise ValueError("Number of patches must match H * W")
+
+        patch_norm = F.normalize(patch_tokens, dim=-1, eps=self.eps)
+
+        device = patch_norm.device
+        ys = torch.arange(h, device=device, dtype=patch_norm.dtype)
+        xs = torch.arange(w, device=device, dtype=patch_norm.dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        coords = torch.stack([yy.reshape(-1), xx.reshape(-1)], dim=-1)
+
+        i = torch.randint(0, num_patches, (batch_size, self.pairs_per_img), device=device)
+        j = torch.randint(0, num_patches, (batch_size, self.pairs_per_img), device=device)
+
+        zi = patch_norm.gather(1, i[..., None].expand(batch_size, self.pairs_per_img, dim))
+        zj = patch_norm.gather(1, j[..., None].expand(batch_size, self.pairs_per_img, dim))
+        sims = (zi * zj).sum(dim=-1).reshape(-1)
+
+        pi = coords[i.reshape(-1)]
+        pj = coords[j.reshape(-1)]
+        dists = (pi - pj).norm(dim=-1)
+
+        sim_rank = self._rank_normalize(sims)
+        dist_rank = self._rank_normalize(dists)
+        rho_update = (sim_rank * (-dist_rank)).mean()
+
+        pair_count_state = cast(Tensor, self.pair_count)
+        rho_weighted_sum_state = cast(Tensor, self.rho_weighted_sum)
+
+        num_pairs = sims.numel()
+        pair_count_state.add_(num_pairs)
+        rho_weighted_sum_state.add_(
+            rho_update.to(dtype=rho_weighted_sum_state.dtype, device=rho_weighted_sum_state.device) * num_pairs
+        )
+
+    def compute(self) -> dict[str, Tensor]:
+        pair_count_state = cast(Tensor, self.pair_count)
+        rho_weighted_sum_state = cast(Tensor, self.rho_weighted_sum)
+
+        if pair_count_state <= 0:
+            nan = torch.tensor(float("nan"), dtype=rho_weighted_sum_state.dtype, device=rho_weighted_sum_state.device)
+            return {"sdc_spearman_proxy": nan}
+
+        pair_count = pair_count_state.to(dtype=rho_weighted_sum_state.dtype)
+        return {"sdc_spearman_proxy": rho_weighted_sum_state / pair_count}
+
+    def plot(self, val: Any = None, ax: Any = None) -> Any:
+        raise NotImplementedError("Plotting is not implemented for SimilarityDistanceCouplingMetric")
