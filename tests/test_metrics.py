@@ -1,7 +1,9 @@
+from typing import cast
+
 import pytest
 import torch
 
-from mjepa.metrics import CLSPatchAlignmentMetric
+from mjepa.metrics import CLSPatchAlignmentMetric, SimilarityDistanceCouplingMetric
 
 
 class TestCLSPatchAlignmentMetric:
@@ -131,3 +133,104 @@ class TestCLSPatchAlignmentMetric:
 
         assert torch.allclose(out["cpa_mean"], expected.mean().to(out["cpa_mean"].dtype), atol=1e-7)
         assert torch.allclose(out["cpa_std"], expected.std(unbiased=False).to(out["cpa_std"].dtype), atol=1e-7)
+
+
+class TestSimilarityDistanceCouplingMetric:
+    def test_outputs_named_keys(self):
+        metric = SimilarityDistanceCouplingMetric(pairs_per_img=256)
+        patch_tokens = torch.randn(2, 6, 8)
+
+        metric.update(patch_tokens, [2, 3])
+        out = metric.compute()
+
+        assert set(out.keys()) == {"sdc_spearman_proxy"}
+
+    def test_rejects_invalid_init(self):
+        with pytest.raises(ValueError, match="pairs_per_img must be positive"):
+            SimilarityDistanceCouplingMetric(pairs_per_img=0)
+
+        with pytest.raises(ValueError, match="eps must be positive"):
+            SimilarityDistanceCouplingMetric(eps=0.0)
+
+    def test_rejects_invalid_update_inputs(self):
+        metric = SimilarityDistanceCouplingMetric()
+
+        with pytest.raises(ValueError, match="patch_tokens must have shape"):
+            metric.update(torch.randn(2, 4), (2, 2))
+
+        with pytest.raises(ValueError, match="grid_hw must have length 2"):
+            metric.update(torch.randn(2, 4, 3), [2])
+
+        with pytest.raises(ValueError, match="grid_hw entries must be integers"):
+            metric.update(torch.randn(2, 4, 3), cast(list[int], [2.0, 2]))
+
+        with pytest.raises(ValueError, match="grid_hw entries must be positive"):
+            metric.update(torch.randn(2, 4, 3), (0, 2))
+
+        with pytest.raises(ValueError, match="Number of patches must match H \\* W"):
+            metric.update(torch.randn(2, 5, 3), (2, 2))
+
+    def test_output_is_finite_on_random_input(self):
+        torch.manual_seed(123)
+        metric = SimilarityDistanceCouplingMetric(pairs_per_img=1024)
+        patch_tokens = torch.randn(3, 16, 12)
+
+        metric.update(patch_tokens, (4, 4))
+        out = metric.compute()
+
+        assert torch.isfinite(out["sdc_spearman_proxy"])
+
+    def test_empty_returns_nan(self):
+        metric = SimilarityDistanceCouplingMetric()
+        out = metric.compute()
+
+        assert torch.isnan(out["sdc_spearman_proxy"])
+
+    def test_reset_clears_state(self):
+        metric = SimilarityDistanceCouplingMetric()
+        metric.update(torch.randn(2, 9, 7), (3, 3))
+
+        metric.reset()
+        out = metric.compute()
+        assert torch.isnan(out["sdc_spearman_proxy"])
+
+    def test_localized_features_have_positive_coupling(self):
+        h, w = 8, 8
+        n = h * w
+        coords = torch.stack(torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij"), dim=-1).reshape(n, 2)
+        coords = coords.to(dtype=torch.float32)
+        dist = torch.cdist(coords, coords)
+        sigma = 1.5
+        patch_tokens = torch.exp(-(dist**2) / (2.0 * sigma**2)).unsqueeze(0)
+
+        torch.manual_seed(0)
+        metric = SimilarityDistanceCouplingMetric(pairs_per_img=8192)
+        metric.update(patch_tokens, (h, w))
+        out = metric.compute()
+
+        assert out["sdc_spearman_proxy"] > 0.7
+
+    def test_random_features_have_low_coupling(self):
+        torch.manual_seed(0)
+        metric = SimilarityDistanceCouplingMetric(pairs_per_img=8192)
+        patch_tokens = torch.randn(4, 64, 32)
+
+        metric.update(patch_tokens, (8, 8))
+        out = metric.compute()
+
+        assert torch.abs(out["sdc_spearman_proxy"]) < 0.15
+
+    def test_sampling_is_deterministic_with_seed(self):
+        patch_tokens = torch.randn(2, 16, 10)
+
+        torch.manual_seed(1234)
+        metric_a = SimilarityDistanceCouplingMetric(pairs_per_img=4096)
+        metric_a.update(patch_tokens, (4, 4))
+        out_a = metric_a.compute()
+
+        torch.manual_seed(1234)
+        metric_b = SimilarityDistanceCouplingMetric(pairs_per_img=4096)
+        metric_b.update(patch_tokens, (4, 4))
+        out_b = metric_b.compute()
+
+        assert torch.allclose(out_a["sdc_spearman_proxy"], out_b["sdc_spearman_proxy"], atol=1e-12)
