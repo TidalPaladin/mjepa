@@ -247,3 +247,25 @@ class TestSimilarityDistanceCouplingMetric:
         out_b = metric_b.compute()
 
         assert torch.allclose(out_a["sdc_spearman_proxy"], out_b["sdc_spearman_proxy"], atol=DETERMINISTIC_ATOL)
+
+    def test_rank_normalize_uses_average_ranks_for_ties(self):
+        metric = SimilarityDistanceCouplingMetric()
+        values = torch.tensor([1.0, 1.0, 2.0, 3.0, 3.0])
+
+        out = metric._rank_normalize(values)
+
+        raw_ranks = torch.tensor([0.5, 0.5, 2.0, 3.5, 3.5], dtype=torch.float64)
+        expected = (raw_ranks - raw_ranks.mean()) / (raw_ranks.std(unbiased=False) + metric.eps)
+        assert torch.allclose(out, expected, atol=STRICT_ATOL)
+
+    def test_empty_batch_update_does_not_poison_running_state(self):
+        torch.manual_seed(RANDOM_TEST_SEED)
+        metric = SimilarityDistanceCouplingMetric(pairs_per_img=1024)
+        metric.update(torch.randn(2, 16, 8), (4, 4))
+        out_before = metric.compute()
+
+        empty_batch = torch.randn(0, 16, 8)
+        metric.update(empty_batch, (4, 4))
+        out_after = metric.compute()
+
+        assert torch.allclose(out_after["sdc_spearman_proxy"], out_before["sdc_spearman_proxy"], atol=STRICT_ATOL)

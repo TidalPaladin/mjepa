@@ -164,7 +164,25 @@ class SimilarityDistanceCouplingMetric(Metric):
         self.add_state("rho_weighted_sum", default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
 
     def _rank_normalize(self, values: Tensor) -> Tensor:
-        ranks = torch.argsort(torch.argsort(values)).to(dtype=torch.float64)
+        num_values = values.numel()
+        if num_values == 0:
+            return values.to(dtype=torch.float64)
+
+        sorted_values, sorted_indices = torch.sort(values)
+        group_start_mask = torch.ones(num_values, dtype=torch.bool, device=values.device)
+        group_start_mask[1:] = sorted_values[1:] != sorted_values[:-1]
+        group_starts = torch.nonzero(group_start_mask, as_tuple=False).reshape(-1)
+
+        group_ends = torch.empty_like(group_starts)
+        group_ends[:-1] = group_starts[1:] - 1
+        group_ends[-1] = num_values - 1
+        group_lengths = group_ends - group_starts + 1
+
+        average_ranks = (group_starts + group_ends).to(dtype=torch.float64) / 2.0
+        sorted_ranks = torch.repeat_interleave(average_ranks, group_lengths)
+
+        ranks = torch.empty(num_values, dtype=torch.float64, device=values.device)
+        ranks.scatter_(0, sorted_indices, sorted_ranks)
         mean = ranks.mean()
         std = ranks.std(unbiased=False)
         return (ranks - mean) / (std + self.eps)
@@ -213,6 +231,9 @@ class SimilarityDistanceCouplingMetric(Metric):
         pi = coords[i.reshape(-1)]
         pj = coords[j.reshape(-1)]
         dists = (pi - pj).norm(dim=-1)
+        num_pairs = sims.numel()
+        if num_pairs == 0:
+            return
 
         sim_rank = self._rank_normalize(sims)
         dist_rank = self._rank_normalize(dists)
@@ -221,7 +242,6 @@ class SimilarityDistanceCouplingMetric(Metric):
         pair_count_state = cast(Tensor, self.pair_count)
         rho_weighted_sum_state = cast(Tensor, self.rho_weighted_sum)
 
-        num_pairs = sims.numel()
         pair_count_state.add_(num_pairs)
         rho_weighted_sum_state.add_(
             rho_update.to(dtype=rho_weighted_sum_state.dtype, device=rho_weighted_sum_state.device) * num_pairs
