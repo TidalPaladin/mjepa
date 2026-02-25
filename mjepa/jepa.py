@@ -240,7 +240,7 @@ def is_gram_update_epoch(epoch: int, gram_start_epoch: int | None, gram_update_i
         gram_start_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
         gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
     """
-    if gram_start_epoch is None:
+    if gram_start_epoch is None or gram_update_interval_epoch <= 0:
         return False
     return epoch > gram_start_epoch and (epoch - gram_start_epoch) % gram_update_interval_epoch == 0
 

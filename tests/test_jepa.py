@@ -637,6 +637,11 @@ class TestIsGramUpdateEpoch:
         assert not is_gram_update_epoch(epoch=12, gram_start_epoch=10, gram_update_interval_epoch=5)
         assert not is_gram_update_epoch(epoch=17, gram_start_epoch=10, gram_update_interval_epoch=5)
 
+    def test_returns_false_when_interval_is_zero(self):
+        """Test that interval zero disables periodic updates."""
+        assert not is_gram_update_epoch(epoch=11, gram_start_epoch=10, gram_update_interval_epoch=0)
+        assert not is_gram_update_epoch(epoch=20, gram_start_epoch=10, gram_update_interval_epoch=0)
+
     @pytest.mark.parametrize("interval", [1, 2, 5, 10])
     def test_different_intervals(self, interval):
         """Test with different gram_update_interval_epoch values."""

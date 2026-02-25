@@ -72,6 +72,7 @@ class MJEPA(nn.Module):
         self.predictor = predictor
         self.gram_teacher = setup_teacher(backbone) if config.gram_start_epoch is not None else None
         self.dtype = dtype
+        self._gram_cooldown_end_epoch: int | None = None
 
     @property
     def img_size(self) -> tuple[int, int]:
@@ -118,14 +119,39 @@ class MJEPA(nn.Module):
             gram_teacher_output = apply_mask(context_mask, gram_teacher_output, fill_value=None)
         return gram_teacher_output.clone()
 
-    def update_gram_teacher(self, current_epoch: int):
+    def _is_gram_cooldown_active(self, epoch: int) -> bool:
+        if self._gram_cooldown_end_epoch is None:
+            return False
+        return epoch < self._gram_cooldown_end_epoch
+
+    def _is_gram_enabled_for_epoch(self, epoch: int) -> bool:
+        if self.config.gram_start_epoch is None:
+            return False
+        return epoch >= self.config.gram_start_epoch and not self._is_gram_cooldown_active(epoch)
+
+    def update_gram_teacher(self, current_epoch: int, resolution_changed: bool = False):
         if self.gram_teacher is None:
             return
+
+        should_sync_gram_teacher = current_epoch == self.config.gram_teacher_epoch
+
         # Initial Gram teacher setup (if necessary)
-        if current_epoch == self.config.gram_teacher_epoch:
-            update_teacher(self.teacher, self.gram_teacher)
+        # Pause gram anchoring updates after a resolution transition.
+        interval = self.config.gram_update_interval_epoch
+        if resolution_changed and interval > 0:
+            self._gram_cooldown_end_epoch = current_epoch + interval
+
+        if self._gram_cooldown_end_epoch is not None:
+            if current_epoch < self._gram_cooldown_end_epoch:
+                return
+            should_sync_gram_teacher = True
+            self._gram_cooldown_end_epoch = None
+
         # Gram teacher update
         if is_gram_update_epoch(current_epoch, self.config.gram_start_epoch, self.config.gram_update_interval_epoch):
+            should_sync_gram_teacher = True
+
+        if should_sync_gram_teacher:
             update_teacher(self.teacher, self.gram_teacher)
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
@@ -142,7 +168,7 @@ class MJEPA(nn.Module):
         )
 
         # Compute Gram loss (if necessary)
-        if self.config.gram_start_epoch is not None and epoch >= self.config.gram_start_epoch:
+        if self._is_gram_enabled_for_epoch(epoch):
             assert output.gram_teacher_output is not None
             assert self.config.gram_loss_weight > 0
             gram_loss = compute_gram_loss(
@@ -172,9 +198,7 @@ class MJEPA(nn.Module):
         # Teacher / Gram teacher forward pass
         teacher_output = self.forward_teacher(x)
         gram_teacher_output = (
-            self.forward_gram_teacher(x, context_mask, rope_seed)
-            if self.config.gram_start_epoch is not None and epoch >= self.config.gram_start_epoch
-            else None
+            self.forward_gram_teacher(x, context_mask, rope_seed) if self._is_gram_enabled_for_epoch(epoch) else None
         )
 
         Ht, Wt = cast(tuple[int, int], self.student.stem.tokenized_size(x.shape[-2:]))
