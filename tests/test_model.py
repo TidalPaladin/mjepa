@@ -610,6 +610,30 @@ class TestMJEPATeacherUpdate:
         assert torch.allclose(model.gram_teacher.stem.patch.weight.data, initial_snapshot)
         assert model._gram_cooldown_end_epoch is None
 
+    def test_update_gram_teacher_cooldown_end_before_teacher_epoch_does_not_resync(self, mjepa_model: MJEPA):
+        """Test cooldown completion does not bypass the gram_teacher_epoch gate."""
+        assert mjepa_model.gram_teacher is not None
+        initial_gram_weight = mjepa_model.gram_teacher.stem.patch.weight.data.clone()
+        gram_teacher_epoch = mjepa_model.config.gram_teacher_epoch
+        cooldown_interval = mjepa_model.config.gram_update_interval_epoch
+
+        resolution_change_epoch = 3
+        cooldown_end_epoch = resolution_change_epoch + cooldown_interval
+        assert cooldown_end_epoch < gram_teacher_epoch
+
+        mjepa_model.teacher.stem.patch.weight.data.fill_(5.0)
+        mjepa_model.update_gram_teacher(current_epoch=resolution_change_epoch, resolution_changed=True)
+        mjepa_model.update_gram_teacher(current_epoch=cooldown_end_epoch)
+
+        # Gram teacher should remain unchanged until gram_teacher_epoch is reached.
+        assert torch.allclose(mjepa_model.gram_teacher.stem.patch.weight.data, initial_gram_weight)
+
+        mjepa_model.update_gram_teacher(current_epoch=gram_teacher_epoch)
+        assert torch.allclose(
+            mjepa_model.gram_teacher.stem.patch.weight.data,
+            mjepa_model.teacher.stem.patch.weight.data,
+        )
+
 
 class TestMJEPAComputeLosses:
     """Test MJEPA loss computation."""

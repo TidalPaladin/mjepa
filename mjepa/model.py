@@ -144,7 +144,7 @@ class MJEPA(nn.Module):
         if self._gram_cooldown_end_epoch is not None:
             if current_epoch < self._gram_cooldown_end_epoch:
                 return
-            should_sync_gram_teacher = True
+            should_sync_gram_teacher = should_sync_gram_teacher or current_epoch >= self.config.gram_teacher_epoch
             self._gram_cooldown_end_epoch = None
 
         # Gram teacher update
