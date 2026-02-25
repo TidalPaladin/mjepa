@@ -516,6 +516,124 @@ class TestMJEPATeacherUpdate:
         mjepa_model_no_gram.update_gram_teacher(current_epoch=10)
         mjepa_model_no_gram.update_gram_teacher(current_epoch=20)
 
+    def test_update_gram_teacher_resolution_change_starts_cooldown(self, mjepa_model: MJEPA):
+        """Test that resolution changes pause gram teacher updates until cooldown ends."""
+        resolution_change_epoch = 20
+        cooldown_probe_epoch = 22
+        expected_cooldown_end_epoch = resolution_change_epoch + mjepa_model.config.gram_update_interval_epoch
+
+        mjepa_model.update_gram_teacher(current_epoch=10)
+        assert mjepa_model.gram_teacher is not None
+        weights_after_init = mjepa_model.gram_teacher.stem.patch.weight.data.clone()
+
+        mjepa_model.teacher.stem.patch.weight.data.fill_(2.0)
+        mjepa_model.update_gram_teacher(current_epoch=resolution_change_epoch, resolution_changed=True)
+        mjepa_model.update_gram_teacher(current_epoch=cooldown_probe_epoch)
+
+        assert mjepa_model._gram_cooldown_end_epoch == expected_cooldown_end_epoch
+        assert torch.allclose(mjepa_model.gram_teacher.stem.patch.weight.data, weights_after_init)
+
+    def test_update_gram_teacher_resets_at_cooldown_end(self, mjepa_model: MJEPA):
+        """Test that gram teacher is reset from teacher when cooldown reaches its end epoch."""
+        resolution_change_epoch = 20
+        cooldown_end_epoch = resolution_change_epoch + mjepa_model.config.gram_update_interval_epoch
+
+        mjepa_model.update_gram_teacher(current_epoch=10)
+        assert mjepa_model.gram_teacher is not None
+
+        mjepa_model.teacher.stem.patch.weight.data.fill_(3.0)
+        mjepa_model.update_gram_teacher(current_epoch=resolution_change_epoch, resolution_changed=True)
+        mjepa_model.update_gram_teacher(current_epoch=cooldown_end_epoch)
+
+        assert torch.allclose(
+            mjepa_model.gram_teacher.stem.patch.weight.data,
+            mjepa_model.teacher.stem.patch.weight.data,
+        )
+        assert mjepa_model._gram_cooldown_end_epoch is None
+
+    def test_update_gram_teacher_overlapping_resolution_changes_restart_cooldown(self, mjepa_model: MJEPA):
+        """Test that a new resolution change restarts the cooldown window."""
+        first_change_epoch = 20
+        second_change_epoch = 23
+        interval = mjepa_model.config.gram_update_interval_epoch
+
+        mjepa_model.update_gram_teacher(current_epoch=10)
+        assert mjepa_model.gram_teacher is not None
+        gram_before = mjepa_model.gram_teacher.stem.patch.weight.data.clone()
+
+        mjepa_model.update_gram_teacher(current_epoch=first_change_epoch, resolution_changed=True)
+        assert mjepa_model._gram_cooldown_end_epoch == first_change_epoch + interval
+
+        mjepa_model.update_gram_teacher(current_epoch=second_change_epoch, resolution_changed=True)
+        assert mjepa_model._gram_cooldown_end_epoch == second_change_epoch + interval
+
+        mjepa_model.teacher.stem.patch.weight.data.fill_(4.0)
+        mjepa_model.update_gram_teacher(current_epoch=25)
+        assert torch.allclose(mjepa_model.gram_teacher.stem.patch.weight.data, gram_before)
+
+        mjepa_model.update_gram_teacher(current_epoch=second_change_epoch + interval)
+        assert torch.allclose(
+            mjepa_model.gram_teacher.stem.patch.weight.data,
+            mjepa_model.teacher.stem.patch.weight.data,
+        )
+        assert mjepa_model._gram_cooldown_end_epoch is None
+
+    def test_update_gram_teacher_interval_zero_keeps_initial_snapshot(self, small_vit, predictor):
+        """Test that interval zero disables periodic updates and resolution-triggered resets."""
+        config = JEPAConfig(
+            context_ratio=0.5,
+            target_ratio=0.25,
+            scale=2,
+            momentum=0.98,
+            predictor_depth=2,
+            scheduled=False,
+            gram_teacher_epoch=10,
+            gram_start_epoch=20,
+            gram_update_interval_epoch=0,
+            gram_resolution_scale=1.0,
+            gram_remove_neg=False,
+            gram_loss_weight=1.0,
+            sigreg_loss_weight=0.0001,
+        )
+        model = MJEPA(config, small_vit, predictor, dtype=torch.float32)
+        assert model.gram_teacher is not None
+
+        model.teacher.stem.patch.weight.data.fill_(1.0)
+        model.update_gram_teacher(current_epoch=10)
+        initial_snapshot = model.gram_teacher.stem.patch.weight.data.clone()
+
+        model.teacher.stem.patch.weight.data.fill_(2.0)
+        model.update_gram_teacher(current_epoch=25)
+        model.update_gram_teacher(current_epoch=30, resolution_changed=True)
+        model.update_gram_teacher(current_epoch=40)
+
+        assert torch.allclose(model.gram_teacher.stem.patch.weight.data, initial_snapshot)
+        assert model._gram_cooldown_end_epoch is None
+
+    def test_update_gram_teacher_cooldown_end_before_teacher_epoch_does_not_resync(self, mjepa_model: MJEPA):
+        """Test cooldown completion does not bypass the gram_teacher_epoch gate."""
+        assert mjepa_model.gram_teacher is not None
+        initial_gram_weight = mjepa_model.gram_teacher.stem.patch.weight.data.clone()
+        gram_teacher_epoch = mjepa_model.config.gram_teacher_epoch
+        cooldown_interval = mjepa_model.config.gram_update_interval_epoch
+
+        resolution_change_epoch = 3
+        cooldown_end_epoch = resolution_change_epoch + cooldown_interval
+        assert cooldown_end_epoch < gram_teacher_epoch
+
+        mjepa_model.teacher.stem.patch.weight.data.fill_(5.0)
+        mjepa_model.update_gram_teacher(current_epoch=resolution_change_epoch, resolution_changed=True)
+        mjepa_model.update_gram_teacher(current_epoch=cooldown_end_epoch)
+
+        # Gram teacher should remain unchanged until gram_teacher_epoch is reached.
+        assert torch.allclose(mjepa_model.gram_teacher.stem.patch.weight.data, initial_gram_weight)
+
+        mjepa_model.update_gram_teacher(current_epoch=gram_teacher_epoch)
+        assert torch.allclose(
+            mjepa_model.gram_teacher.stem.patch.weight.data,
+            mjepa_model.teacher.stem.patch.weight.data,
+        )
+
 
 class TestMJEPAComputeLosses:
     """Test MJEPA loss computation."""
@@ -674,6 +792,43 @@ class TestMJEPAComputeLosses:
 
         assert losses.gram_loss == 0.0
 
+    def test_compute_losses_gram_during_cooldown_is_zero(self, mjepa_model: MJEPA):
+        """Test that gram loss is disabled during the resolution cooldown window."""
+        resolution_change_epoch = 20
+        cooldown_epoch = 22
+
+        pred = torch.randn(2, 16, 64)
+        pred_with_cls = torch.randn(2, 16, 64)
+
+        batch_size = 2
+        num_tokens = 64
+        hidden_size = 64
+        dense_features = torch.randn(batch_size, num_tokens + 4, hidden_size)
+        student_output = ViTFeatures(dense_features, 2, 2)
+        teacher_output = ViTFeatures(dense_features.clone(), 2, 2)
+
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, :16] = True
+
+        mjepa_model.update_gram_teacher(current_epoch=resolution_change_epoch, resolution_changed=True)
+
+        predictions = MJEPAPredictions(
+            pred=pred,
+            pred_with_cls=pred_with_cls,
+            student_output=student_output,
+            teacher_output=teacher_output,
+            target_mask=target_mask,
+            context_mask=target_mask,
+            gram_teacher_output=None,
+        )
+        losses = mjepa_model.compute_losses(
+            output=predictions,
+            step=0,
+            epoch=cooldown_epoch,
+        )
+
+        assert losses.gram_loss == 0.0
+
     @pytest.mark.parametrize("epoch", [20, 25, 30])
     def test_compute_losses_gram_different_epochs(self, mjepa_model: MJEPA, epoch):
         """Test gram loss computation at different epochs."""
@@ -744,6 +899,24 @@ class TestMJEPAForward:
             predictions_after = mjepa_model(dummy_batch, jepa_scale=2, epoch=20)
         assert predictions_after.gram_teacher_output is not None
         assert isinstance(predictions_after.gram_teacher_output, torch.Tensor)
+
+    def test_forward_disables_gram_during_resolution_cooldown(self, mjepa_model, dummy_batch):
+        """Test that gram teacher forward is skipped during cooldown and resumes at cooldown end."""
+        resolution_change_epoch = 20
+        cooldown_epoch = 22
+        cooldown_end_epoch = resolution_change_epoch + mjepa_model.config.gram_update_interval_epoch
+
+        mjepa_model.eval()
+
+        mjepa_model.update_gram_teacher(current_epoch=resolution_change_epoch, resolution_changed=True)
+        with torch.no_grad():
+            predictions_during = mjepa_model(dummy_batch, jepa_scale=2, epoch=cooldown_epoch)
+        assert predictions_during.gram_teacher_output is None
+
+        mjepa_model.update_gram_teacher(current_epoch=cooldown_end_epoch)
+        with torch.no_grad():
+            predictions_after = mjepa_model(dummy_batch, jepa_scale=2, epoch=cooldown_end_epoch)
+        assert predictions_after.gram_teacher_output is not None
 
     @pytest.mark.parametrize("jepa_scale", [1, 2, 4])
     def test_forward_different_scales(self, mjepa_model_no_gram, dummy_batch, jepa_scale):
