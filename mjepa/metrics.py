@@ -14,10 +14,18 @@ SIMILARITY_MAX = 1.0
 SIMILARITY_SPAN = SIMILARITY_MAX - SIMILARITY_MIN
 CPA_P90 = 0.90
 CPA_P99 = 0.99
+GRID_HW_NUM_DIMS = 2
+CPA_RESULT_KEYS = ("cpa_mean", "cpa_std", "cpa_p90", "cpa_p99")
+SDC_RESULT_KEY = "sdc_spearman_proxy"
 
 
 def _nan_like(reference: Tensor) -> Tensor:
     return torch.tensor(float("nan"), dtype=reference.dtype, device=reference.device)
+
+
+def _nan_result(reference: Tensor, keys: tuple[str, ...]) -> dict[str, Tensor]:
+    nan = _nan_like(reference)
+    return {key: nan for key in keys}
 
 
 class CLSPatchAlignmentMetric(Metric):
@@ -113,13 +121,7 @@ class CLSPatchAlignmentMetric(Metric):
         sum_sq_state = cast(Tensor, self.sum_sq)
 
         if count_state <= 0:
-            nan = _nan_like(sum_state)
-            return {
-                "cpa_mean": nan,
-                "cpa_std": nan,
-                "cpa_p90": nan,
-                "cpa_p99": nan,
-            }
+            return _nan_result(sum_state, CPA_RESULT_KEYS)
 
         count = count_state.to(dtype=sum_state.dtype)
         mean = sum_state / count
@@ -167,11 +169,9 @@ class SimilarityDistanceCouplingMetric(Metric):
         std = ranks.std(unbiased=False)
         return (ranks - mean) / (std + self.eps)
 
-    def update(self, patch_tokens: Tensor, grid_hw: tuple[int, int] | list[int]) -> None:
-        if patch_tokens.ndim != 3:
-            raise ValueError("patch_tokens must have shape [B, N, D]")
-
-        if len(grid_hw) != 2:
+    @staticmethod
+    def _parse_grid_hw(grid_hw: tuple[int, int] | list[int]) -> tuple[int, int]:
+        if len(grid_hw) != GRID_HW_NUM_DIMS:
             raise ValueError("grid_hw must have length 2 as (H, W)")
 
         h_raw, w_raw = grid_hw
@@ -182,6 +182,13 @@ class SimilarityDistanceCouplingMetric(Metric):
         w = int(w_raw)
         if h <= 0 or w <= 0:
             raise ValueError("grid_hw entries must be positive")
+        return h, w
+
+    def update(self, patch_tokens: Tensor, grid_hw: tuple[int, int] | list[int]) -> None:
+        if patch_tokens.ndim != 3:
+            raise ValueError("patch_tokens must have shape [B, N, D]")
+
+        h, w = self._parse_grid_hw(grid_hw)
 
         batch_size, num_patches, dim = patch_tokens.shape
         expected_patches = h * w
@@ -225,11 +232,10 @@ class SimilarityDistanceCouplingMetric(Metric):
         rho_weighted_sum_state = cast(Tensor, self.rho_weighted_sum)
 
         if pair_count_state <= 0:
-            nan = _nan_like(rho_weighted_sum_state)
-            return {"sdc_spearman_proxy": nan}
+            return _nan_result(rho_weighted_sum_state, (SDC_RESULT_KEY,))
 
         pair_count = pair_count_state.to(dtype=rho_weighted_sum_state.dtype)
-        return {"sdc_spearman_proxy": rho_weighted_sum_state / pair_count}
+        return {SDC_RESULT_KEY: rho_weighted_sum_state / pair_count}
 
     def plot(self, val: Any = None, ax: Any = None) -> Any:
         raise NotImplementedError("Plotting is not implemented for SimilarityDistanceCouplingMetric")
