@@ -107,6 +107,7 @@ class TestJEPAConfig:
         assert config.scale == 4
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
+        assert config.gram_teacher == "backbone"
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -116,12 +117,14 @@ class TestJEPAConfig:
             scale=8,
             momentum=0.95,
             predictor_depth=6,
+            gram_teacher="stem",
         )
         assert config.context_ratio == 0.6
         assert config.target_ratio == 0.3
         assert config.scale == 8
         assert config.momentum == 0.95
         assert config.predictor_depth == 6
+        assert config.gram_teacher == "stem"
 
     def test_invalid_context_ratio(self):
         """Test invalid context ratio."""
@@ -658,6 +661,11 @@ class TestIsGramUpdateEpoch:
 class TestJEPAConfigValidation:
     """Additional validation tests for JEPAConfig."""
 
+    def test_invalid_gram_teacher(self):
+        """Test invalid gram_teacher option."""
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_teacher="invalid")  # type: ignore[arg-type]
+
     def test_invalid_gram_teacher_epoch(self):
         """Test invalid gram_teacher_epoch."""
         with pytest.raises(ValueError):
@@ -708,6 +716,7 @@ class TestJEPAConfigValidation:
     def test_valid_gram_config(self):
         """Test valid Gram configuration."""
         config = JEPAConfig(
+            gram_teacher="stem",
             gram_teacher_epoch=50,
             gram_start_epoch=100,
             gram_update_interval_epoch=10,
@@ -716,5 +725,6 @@ class TestJEPAConfigValidation:
             gram_loss_weight=0.5,
             sigreg_loss_weight=1e-3,
         )
+        assert config.gram_teacher == "stem"
         assert config.gram_teacher_epoch == 50
         assert config.gram_start_epoch == 100

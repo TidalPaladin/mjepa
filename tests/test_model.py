@@ -1,6 +1,7 @@
 import pytest
 import torch
 from vit import ViT, ViTConfig, ViTFeatures
+from vit.tokens import apply_mask
 
 from mjepa.jepa import CrossAttentionPredictor, JEPAConfig
 from mjepa.model import MJEPA, MJEPALosses, MJEPAPredictions
@@ -16,6 +17,7 @@ def jepa_config():
         momentum=0.98,
         predictor_depth=2,
         scheduled=False,
+        gram_teacher="backbone",
         gram_teacher_epoch=10,
         gram_start_epoch=20,
         gram_update_interval_epoch=5,
@@ -37,6 +39,27 @@ def jepa_config_no_gram():
         predictor_depth=2,
         scheduled=False,
         gram_start_epoch=None,
+        gram_loss_weight=1.0,
+        sigreg_loss_weight=0.0001,
+    )
+
+
+@pytest.fixture
+def jepa_config_stem():
+    """Create a JEPA configuration using stem-based Gram supervision."""
+    return JEPAConfig(
+        context_ratio=0.5,
+        target_ratio=0.25,
+        scale=2,
+        momentum=0.98,
+        predictor_depth=2,
+        scheduled=False,
+        gram_teacher="stem",
+        gram_teacher_epoch=10,
+        gram_start_epoch=20,
+        gram_update_interval_epoch=5,
+        gram_resolution_scale=1.0,
+        gram_remove_neg=False,
         gram_loss_weight=1.0,
         sigreg_loss_weight=0.0001,
     )
@@ -84,6 +107,12 @@ def mjepa_model(jepa_config, small_vit, predictor):
 def mjepa_model_no_gram(jepa_config_no_gram, small_vit, predictor):
     """Create an MJEPA model without Gram teacher for testing."""
     return MJEPA(jepa_config_no_gram, small_vit, predictor, dtype=torch.float32)
+
+
+@pytest.fixture
+def mjepa_model_stem(jepa_config_stem, small_vit, predictor):
+    """Create an MJEPA model with stem-based Gram supervision."""
+    return MJEPA(jepa_config_stem, small_vit, predictor, dtype=torch.float32)
 
 
 @pytest.fixture
@@ -279,6 +308,11 @@ class TestMJEPAInitialization:
         assert mjepa_model_no_gram.gram_teacher is None
         assert mjepa_model_no_gram.config.gram_start_epoch is None
 
+    def test_initialization_stem_mode(self, mjepa_model_stem):
+        """Test that stem mode does not allocate a separate Gram teacher model."""
+        assert mjepa_model_stem.config.gram_teacher == "stem"
+        assert mjepa_model_stem.gram_teacher is None
+
     def test_teacher_frozen(self, mjepa_model):
         """Test that teacher parameters are frozen."""
         for param in mjepa_model.teacher.parameters():
@@ -386,6 +420,17 @@ class TestMJEPAForwardPasses:
         mjepa_model.gram_teacher.train()
         _ = mjepa_model.forward_gram_teacher(dummy_batch, context_mask)
         assert not mjepa_model.gram_teacher.training
+
+    def test_forward_gram_anchor(self, mjepa_model_stem: MJEPA, dummy_batch):
+        """Test forward pass through detached stem-based Gram anchor."""
+        context_mask = torch.randint(0, 2, (2, 64), dtype=torch.bool)
+        output = mjepa_model_stem.forward_gram_anchor(dummy_batch, context_mask)
+        expected = apply_mask(context_mask, mjepa_model_stem.teacher.stem(dummy_batch), fill_value=None)
+
+        assert isinstance(output, torch.Tensor)
+        assert output.shape[0] == dummy_batch.shape[0]
+        assert torch.allclose(output, expected)
+        assert not output.requires_grad
 
 
 class TestMJEPATeacherUpdate:
@@ -634,6 +679,18 @@ class TestMJEPATeacherUpdate:
             mjepa_model.teacher.stem.patch.weight.data,
         )
 
+    def test_update_gram_teacher_stem_mode_tracks_cooldown(self, mjepa_model_stem: MJEPA):
+        """Test that stem mode still honors cooldown windows for Gram usage."""
+        interval = mjepa_model_stem.config.gram_update_interval_epoch
+        resolution_change_epoch = 20
+        cooldown_end_epoch = resolution_change_epoch + interval
+
+        mjepa_model_stem.update_gram_teacher(current_epoch=resolution_change_epoch, resolution_changed=True)
+        assert mjepa_model_stem._gram_cooldown_end_epoch == cooldown_end_epoch
+
+        mjepa_model_stem.update_gram_teacher(current_epoch=cooldown_end_epoch)
+        assert mjepa_model_stem._gram_cooldown_end_epoch is None
+
 
 class TestMJEPAComputeLosses:
     """Test MJEPA loss computation."""
@@ -864,6 +921,33 @@ class TestMJEPAComputeLosses:
 
         assert isinstance(losses.gram_loss, torch.Tensor)
 
+    def test_compute_losses_with_stem_gram(self, mjepa_model_stem: MJEPA):
+        """Test loss computation with stem-based Gram source."""
+        pred = torch.randn(2, 16, 64)
+        pred_with_cls = torch.randn(2, 16, 64)
+
+        batch_size = 2
+        num_tokens = 64
+        hidden_size = 64
+        dense_features = torch.randn(batch_size, num_tokens + 4, hidden_size)
+        student_output = ViTFeatures(dense_features, 2, 2)
+        teacher_output = ViTFeatures(dense_features.clone(), 2, 2)
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, :16] = True
+
+        predictions = MJEPAPredictions(
+            pred=pred,
+            pred_with_cls=pred_with_cls,
+            student_output=student_output,
+            teacher_output=teacher_output,
+            target_mask=target_mask,
+            context_mask=target_mask,
+            gram_teacher_output=torch.randn(2, 64, 64),
+        )
+        losses = mjepa_model_stem.compute_losses(output=predictions, step=0, epoch=20)
+        assert isinstance(losses.gram_loss, torch.Tensor)
+        assert losses.gram_loss.item() > 0
+
 
 class TestMJEPAForward:
     """Test the main MJEPA forward pass."""
@@ -917,6 +1001,20 @@ class TestMJEPAForward:
         with torch.no_grad():
             predictions_after = mjepa_model(dummy_batch, jepa_scale=2, epoch=cooldown_end_epoch)
         assert predictions_after.gram_teacher_output is not None
+
+    def test_forward_with_stem_gram(self, mjepa_model_stem, dummy_batch):
+        """Test forward pass with stem-based Gram source."""
+        mjepa_model_stem.eval()
+
+        with torch.no_grad():
+            predictions_before = mjepa_model_stem(dummy_batch, jepa_scale=2, epoch=15)
+        assert predictions_before.gram_teacher_output is None
+
+        with torch.no_grad():
+            predictions_after = mjepa_model_stem(dummy_batch, jepa_scale=2, epoch=20)
+        assert predictions_after.gram_teacher_output is not None
+        assert isinstance(predictions_after.gram_teacher_output, torch.Tensor)
+        assert not predictions_after.gram_teacher_output.requires_grad
 
     @pytest.mark.parametrize("jepa_scale", [1, 2, 4])
     def test_forward_different_scales(self, mjepa_model_no_gram, dummy_batch, jepa_scale):

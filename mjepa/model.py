@@ -70,7 +70,11 @@ class MJEPA(nn.Module):
         self.student = backbone
         self.teacher = setup_teacher(backbone)
         self.predictor = predictor
-        self.gram_teacher = setup_teacher(backbone) if config.gram_start_epoch is not None else None
+        self.gram_teacher = (
+            setup_teacher(backbone)
+            if config.gram_start_epoch is not None and config.gram_teacher == "backbone"
+            else None
+        )
         self.dtype = dtype
         self._gram_cooldown_end_epoch: int | None = None
 
@@ -119,6 +123,18 @@ class MJEPA(nn.Module):
             gram_teacher_output = apply_mask(context_mask, gram_teacher_output, fill_value=None)
         return gram_teacher_output.clone()
 
+    def forward_gram_anchor(self, x: Tensor, context_mask: Tensor) -> Tensor:
+        self.teacher.eval()
+        with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
+            stem_tokens = self.teacher.stem(x)
+            gram_anchor_output = apply_mask(context_mask, stem_tokens, fill_value=None)
+        return gram_anchor_output.detach().clone()
+
+    def forward_gram_source(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> Tensor:
+        if self.config.gram_teacher == "stem":
+            return self.forward_gram_anchor(x, context_mask)
+        return self.forward_gram_teacher(x, context_mask, rope_seed)
+
     def _is_gram_cooldown_active(self, epoch: int) -> bool:
         if self._gram_cooldown_end_epoch is None:
             return False
@@ -130,22 +146,24 @@ class MJEPA(nn.Module):
         return epoch >= self.config.gram_start_epoch and not self._is_gram_cooldown_active(epoch)
 
     def update_gram_teacher(self, current_epoch: int, resolution_changed: bool = False):
-        if self.gram_teacher is None:
-            return
-
-        should_sync_gram_teacher = current_epoch == self.config.gram_teacher_epoch
-
-        # Initial Gram teacher setup (if necessary)
         # Pause gram anchoring updates after a resolution transition.
         interval = self.config.gram_update_interval_epoch
+        cooldown_just_ended = False
         if resolution_changed and interval > 0:
             self._gram_cooldown_end_epoch = current_epoch + interval
 
         if self._gram_cooldown_end_epoch is not None:
             if current_epoch < self._gram_cooldown_end_epoch:
                 return
-            should_sync_gram_teacher = should_sync_gram_teacher or current_epoch >= self.config.gram_teacher_epoch
+            cooldown_just_ended = True
             self._gram_cooldown_end_epoch = None
+
+        if self.gram_teacher is None:
+            return
+
+        should_sync_gram_teacher = current_epoch == self.config.gram_teacher_epoch
+        if cooldown_just_ended:
+            should_sync_gram_teacher = should_sync_gram_teacher or current_epoch >= self.config.gram_teacher_epoch
 
         # Gram teacher update
         if is_gram_update_epoch(current_epoch, self.config.gram_start_epoch, self.config.gram_update_interval_epoch):
@@ -198,7 +216,7 @@ class MJEPA(nn.Module):
         # Teacher / Gram teacher forward pass
         teacher_output = self.forward_teacher(x)
         gram_teacher_output = (
-            self.forward_gram_teacher(x, context_mask, rope_seed) if self._is_gram_enabled_for_epoch(epoch) else None
+            self.forward_gram_source(x, context_mask, rope_seed) if self._is_gram_enabled_for_epoch(epoch) else None
         )
 
         Ht, Wt = cast(tuple[int, int], self.student.stem.tokenized_size(x.shape[-2:]))

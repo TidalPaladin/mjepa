@@ -1,7 +1,7 @@
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -350,9 +350,10 @@ class JEPAConfig:
             from this value to 1.0 over the course of training if scheduled is ``True``.
         scheduled: Whether to schedule the momentum.
         predictor_depth: Depth of the predictor network.
-        gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
-            If ``None``, the Gram loss will not be computed.
-        gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
+        gram_teacher: Source to use for Gram supervision.
+            ``"backbone"`` uses a dedicated EMA Gram teacher backbone.
+            ``"stem"`` uses detached masked tokens from the online EMA teacher stem.
+        gram_start_epoch: The epoch at which to begin computing the Gram loss.
             If ``None``, the Gram loss will not be computed.
         gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
         gram_resolution_scale: The scale at which to feed inputs through the Gram teacher.
@@ -367,6 +368,7 @@ class JEPAConfig:
     momentum: float = 0.99
     scheduled: bool = False
     predictor_depth: int = 4
+    gram_teacher: Literal["backbone", "stem"] = "backbone"
     gram_teacher_epoch: int = 100
     gram_start_epoch: int | None = None
     gram_update_interval_epoch: int = 10
@@ -376,6 +378,8 @@ class JEPAConfig:
     sigreg_loss_weight: float = 1e-4
 
     def __post_init__(self) -> None:
+        if self.gram_teacher not in {"backbone", "stem"}:
+            raise ValueError("gram_teacher must be one of {'backbone', 'stem'}")
         if not 0 < self.context_ratio <= 1:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:
