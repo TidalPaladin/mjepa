@@ -14,10 +14,18 @@ SIMILARITY_MAX = 1.0
 SIMILARITY_SPAN = SIMILARITY_MAX - SIMILARITY_MIN
 CPA_P90 = 0.90
 CPA_P99 = 0.99
+GRID_HW_NUM_DIMS = 2
+CPA_RESULT_KEYS = ("cpa_mean", "cpa_std", "cpa_p90", "cpa_p99")
+SDC_RESULT_KEY = "sdc_spearman_proxy"
 
 
 def _nan_like(reference: Tensor) -> Tensor:
     return torch.tensor(float("nan"), dtype=reference.dtype, device=reference.device)
+
+
+def _nan_result(reference: Tensor, keys: tuple[str, ...]) -> dict[str, Tensor]:
+    nan = _nan_like(reference)
+    return {key: nan for key in keys}
 
 
 class CLSPatchAlignmentMetric(Metric):
@@ -113,13 +121,7 @@ class CLSPatchAlignmentMetric(Metric):
         sum_sq_state = cast(Tensor, self.sum_sq)
 
         if count_state <= 0:
-            nan = _nan_like(sum_state)
-            return {
-                "cpa_mean": nan,
-                "cpa_std": nan,
-                "cpa_p90": nan,
-                "cpa_p99": nan,
-            }
+            return _nan_result(sum_state, CPA_RESULT_KEYS)
 
         count = count_state.to(dtype=sum_state.dtype)
         mean = sum_state / count
@@ -162,16 +164,32 @@ class SimilarityDistanceCouplingMetric(Metric):
         self.add_state("rho_weighted_sum", default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
 
     def _rank_normalize(self, values: Tensor) -> Tensor:
-        ranks = torch.argsort(torch.argsort(values)).to(dtype=torch.float64)
+        num_values = values.numel()
+        if num_values == 0:
+            return values.to(dtype=torch.float64)
+
+        sorted_values, sorted_indices = torch.sort(values)
+        group_start_mask = torch.ones(num_values, dtype=torch.bool, device=values.device)
+        group_start_mask[1:] = sorted_values[1:] != sorted_values[:-1]
+        group_starts = torch.nonzero(group_start_mask, as_tuple=False).reshape(-1)
+
+        group_ends = torch.empty_like(group_starts)
+        group_ends[:-1] = group_starts[1:] - 1
+        group_ends[-1] = num_values - 1
+        group_lengths = group_ends - group_starts + 1
+
+        average_ranks = (group_starts + group_ends).to(dtype=torch.float64) / 2.0
+        sorted_ranks = torch.repeat_interleave(average_ranks, group_lengths)
+
+        ranks = torch.empty(num_values, dtype=torch.float64, device=values.device)
+        ranks.scatter_(0, sorted_indices, sorted_ranks)
         mean = ranks.mean()
         std = ranks.std(unbiased=False)
         return (ranks - mean) / (std + self.eps)
 
-    def update(self, patch_tokens: Tensor, grid_hw: tuple[int, int] | list[int]) -> None:
-        if patch_tokens.ndim != 3:
-            raise ValueError("patch_tokens must have shape [B, N, D]")
-
-        if len(grid_hw) != 2:
+    @staticmethod
+    def _parse_grid_hw(grid_hw: tuple[int, int] | list[int]) -> tuple[int, int]:
+        if len(grid_hw) != GRID_HW_NUM_DIMS:
             raise ValueError("grid_hw must have length 2 as (H, W)")
 
         h_raw, w_raw = grid_hw
@@ -182,6 +200,13 @@ class SimilarityDistanceCouplingMetric(Metric):
         w = int(w_raw)
         if h <= 0 or w <= 0:
             raise ValueError("grid_hw entries must be positive")
+        return h, w
+
+    def update(self, patch_tokens: Tensor, grid_hw: tuple[int, int] | list[int]) -> None:
+        if patch_tokens.ndim != 3:
+            raise ValueError("patch_tokens must have shape [B, N, D]")
+
+        h, w = self._parse_grid_hw(grid_hw)
 
         batch_size, num_patches, dim = patch_tokens.shape
         expected_patches = h * w
@@ -206,6 +231,9 @@ class SimilarityDistanceCouplingMetric(Metric):
         pi = coords[i.reshape(-1)]
         pj = coords[j.reshape(-1)]
         dists = (pi - pj).norm(dim=-1)
+        num_pairs = sims.numel()
+        if num_pairs == 0:
+            return
 
         sim_rank = self._rank_normalize(sims)
         dist_rank = self._rank_normalize(dists)
@@ -214,7 +242,6 @@ class SimilarityDistanceCouplingMetric(Metric):
         pair_count_state = cast(Tensor, self.pair_count)
         rho_weighted_sum_state = cast(Tensor, self.rho_weighted_sum)
 
-        num_pairs = sims.numel()
         pair_count_state.add_(num_pairs)
         rho_weighted_sum_state.add_(
             rho_update.to(dtype=rho_weighted_sum_state.dtype, device=rho_weighted_sum_state.device) * num_pairs
@@ -225,11 +252,10 @@ class SimilarityDistanceCouplingMetric(Metric):
         rho_weighted_sum_state = cast(Tensor, self.rho_weighted_sum)
 
         if pair_count_state <= 0:
-            nan = _nan_like(rho_weighted_sum_state)
-            return {"sdc_spearman_proxy": nan}
+            return _nan_result(rho_weighted_sum_state, (SDC_RESULT_KEY,))
 
         pair_count = pair_count_state.to(dtype=rho_weighted_sum_state.dtype)
-        return {"sdc_spearman_proxy": rho_weighted_sum_state / pair_count}
+        return {SDC_RESULT_KEY: rho_weighted_sum_state / pair_count}
 
     def plot(self, val: Any = None, ax: Any = None) -> Any:
         raise NotImplementedError("Plotting is not implemented for SimilarityDistanceCouplingMetric")

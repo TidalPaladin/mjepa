@@ -1,6 +1,7 @@
+import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -202,33 +203,89 @@ def setup_teacher(backbone: M) -> M:
 
 
 @torch.compile(fullgraph=True)
-def compute_gram_loss(student: Tensor, anchor: Tensor, normalize: bool = True, remove_neg: bool = True) -> Tensor:
-    r"""Compute the Gram loss between student features and detached Gram anchor features.
+def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True, remove_neg: bool = True) -> Tensor:
+    r"""Compute the Gram loss between student features and the Gram teacher's features.
 
     Args:
         student: Student features.
-        anchor: Detached Gram anchor features.
+        teacher: Gram teacher features.
         normalize: Whether to normalize the features.
         remove_neg: Whether to remove negative values from the Gram matrix.
 
     Shapes:
         student: :math:`(*, L, D)`
-        anchor: :math:`(*, L, D)`
+        teacher: :math:`(*, L, D)`
         Output: Scalar
 
     Returns:
         The Gram loss.
     """
     student = F.normalize(student, dim=-1) if normalize else student
-    anchor = F.normalize(anchor, dim=-1) if normalize else anchor
+    teacher = F.normalize(teacher, dim=-1) if normalize else teacher
 
     student_sim = student.bmm(student.mT)
-    anchor_sim = anchor.bmm(anchor.mT)
+    teacher_sim = teacher.bmm(teacher.mT)
     if remove_neg:
-        anchor_sim = anchor_sim.clamp(min=0.0)
+        teacher_sim = teacher_sim.clamp(min=0.0)
         student_sim = student_sim.clamp(min=0.0)
 
-    return F.mse_loss(student_sim, anchor_sim)
+    return F.mse_loss(student_sim, teacher_sim)
+
+
+def is_gram_update_epoch(epoch: int, gram_start_epoch: int | None, gram_update_interval_epoch: int) -> bool:
+    r"""Check if the current epoch is a Gram update epoch.
+
+    Args:
+        epoch: Current epoch.
+        gram_start_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
+        gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
+    """
+    if gram_start_epoch is None or gram_update_interval_epoch <= 0:
+        return False
+    return epoch > gram_start_epoch and (epoch - gram_start_epoch) % gram_update_interval_epoch == 0
+
+
+def forward_gram_teacher(
+    gram_teacher: ViT,
+    img: Tensor,
+    rope_seed: int | None = None,
+    resolution_scale: float = 1.0,
+) -> Tensor:
+    r"""Forward pass through the Gram teacher.
+
+    Applies image upsampling and downsampling to the input and output, respectively.
+
+    Args:
+        gram_teacher: Gram teacher model.
+        img: Input image.
+        rope_seed: Rope seed.
+        resolution_scale: Resolution scale.
+
+    Shapes:
+        img: :math:`(*, C, H, W)`
+        Output: :math:`(*, L, D)`
+
+    Returns:
+        Output features.
+    """
+    # Resize input according to resolution scale, tracking the tokenized size of the input and output
+    target_tokenized_size = gram_teacher.stem.tokenized_size(img.shape[-2:])
+    img = F.interpolate(img, scale_factor=resolution_scale, mode="bilinear", align_corners=False)
+    output_tokenized_size = gram_teacher.stem.tokenized_size(img.shape[-2:])
+
+    assert not gram_teacher.training, "Gram teacher must be in evaluation mode"
+
+    # Forward pass and resize output features to original size
+    gram_teacher_output = gram_teacher(img, rope_seed=rope_seed).visual_tokens
+    B, _, D = gram_teacher_output.shape
+    gram_teacher_output = gram_teacher_output.movedim(1, -1).reshape(B, D, *output_tokenized_size)
+    gram_teacher_output = F.interpolate(
+        gram_teacher_output, scale_factor=1 / resolution_scale, mode="bilinear", align_corners=False
+    )
+    gram_teacher_output = gram_teacher_output.flatten(2).movedim(-1, 1)
+
+    assert gram_teacher_output.shape == (B, math.prod(target_tokenized_size), D)
+    return gram_teacher_output
 
 
 @torch.compile
@@ -293,8 +350,13 @@ class JEPAConfig:
             from this value to 1.0 over the course of training if scheduled is ``True``.
         scheduled: Whether to schedule the momentum.
         predictor_depth: Depth of the predictor network.
-        gram_start_epoch: The epoch at which Gram loss begins contributing gradients.
-            If ``None``, Gram loss is tracked but excluded from optimization updates.
+        gram_teacher: Source to use for Gram supervision.
+            ``"backbone"`` uses a dedicated EMA Gram teacher backbone.
+            ``"stem"`` uses detached masked tokens from the online EMA teacher stem.
+        gram_start_epoch: The epoch at which to begin computing the Gram loss.
+            If ``None``, the Gram loss will not be computed.
+        gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
+        gram_resolution_scale: The scale at which to feed inputs through the Gram teacher.
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
         gram_loss_weight: The coefficient of the Gram loss.
         sigreg_loss_weight: The coefficient of the SigREG loss.
@@ -306,18 +368,32 @@ class JEPAConfig:
     momentum: float = 0.99
     scheduled: bool = False
     predictor_depth: int = 4
+    gram_teacher: Literal["backbone", "stem"] = "backbone"
+    gram_teacher_epoch: int = 100
     gram_start_epoch: int | None = None
+    gram_update_interval_epoch: int = 10
+    gram_resolution_scale: float = 2.0
     gram_remove_neg: bool = False
     gram_loss_weight: float = 1.0
     sigreg_loss_weight: float = 1e-4
 
     def __post_init__(self) -> None:
+        if self.gram_teacher not in {"backbone", "stem"}:
+            raise ValueError("gram_teacher must be one of {'backbone', 'stem'}")
         if not 0 < self.context_ratio <= 1:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:
             raise ValueError("target_ratio must be in the range (0, 1]")
+        if self.gram_teacher_epoch <= 0:
+            raise ValueError("gram_teacher_epoch must be a positive integer")
         if self.gram_start_epoch is not None and self.gram_start_epoch <= 0:
             raise ValueError("gram_start_epoch must be a positive integer or None")
+        if self.gram_update_interval_epoch < 0:
+            raise ValueError("gram_update_interval_epoch must be a non-negative integer")
+        if self.gram_start_epoch is not None and self.gram_start_epoch < self.gram_teacher_epoch:
+            raise ValueError("gram_start_epoch must be greater than or equal to gram_teacher_epoch")
+        if self.gram_resolution_scale <= 0:
+            raise ValueError("gram_resolution_scale must be a positive float")
         if self.gram_loss_weight <= 0:
             raise ValueError("gram_loss_weight must be a positive float")
         if self.sigreg_loss_weight < 0:
