@@ -31,9 +31,9 @@ class CrossAttentionPredictor(nn.Module):
         depth: Depth of the predictor network.
         out_dim: Output dimension of the predictor.
             If ``None``, the output dimension will be the same as the input dimension.
+        device: Device to place the predictor on.
         disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
             and attention dropout to ``0.0``.
-        device: Device to place the predictor on.
     """
 
     def __init__(
@@ -41,8 +41,8 @@ class CrossAttentionPredictor(nn.Module):
         backbone: ViT,
         depth: int,
         out_dim: int | None = None,
-        disable_predictor_regularizers: bool = False,
         device: torch.device | None = None,
+        disable_predictor_regularizers: bool = False,
     ):
         super().__init__()
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)

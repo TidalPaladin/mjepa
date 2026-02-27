@@ -469,6 +469,18 @@ class TestCrossAttentionPredictor:
 
         self._assert_predictor_regularizers(predictor, 0.0, 0.0, 0.0)
 
+    def test_predictor_positional_device_arg_is_backwards_compatible(self):
+        """Test positional device argument does not toggle regularizer override."""
+        hidden_dropout = 0.2
+        attention_dropout = 0.3
+        drop_path_rate = 0.4
+        backbone = self._instantiate_backbone_with_regularizers(hidden_dropout, attention_dropout, drop_path_rate)
+        device = torch.device("cpu")
+
+        predictor = CrossAttentionPredictor(backbone, 2, None, device)
+
+        self._assert_predictor_regularizers(predictor, hidden_dropout, attention_dropout, drop_path_rate)
+
 
 class TestGenerateMasks:
     """Test generate_masks function."""
