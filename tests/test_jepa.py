@@ -1,4 +1,5 @@
 import math
+from typing import Any, cast
 
 import pytest
 import torch
@@ -107,6 +108,7 @@ class TestJEPAConfig:
         assert config.scale == 4
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
+        assert config.disable_predictor_regularizers is False
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -116,12 +118,14 @@ class TestJEPAConfig:
             scale=8,
             momentum=0.95,
             predictor_depth=6,
+            disable_predictor_regularizers=True,
         )
         assert config.context_ratio == 0.6
         assert config.target_ratio == 0.3
         assert config.scale == 8
         assert config.momentum == 0.95
         assert config.predictor_depth == 6
+        assert config.disable_predictor_regularizers is True
 
     def test_invalid_context_ratio(self):
         """Test invalid context ratio."""
@@ -154,6 +158,7 @@ class TestYAMLConfig:
             "scale": 16,
             "momentum": 0.98,
             "predictor_depth": 8,
+            "disable_predictor_regularizers": True,
         }
         loader.construct_mapping.return_value = config_dict
 
@@ -167,6 +172,7 @@ class TestYAMLConfig:
         assert config.scale == 16
         assert config.momentum == 0.98
         assert config.predictor_depth == 8
+        assert config.disable_predictor_regularizers is True
 
         # Verify the loader was called correctly
         loader.construct_mapping.assert_called_once_with(node, deep=True)
@@ -184,6 +190,7 @@ class TestYAMLConfig:
         scale: 12
         momentum: 0.97
         predictor_depth: 5
+        disable_predictor_regularizers: true
         """
 
         # Load the YAML
@@ -196,6 +203,7 @@ class TestYAMLConfig:
         assert config.scale == 12
         assert config.momentum == 0.97
         assert config.predictor_depth == 5
+        assert config.disable_predictor_regularizers is True
 
 
 class TestComputeSigREGLoss:
@@ -261,6 +269,35 @@ class TestComputeSigREGLoss:
 
 class TestCrossAttentionPredictor:
     """Test CrossAttentionPredictor initialization and device/dtype handling."""
+
+    @staticmethod
+    def _instantiate_backbone_with_regularizers(hidden_dropout: float, attention_dropout: float, drop_path_rate: float):
+        vit_config = ViTConfig(
+            in_channels=3,
+            hidden_size=64,
+            patch_size=[4, 4],
+            img_size=[32, 32],
+            depth=2,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            hidden_dropout=hidden_dropout,
+            attention_dropout=attention_dropout,
+            drop_path_rate=drop_path_rate,
+            pos_enc="rope",
+            dtype=torch.float32,
+        )
+        return vit_config.instantiate()
+
+    @staticmethod
+    def _assert_predictor_regularizers(
+        predictor: CrossAttentionPredictor, hidden_dropout: float, attention_dropout: float, drop_path_rate: float
+    ) -> None:
+        for block in predictor.blocks:
+            block = cast(Any, block)
+            assert block.drop_path_rate == pytest.approx(drop_path_rate)
+            assert block.cross_attention.dropout.p == pytest.approx(hidden_dropout)
+            assert block.cross_attention.attention_dropout.p == pytest.approx(attention_dropout)
+            assert block.mlp.dropout.p == pytest.approx(hidden_dropout)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
     def test_predictor_initialization_cpu_dtype(self, dtype):
@@ -411,6 +448,38 @@ class TestCrossAttentionPredictor:
         # Check the output projection dimension
         expected_out_dim = out_dim if out_dim is not None else hidden_size
         assert predictor.predictor_proj.out_features == expected_out_dim
+
+    def test_predictor_regularizers_follow_backbone_by_default(self):
+        """Test predictor regularizer values are inherited from the backbone by default."""
+        hidden_dropout = 0.2
+        attention_dropout = 0.3
+        drop_path_rate = 0.4
+        backbone = self._instantiate_backbone_with_regularizers(hidden_dropout, attention_dropout, drop_path_rate)
+        predictor = CrossAttentionPredictor(backbone, depth=2, disable_predictor_regularizers=False)
+
+        self._assert_predictor_regularizers(predictor, hidden_dropout, attention_dropout, drop_path_rate)
+
+    def test_predictor_regularizers_can_be_disabled(self):
+        """Test predictor regularizers are set to zero when override is enabled."""
+        hidden_dropout = 0.2
+        attention_dropout = 0.3
+        drop_path_rate = 0.4
+        backbone = self._instantiate_backbone_with_regularizers(hidden_dropout, attention_dropout, drop_path_rate)
+        predictor = CrossAttentionPredictor(backbone, depth=2, disable_predictor_regularizers=True)
+
+        self._assert_predictor_regularizers(predictor, 0.0, 0.0, 0.0)
+
+    def test_predictor_positional_device_arg_is_backwards_compatible(self):
+        """Test positional device argument does not toggle regularizer override."""
+        hidden_dropout = 0.2
+        attention_dropout = 0.3
+        drop_path_rate = 0.4
+        backbone = self._instantiate_backbone_with_regularizers(hidden_dropout, attention_dropout, drop_path_rate)
+        device = torch.device("cpu")
+
+        predictor = CrossAttentionPredictor(backbone, 2, None, device)
+
+        self._assert_predictor_regularizers(predictor, hidden_dropout, attention_dropout, drop_path_rate)
 
 
 class TestGenerateMasks:
