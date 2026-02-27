@@ -57,6 +57,7 @@ augmentations: !!python/object:mjepa.AugmentationConfig
 jepa: !!python/object:mjepa.JEPAConfig
   momentum: 0.98
   predictor_depth: 4
+  disable_predictor_regularizers: false
   context_ratio: 0.5
   target_ratio: 0.25
   scale: 2

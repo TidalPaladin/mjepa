@@ -1,7 +1,7 @@
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -29,11 +29,11 @@ class CrossAttentionPredictor(nn.Module):
     Args:
         backbone: Backbone model with a :meth:`create_cross_attention_layer` method.
         depth: Depth of the predictor network.
-        context_pos_emb: Whether to introduce positional encoding to the context.
         out_dim: Output dimension of the predictor.
             If ``None``, the output dimension will be the same as the input dimension.
+        disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
+            and attention dropout to ``0.0``.
         device: Device to place the predictor on.
-        dtype: Data type to place the predictor on.
     """
 
     def __init__(
@@ -41,6 +41,7 @@ class CrossAttentionPredictor(nn.Module):
         backbone: ViT,
         depth: int,
         out_dim: int | None = None,
+        disable_predictor_regularizers: bool = False,
         device: torch.device | None = None,
     ):
         super().__init__()
@@ -52,6 +53,8 @@ class CrossAttentionPredictor(nn.Module):
 
         # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer(device=device) for _ in range(depth)])
+        if disable_predictor_regularizers:
+            self._disable_predictor_regularizers()
 
         self.predictor_proj = nn.Linear(
             backbone.config.hidden_size,
@@ -59,6 +62,16 @@ class CrossAttentionPredictor(nn.Module):
             device=device,
             dtype=backbone.config.dtype,
         )
+
+    def _disable_predictor_regularizers(self) -> None:
+        # Force predictor regularizers to zero without changing the backbone configuration.
+        no_regularization = 0.0
+        for block in self.blocks:
+            block = cast(Any, block)
+            block.drop_path_rate = no_regularization
+            block.cross_attention.dropout.p = no_regularization
+            block.cross_attention.attention_dropout.p = no_regularization
+            block.mlp.dropout.p = no_regularization
 
     def forward(
         self,
@@ -350,9 +363,10 @@ class JEPAConfig:
             from this value to 1.0 over the course of training if scheduled is ``True``.
         scheduled: Whether to schedule the momentum.
         predictor_depth: Depth of the predictor network.
-        gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
-            If ``None``, the Gram loss will not be computed.
-        gram_epoch: The epoch at which to store a checkpoint and begin computing the Gram loss.
+        disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
+            and attention dropout to ``0.0``.
+        gram_teacher_epoch: Epoch when the Gram teacher is first synchronized from the teacher.
+        gram_start_epoch: The epoch at which to begin computing the Gram loss.
             If ``None``, the Gram loss will not be computed.
         gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
         gram_resolution_scale: The scale at which to feed inputs through the Gram teacher.
@@ -367,6 +381,7 @@ class JEPAConfig:
     momentum: float = 0.99
     scheduled: bool = False
     predictor_depth: int = 4
+    disable_predictor_regularizers: bool = False
     gram_teacher_epoch: int = 100
     gram_start_epoch: int | None = None
     gram_update_interval_epoch: int = 10
