@@ -45,7 +45,7 @@ class MJEPALosses:
 @dataclass
 class MJEPAPredictions:
     pred: Tensor
-    pred_with_cls: Tensor | None
+    cls_global_pred: Tensor | None
     student_output: ViTFeatures
     teacher_output: ViTFeatures
     context_mask: Tensor
@@ -93,9 +93,21 @@ class MJEPA(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        num_extra_context_tokens: int = 0,
     ) -> Tensor:
         with torch.autocast(device_type=context.device.type, dtype=self.dtype):
-            return self.predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+            return self.predictor(
+                tokenized_size,
+                context,
+                context_mask,
+                target_mask,
+                rope_seed=rope_seed,
+                num_extra_context_tokens=num_extra_context_tokens,
+            )
+
+    def forward_predictor_cls_global(self, cls_tokens: Tensor) -> Tensor:
+        with torch.autocast(device_type=cls_tokens.device.type, dtype=self.dtype):
+            return self.predictor.forward_cls_global(cls_tokens)
 
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
         return dict()
@@ -118,7 +130,10 @@ class MJEPA(nn.Module):
         # Compute JEPA loss
         target = apply_mask(output.target_mask, output.teacher_output.visual_tokens, fill_value=None).float()
         jepa_loss = F.mse_loss(output.pred.float(), target)
-        jepa_loss_cls = F.mse_loss(output.pred_with_cls.float(), target) if output.pred_with_cls is not None else 0.0
+        cls_target = output.teacher_output.visual_tokens.float().mean(dim=1)
+        jepa_loss_cls = (
+            F.mse_loss(output.cls_global_pred.float(), cls_target) if output.cls_global_pred is not None else 0.0
+        )
 
         # Compute SigREG loss
         sigreg_loss = (
@@ -160,21 +175,29 @@ class MJEPA(nn.Module):
         Ht, Wt = cast(tuple[int, int], self.student.stem.tokenized_size(x.shape[-2:]))
 
         student_output = self.forward_student(x, context_mask, rope_seed=rope_seed)
+        cls_tokens = student_output.cls_tokens
+        num_cls_tokens = cls_tokens.shape[1]
+        context_tokens = (
+            torch.cat([student_output.visual_tokens, cls_tokens], dim=1)
+            if num_cls_tokens
+            else student_output.visual_tokens
+        )
         pred = self.forward_predictor(
-            (Ht, Wt), student_output.visual_tokens, context_mask, target_mask, rope_seed=rope_seed
+            (Ht, Wt),
+            context_tokens,
+            context_mask,
+            target_mask,
+            rope_seed=rope_seed,
+            num_extra_context_tokens=num_cls_tokens,
         )
-        pred_with_cls = (
-            self.forward_predictor((Ht, Wt), student_output.cls_tokens, None, target_mask, rope_seed=rope_seed)
-            if student_output.cls_tokens.numel()
-            else None
-        )
+        cls_global_pred = self.forward_predictor_cls_global(cls_tokens) if cls_tokens.numel() else None
 
         with torch.autocast(device_type=pred.device.type, dtype=self.dtype):
             probes = self.forward_probe(teacher_output)
 
         return MJEPAPredictions(
             pred=pred,
-            pred_with_cls=pred_with_cls,
+            cls_global_pred=cls_global_pred,
             student_output=student_output,
             teacher_output=teacher_output,
             context_mask=context_mask,

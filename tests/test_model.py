@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 from vit import ViT, ViTConfig, ViTFeatures
 from vit.tokens import apply_mask
 
@@ -121,14 +122,14 @@ class TestMJEPALosses:
 class TestMJEPAPredictions:
     def test_initialization(self, dummy_vit_features):
         pred = torch.randn(BATCH_SIZE, NUM_TARGET_TOKENS, HIDDEN_SIZE)
-        pred_with_cls = torch.randn(BATCH_SIZE, NUM_TARGET_TOKENS, HIDDEN_SIZE)
+        cls_global_pred = torch.randn(BATCH_SIZE, HIDDEN_SIZE)
         context_mask = torch.randint(0, 2, (BATCH_SIZE, NUM_TOKENS), dtype=torch.bool)
         target_mask = torch.randint(0, 2, (BATCH_SIZE, NUM_TOKENS), dtype=torch.bool)
         gram_target_output = torch.randn(BATCH_SIZE, NUM_TOKENS, HIDDEN_SIZE)
 
         predictions = MJEPAPredictions(
             pred=pred,
-            pred_with_cls=pred_with_cls,
+            cls_global_pred=cls_global_pred,
             student_output=dummy_vit_features,
             teacher_output=dummy_vit_features,
             context_mask=context_mask,
@@ -211,7 +212,7 @@ class TestMJEPAWarmup:
 class TestMJEPAComputeLosses:
     def _build_predictions(self) -> MJEPAPredictions:
         pred = torch.randn(BATCH_SIZE, NUM_TARGET_TOKENS, HIDDEN_SIZE)
-        pred_with_cls = torch.randn(BATCH_SIZE, NUM_TARGET_TOKENS, HIDDEN_SIZE)
+        cls_global_pred = torch.randn(BATCH_SIZE, HIDDEN_SIZE)
         dense_features = torch.randn(BATCH_SIZE, NUM_TOKENS + NUM_CLS_TOKENS + NUM_REGISTER_TOKENS, HIDDEN_SIZE)
         student_output = ViTFeatures(dense_features, NUM_REGISTER_TOKENS, NUM_CLS_TOKENS)
         teacher_output = ViTFeatures(dense_features.clone(), NUM_REGISTER_TOKENS, NUM_CLS_TOKENS)
@@ -221,7 +222,7 @@ class TestMJEPAComputeLosses:
 
         return MJEPAPredictions(
             pred=pred,
-            pred_with_cls=pred_with_cls,
+            cls_global_pred=cls_global_pred,
             student_output=student_output,
             teacher_output=teacher_output,
             target_mask=target_mask,
@@ -245,6 +246,20 @@ class TestMJEPAComputeLosses:
         assert isinstance(losses.gram_loss, torch.Tensor)
         assert losses.gram_loss_weight == pytest.approx(0.0)
 
+    def test_compute_losses_cls_uses_pooled_teacher_visual_target(self, mjepa_model: MJEPA):
+        output = self._build_predictions()
+        losses = mjepa_model.compute_losses(output=output, step=0, epoch=WARMUP_EPOCHS)
+        assert output.cls_global_pred is not None
+        expected = F.mse_loss(output.cls_global_pred.float(), output.teacher_output.visual_tokens.float().mean(dim=1))
+        assert isinstance(losses.jepa_loss_cls, torch.Tensor)
+        assert torch.allclose(losses.jepa_loss_cls, expected)
+
+    def test_compute_losses_cls_is_zero_without_cls_pred(self, mjepa_model: MJEPA):
+        output = self._build_predictions()
+        output.cls_global_pred = None
+        losses = mjepa_model.compute_losses(output=output, step=0, epoch=WARMUP_EPOCHS)
+        assert losses.jepa_loss_cls == 0.0
+
 
 class TestMJEPAForward:
     def test_forward_includes_gram_target_at_all_epochs(self, mjepa_model: MJEPA, dummy_batch):
@@ -258,10 +273,44 @@ class TestMJEPAForward:
         assert predictions_epoch_20.gram_target_output is not None
         assert not predictions_epoch_0.gram_target_output.requires_grad
 
+    def test_forward_calls_predictor_once_with_fused_context(self, mjepa_model: MJEPA, dummy_batch, monkeypatch):
+        predictor_calls: list[tuple[int, int]] = []
+        original_forward_predictor = mjepa_model.forward_predictor
+
+        def wrapped_forward_predictor(
+            tokenized_size: tuple[int, int],
+            context: torch.Tensor,
+            context_mask: torch.Tensor | None,
+            target_mask: torch.Tensor,
+            rope_seed: int | None = None,
+            num_extra_context_tokens: int = 0,
+        ) -> torch.Tensor:
+            predictor_calls.append((context.shape[1], num_extra_context_tokens))
+            return original_forward_predictor(
+                tokenized_size,
+                context,
+                context_mask,
+                target_mask,
+                rope_seed=rope_seed,
+                num_extra_context_tokens=num_extra_context_tokens,
+            )
+
+        monkeypatch.setattr(mjepa_model, "forward_predictor", wrapped_forward_predictor)
+        predictions = mjepa_model(dummy_batch, jepa_scale=2, epoch=0)
+
+        assert len(predictor_calls) == 1
+        context_len, num_extra_context_tokens = predictor_calls[0]
+        expected_extra_context_tokens = predictions.student_output.cls_tokens.shape[1]
+        expected_context_len = predictions.student_output.visual_tokens.shape[1] + expected_extra_context_tokens
+        assert num_extra_context_tokens == expected_extra_context_tokens
+        assert context_len == expected_context_len
+
     def test_forward_training_mode(self, mjepa_model: MJEPA, dummy_batch):
         mjepa_model.train()
         predictions = mjepa_model(dummy_batch, jepa_scale=2, epoch=0)
         assert predictions.pred.requires_grad
+        assert predictions.cls_global_pred is not None
+        assert predictions.cls_global_pred.requires_grad
 
 
 class TestMJEPAEndToEnd:
@@ -276,6 +325,9 @@ class TestMJEPAEndToEnd:
             if param.requires_grad:
                 assert param.grad is not None
                 break
+
+        for param in mjepa_model.predictor.cls_global_head.parameters():
+            assert param.grad is not None
 
     def test_teacher_update_workflow(self, mjepa_model: MJEPA):
         initial_weight = mjepa_model.teacher.stem.patch.weight.data.clone()

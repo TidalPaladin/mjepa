@@ -49,6 +49,7 @@ class CrossAttentionPredictor(nn.Module):
             backbone.config.hidden_size, spatial_size, device=device, dtype=backbone.config.dtype
         )
         self.rope = backbone.rope
+        predictor_out_dim = out_dim or backbone.config.hidden_size
 
         # Predictor blocks and output projection
         self.blocks = nn.ModuleList([backbone.create_cross_attention_layer(device=device) for _ in range(depth)])
@@ -57,7 +58,13 @@ class CrossAttentionPredictor(nn.Module):
 
         self.predictor_proj = nn.Linear(
             backbone.config.hidden_size,
-            out_dim or backbone.config.hidden_size,
+            predictor_out_dim,
+            device=device,
+            dtype=backbone.config.dtype,
+        )
+        self.cls_global_head = nn.Linear(
+            backbone.config.hidden_size,
+            predictor_out_dim,
             device=device,
             dtype=backbone.config.dtype,
         )
@@ -79,6 +86,7 @@ class CrossAttentionPredictor(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        num_extra_context_tokens: int = 0,
     ) -> Tensor:
         # Create positional encodings
         B, _ = target_mask.shape
@@ -86,13 +94,22 @@ class CrossAttentionPredictor(nn.Module):
 
         # Prepare inputs
         query = pos_target
-        rope_q, rope_k = self.prepare_rope(tokenized_size, context_mask, target_mask, rope_seed=rope_seed)
+        rope_q, rope_k = self.prepare_rope(
+            tokenized_size,
+            context_mask,
+            target_mask,
+            rope_seed=rope_seed,
+            num_extra_context_tokens=num_extra_context_tokens,
+        )
 
         # Run query and context through predictor
         for block in self.blocks:
             query = block(query, context, rope_q=rope_q, rope_k=rope_k)
 
         return self.predictor_proj(query)
+
+    def forward_cls_global(self, cls_tokens: Tensor) -> Tensor:
+        return self.cls_global_head(cls_tokens.mean(dim=1))
 
     if TYPE_CHECKING:
 
@@ -103,8 +120,16 @@ class CrossAttentionPredictor(nn.Module):
             context_mask: Tensor | None,
             target_mask: Tensor,
             rope_seed: int | None = None,
+            num_extra_context_tokens: int = 0,
         ) -> Tensor:
-            return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed)
+            return self.forward(
+                tokenized_size,
+                context,
+                context_mask,
+                target_mask,
+                rope_seed,
+                num_extra_context_tokens,
+            )
 
     def prepare_rope(
         self,
@@ -112,6 +137,7 @@ class CrossAttentionPredictor(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        num_extra_context_tokens: int = 0,
     ) -> tuple[Tensor | None, Tensor | None]:
         if self.rope is None:
             return None, None
@@ -128,6 +154,12 @@ class CrossAttentionPredictor(nn.Module):
         if context_mask is not None:
             sin_k = apply_mask(context_mask, sin[None].expand(B, -1, -1))
             cos_k = apply_mask(context_mask, cos[None].expand(B, -1, -1))
+            if num_extra_context_tokens > 0:
+                identity_shape = (B, num_extra_context_tokens, sin_k.shape[-1])
+                sin_extra = sin_k.new_zeros(identity_shape)
+                cos_extra = cos_k.new_ones(identity_shape)
+                sin_k = torch.cat([sin_k, sin_extra], dim=1)
+                cos_k = torch.cat([cos_k, cos_extra], dim=1)
             rope_k = torch.stack([sin_k[:, None, ...], cos_k[:, None, ...]], dim=0)
         else:
             rope_k = None

@@ -273,6 +273,36 @@ class TestCrossAttentionPredictor:
     """Test CrossAttentionPredictor initialization and device/dtype handling."""
 
     @staticmethod
+    def _instantiate_rope_backbone(dtype: torch.dtype = torch.float32, hidden_size: int = 64):
+        vit_config = ViTConfig(
+            in_channels=3,
+            hidden_size=hidden_size,
+            patch_size=[4, 4],
+            img_size=[32, 32],
+            depth=2,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            num_register_tokens=2,
+            num_cls_tokens=2,
+            pos_enc="rope",
+            dtype=dtype,
+        )
+        return vit_config.instantiate()
+
+    @staticmethod
+    def _make_context_and_target_masks(
+        batch_size: int,
+        num_tokens: int,
+        num_context_tokens: int,
+        num_target_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context_mask = torch.zeros(batch_size, num_tokens, dtype=torch.bool)
+        context_mask[:, :num_context_tokens] = True
+        target_mask = torch.zeros(batch_size, num_tokens, dtype=torch.bool)
+        target_mask[:, num_context_tokens : num_context_tokens + num_target_tokens] = True
+        return context_mask, target_mask
+
+    @staticmethod
     def _instantiate_backbone_with_regularizers(hidden_dropout: float, attention_dropout: float, drop_path_rate: float):
         vit_config = ViTConfig(
             in_channels=3,
@@ -450,6 +480,76 @@ class TestCrossAttentionPredictor:
         # Check the output projection dimension
         expected_out_dim = out_dim if out_dim is not None else hidden_size
         assert predictor.predictor_proj.out_features == expected_out_dim
+        assert predictor.cls_global_head.out_features == expected_out_dim
+
+    def test_prepare_rope_appends_identity_for_extra_context_tokens(self):
+        """Test that extra fused context tokens use identity RoPE."""
+        dtype = torch.float32
+        tokenized_size = (8, 8)
+        num_tokens = tokenized_size[0] * tokenized_size[1]
+        num_context_tokens = 5
+        num_target_tokens = 3
+        num_extra_context_tokens = 2
+        batch_size = 2
+
+        backbone = self._instantiate_rope_backbone(dtype=dtype)
+        predictor = CrossAttentionPredictor(backbone, depth=2, out_dim=None, device=torch.device("cpu"))
+
+        context_mask, target_mask = self._make_context_and_target_masks(
+            batch_size=batch_size,
+            num_tokens=num_tokens,
+            num_context_tokens=num_context_tokens,
+            num_target_tokens=num_target_tokens,
+        )
+
+        _, rope_k = predictor.prepare_rope(
+            tokenized_size,
+            context_mask=context_mask,
+            target_mask=target_mask,
+            num_extra_context_tokens=num_extra_context_tokens,
+        )
+
+        assert rope_k is not None
+        sin_tail = rope_k[0, :, 0, -num_extra_context_tokens:, :]
+        cos_tail = rope_k[1, :, 0, -num_extra_context_tokens:, :]
+        assert torch.allclose(sin_tail, torch.zeros_like(sin_tail))
+        assert torch.allclose(cos_tail, torch.ones_like(cos_tail))
+
+    def test_forward_supports_fused_context_with_extra_tokens(self):
+        """Test predictor forward when key length is larger than masked visual context."""
+        dtype = torch.float32
+        tokenized_size = (8, 8)
+        num_tokens = tokenized_size[0] * tokenized_size[1]
+        num_context_tokens = 5
+        num_target_tokens = 3
+        num_extra_context_tokens = 2
+        batch_size = 2
+        hidden_size = 64
+
+        backbone = self._instantiate_rope_backbone(dtype=dtype, hidden_size=hidden_size)
+        predictor = CrossAttentionPredictor(backbone, depth=2, out_dim=None, device=torch.device("cpu"))
+
+        context_mask, target_mask = self._make_context_and_target_masks(
+            batch_size=batch_size,
+            num_tokens=num_tokens,
+            num_context_tokens=num_context_tokens,
+            num_target_tokens=num_target_tokens,
+        )
+        context = torch.randn(
+            batch_size,
+            num_context_tokens + num_extra_context_tokens,
+            hidden_size,
+            dtype=dtype,
+        )
+
+        output = predictor(
+            tokenized_size,
+            context=context,
+            context_mask=context_mask,
+            target_mask=target_mask,
+            num_extra_context_tokens=num_extra_context_tokens,
+        )
+        assert output.shape == (batch_size, num_target_tokens, hidden_size)
 
     def test_predictor_regularizers_follow_backbone_by_default(self):
         """Test predictor regularizer values are inherited from the backbone by default."""
