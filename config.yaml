@@ -62,12 +62,7 @@ jepa: !!python/object:mjepa.JEPAConfig
   target_ratio: 0.25
   scale: 2
   scheduled: false
-  gram_teacher_epoch: 300
-  gram_start_epoch: 700
-  gram_update_interval_epoch: 100
-  gram_resolution_scale: 1.0
-  gram_remove_neg: false
-  gram_loss_weight: 1.0
+  dense_pred_loss_weight: 1.0
   sigreg_loss_weight: 0.0001
 
 optimizer: !!python/object:mjepa.OptimizerConfig
