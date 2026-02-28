@@ -11,16 +11,16 @@ from vit.tokens import apply_mask
 from .jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
+    compute_gram_loss,
     compute_sigreg_loss,
+    forward_gram_teacher,
     generate_masks,
     get_momentum,
+    is_gram_update_epoch,
     setup_teacher,
     update_teacher,
 )
 from .trainer import assert_all_ranks_synced, assert_all_trainable_params_have_grad
-
-
-SIGREG_NUM_SLICES = 256
 
 
 @dataclass
@@ -28,16 +28,16 @@ class MJEPALosses:
     jepa_loss: Tensor
     jepa_loss_cls: Tensor | float
     sigreg_loss: Tensor | float
-    dense_pred_loss: Tensor | float
+    gram_loss: Tensor | float
 
-    dense_pred_loss_weight: float = 1.0
+    gram_loss_weight: float = 1.0
     sigreg_loss_weight: float = 1e-4
 
     def reduce(self) -> Tensor:
         loss = (
             self.jepa_loss
             + self.jepa_loss_cls
-            + self.dense_pred_loss * self.dense_pred_loss_weight
+            + self.gram_loss * self.gram_loss_weight
             + self.sigreg_loss * self.sigreg_loss_weight
         )
         assert isinstance(loss, Tensor)
@@ -48,13 +48,12 @@ class MJEPALosses:
 class MJEPAPredictions:
     pred: Tensor
     pred_with_cls: Tensor | None
-    dense_pred: Tensor
     student_output: ViTFeatures
     teacher_output: ViTFeatures
-    teacher_stem_output: Tensor
     context_mask: Tensor
     target_mask: Tensor
 
+    gram_teacher_output: Tensor | None = None
     probes: dict[str, Tensor] = field(default_factory=dict)
 
 
@@ -71,12 +70,9 @@ class MJEPA(nn.Module):
         self.student = backbone
         self.teacher = setup_teacher(backbone)
         self.predictor = predictor
-        self.dense_pred_head = nn.Linear(
-            backbone.config.hidden_size,
-            backbone.config.hidden_size,
-            dtype=backbone.config.dtype,
-        )
+        self.gram_teacher = setup_teacher(backbone) if config.gram_start_epoch is not None else None
         self.dtype = dtype
+        self._gram_cooldown_end_epoch: int | None = None
 
     @property
     def img_size(self) -> tuple[int, int]:
@@ -108,19 +104,57 @@ class MJEPA(nn.Module):
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
         return dict()
 
-    def forward_teacher_stem(self, x: Tensor, context_mask: Tensor) -> Tensor:
-        self.teacher.eval()
-        with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
-            teacher_stem_output = self.teacher.stem(x)
-            teacher_stem_output = apply_mask(context_mask, teacher_stem_output, fill_value=None)
-        return teacher_stem_output.clone()
+    def forward_gram_teacher(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> Tensor:
+        if self.gram_teacher is None:
+            raise ValueError("Gram teacher is not initialized")
 
-    def forward_dense_pred(self, student_visual_tokens: Tensor) -> Tensor:
-        with torch.autocast(device_type=student_visual_tokens.device.type, dtype=self.dtype):
-            return self.dense_pred_head(student_visual_tokens)
+        self.gram_teacher.eval()
+        with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
+            gram_teacher_output = forward_gram_teacher(
+                self.gram_teacher,
+                x,
+                rope_seed=rope_seed,
+                resolution_scale=self.config.gram_resolution_scale,
+            )
+            gram_teacher_output = apply_mask(context_mask, gram_teacher_output, fill_value=None)
+        return gram_teacher_output.clone()
+
+    def _is_gram_cooldown_active(self, epoch: int) -> bool:
+        if self._gram_cooldown_end_epoch is None:
+            return False
+        return epoch < self._gram_cooldown_end_epoch
+
+    def _is_gram_enabled_for_epoch(self, epoch: int) -> bool:
+        if self.config.gram_start_epoch is None:
+            return False
+        return epoch >= self.config.gram_start_epoch and not self._is_gram_cooldown_active(epoch)
+
+    def update_gram_teacher(self, current_epoch: int, resolution_changed: bool = False):
+        if self.gram_teacher is None:
+            return
+
+        should_sync_gram_teacher = current_epoch == self.config.gram_teacher_epoch
+
+        # Initial Gram teacher setup (if necessary)
+        # Pause gram anchoring updates after a resolution transition.
+        interval = self.config.gram_update_interval_epoch
+        if resolution_changed and interval > 0:
+            self._gram_cooldown_end_epoch = current_epoch + interval
+
+        if self._gram_cooldown_end_epoch is not None:
+            if current_epoch < self._gram_cooldown_end_epoch:
+                return
+            should_sync_gram_teacher = should_sync_gram_teacher or current_epoch >= self.config.gram_teacher_epoch
+            self._gram_cooldown_end_epoch = None
+
+        # Gram teacher update
+        if is_gram_update_epoch(current_epoch, self.config.gram_start_epoch, self.config.gram_update_interval_epoch):
+            should_sync_gram_teacher = True
+
+        if should_sync_gram_teacher:
+            update_teacher(self.teacher, self.gram_teacher)
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
-        del epoch  # Kept in the signature for call-site compatibility with the training loop.
         # Compute JEPA loss
         target = apply_mask(output.target_mask, output.teacher_output.visual_tokens, fill_value=None).float()
         jepa_loss = F.mse_loss(output.pred.float(), target)
@@ -128,22 +162,29 @@ class MJEPA(nn.Module):
 
         # Compute SigREG loss
         sigreg_loss = (
-            compute_sigreg_loss(
-                output.student_output.cls_tokens.transpose(0, 1).float(), step, num_slices=SIGREG_NUM_SLICES
-            )
+            compute_sigreg_loss(output.student_output.cls_tokens.transpose(0, 1).float(), step, num_slices=256)
             if self.config.sigreg_loss_weight > 0
             else 0.0
         )
 
-        # Compute dense prediction loss
-        dense_pred_loss = F.mse_loss(output.dense_pred.float(), output.teacher_stem_output.float())
+        # Compute Gram loss (if necessary)
+        if self._is_gram_enabled_for_epoch(epoch):
+            assert output.gram_teacher_output is not None
+            assert self.config.gram_loss_weight > 0
+            gram_loss = compute_gram_loss(
+                output.student_output.visual_tokens.float(),
+                output.gram_teacher_output.float(),
+                remove_neg=self.config.gram_remove_neg,
+            )
+        else:
+            gram_loss = 0.0
 
         return MJEPALosses(
             jepa_loss=jepa_loss,
             jepa_loss_cls=jepa_loss_cls,
             sigreg_loss=sigreg_loss,
-            dense_pred_loss=dense_pred_loss,
-            dense_pred_loss_weight=self.config.dense_pred_loss_weight,
+            gram_loss=gram_loss,
+            gram_loss_weight=self.config.gram_loss_weight,
             sigreg_loss_weight=self.config.sigreg_loss_weight,
         )
 
@@ -154,14 +195,15 @@ class MJEPA(nn.Module):
         )
 
         rope_seed = int(torch.randint(0, 1000000, (1,)).item())
-        # Teacher forward pass
+        # Teacher / Gram teacher forward pass
         teacher_output = self.forward_teacher(x)
-        teacher_stem_output = self.forward_teacher_stem(x, context_mask)
+        gram_teacher_output = (
+            self.forward_gram_teacher(x, context_mask, rope_seed) if self._is_gram_enabled_for_epoch(epoch) else None
+        )
 
         Ht, Wt = cast(tuple[int, int], self.student.stem.tokenized_size(x.shape[-2:]))
 
         student_output = self.forward_student(x, context_mask, rope_seed=rope_seed)
-        dense_pred = self.forward_dense_pred(student_output.visual_tokens)
         pred = self.forward_predictor(
             (Ht, Wt), student_output.visual_tokens, context_mask, target_mask, rope_seed=rope_seed
         )
@@ -177,12 +219,11 @@ class MJEPA(nn.Module):
         return MJEPAPredictions(
             pred=pred,
             pred_with_cls=pred_with_cls,
-            dense_pred=dense_pred,
             student_output=student_output,
             teacher_output=teacher_output,
-            teacher_stem_output=teacher_stem_output,
             context_mask=context_mask,
             target_mask=target_mask,
+            gram_teacher_output=gram_teacher_output,
             probes=probes,
         )
 
@@ -196,17 +237,11 @@ class MJEPA(nn.Module):
     def assert_predictor_params_have_grad(self, step: int | None = None) -> None:
         assert_all_trainable_params_have_grad(self.predictor, step)
 
-    def assert_dense_pred_params_have_grad(self, step: int | None = None) -> None:
-        assert_all_trainable_params_have_grad(self.dense_pred_head, step)
-
     def assert_student_params_synced(self, atol: float = 1e-4, rtol: float = 0) -> None:
         assert_all_ranks_synced(self.student, atol, rtol)
 
     def assert_predictor_params_synced(self, atol: float = 1e-4, rtol: float = 0) -> None:
         assert_all_ranks_synced(self.predictor, atol, rtol)
-
-    def assert_dense_pred_params_synced(self, atol: float = 1e-4, rtol: float = 0) -> None:
-        assert_all_ranks_synced(self.dense_pred_head, atol, rtol)
 
     if TYPE_CHECKING:
 

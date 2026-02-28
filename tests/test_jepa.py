@@ -10,10 +10,12 @@ from vit import ViTConfig
 from mjepa.jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
+    compute_gram_loss,
     compute_sigreg_loss,
     config_constructor,
     generate_masks,
     get_momentum,
+    is_gram_update_epoch,
     register_constructors,
     setup_teacher,
     update_teacher,
@@ -548,6 +550,74 @@ class TestGenerateMasks:
             assert context_mask.shape == target_mask.shape
 
 
+class TestComputeGramLoss:
+    """Test compute_gram_loss function."""
+
+    def test_basic_gram_loss(self):
+        """Test basic Gram loss computation."""
+        student = torch.randn(2, 16, 64)
+        teacher = torch.randn(2, 16, 64)
+
+        loss = compute_gram_loss(student, teacher)
+
+        assert loss.shape == ()
+        assert loss.item() >= 0
+        assert not torch.isnan(loss)
+
+    def test_gram_loss_zero_for_identical_inputs(self):
+        """Test Gram loss is zero when student equals teacher."""
+        features = torch.randn(2, 16, 64)
+
+        loss = compute_gram_loss(features, features.clone())
+
+        assert loss.item() < 1e-5, "Loss should be near zero for identical inputs"
+
+    def test_gram_loss_normalize_option(self):
+        """Test Gram loss with and without normalization."""
+        student = torch.randn(2, 16, 64)
+        teacher = torch.randn(2, 16, 64)
+
+        loss_normalized = compute_gram_loss(student, teacher, normalize=True)
+        loss_unnormalized = compute_gram_loss(student, teacher, normalize=False)
+
+        # Both should be valid losses
+        assert not torch.isnan(loss_normalized)
+        assert not torch.isnan(loss_unnormalized)
+
+    def test_gram_loss_remove_neg_option(self):
+        """Test Gram loss with and without negative removal."""
+        student = torch.randn(2, 16, 64)
+        teacher = torch.randn(2, 16, 64)
+
+        loss_remove_neg = compute_gram_loss(student, teacher, remove_neg=True)
+        loss_keep_neg = compute_gram_loss(student, teacher, remove_neg=False)
+
+        # Both should be valid losses
+        assert not torch.isnan(loss_remove_neg)
+        assert not torch.isnan(loss_keep_neg)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_gram_loss_different_dtypes(self, dtype):
+        """Test Gram loss with different data types."""
+        student = torch.randn(2, 16, 64, dtype=dtype)
+        teacher = torch.randn(2, 16, 64, dtype=dtype)
+
+        loss = compute_gram_loss(student, teacher)
+
+        assert not torch.isnan(loss)
+
+    def test_gram_loss_different_batch_sizes(self):
+        """Test Gram loss with different batch sizes."""
+        for batch_size in [1, 2, 4, 8]:
+            student = torch.randn(batch_size, 16, 64)
+            teacher = torch.randn(batch_size, 16, 64)
+
+            loss = compute_gram_loss(student, teacher)
+
+            assert loss.shape == ()
+            assert not torch.isnan(loss)
+
+
 class TestSetupTeacher:
     """Test setup_teacher function."""
 
@@ -603,26 +673,117 @@ class TestSetupTeacher:
             assert not param.requires_grad
 
 
+class TestIsGramUpdateEpoch:
+    """Test is_gram_update_epoch function."""
+
+    def test_returns_false_when_gram_start_is_none(self):
+        """Test that function returns False when gram_start_epoch is None."""
+        assert not is_gram_update_epoch(epoch=50, gram_start_epoch=None, gram_update_interval_epoch=10)
+
+    def test_returns_false_before_gram_start(self):
+        """Test that function returns False before gram_start_epoch."""
+        assert not is_gram_update_epoch(epoch=5, gram_start_epoch=10, gram_update_interval_epoch=5)
+
+    def test_returns_false_at_gram_start(self):
+        """Test that function returns False at gram_start_epoch."""
+        # epoch > gram_start_epoch is required, so at gram_start it's False
+        assert not is_gram_update_epoch(epoch=10, gram_start_epoch=10, gram_update_interval_epoch=5)
+
+    def test_returns_true_at_first_update_after_start(self):
+        """Test that function returns True at first update epoch after gram_start."""
+        # First update epoch is gram_start + gram_update_interval
+        assert is_gram_update_epoch(epoch=15, gram_start_epoch=10, gram_update_interval_epoch=5)
+
+    def test_returns_true_at_subsequent_update_epochs(self):
+        """Test that function returns True at subsequent update epochs."""
+        # Epochs 20, 25, 30, etc. should be update epochs
+        assert is_gram_update_epoch(epoch=20, gram_start_epoch=10, gram_update_interval_epoch=5)
+        assert is_gram_update_epoch(epoch=25, gram_start_epoch=10, gram_update_interval_epoch=5)
+        assert is_gram_update_epoch(epoch=30, gram_start_epoch=10, gram_update_interval_epoch=5)
+
+    def test_returns_false_between_update_epochs(self):
+        """Test that function returns False between update epochs."""
+        assert not is_gram_update_epoch(epoch=12, gram_start_epoch=10, gram_update_interval_epoch=5)
+        assert not is_gram_update_epoch(epoch=17, gram_start_epoch=10, gram_update_interval_epoch=5)
+
+    def test_returns_false_when_interval_is_zero(self):
+        """Test that interval zero disables periodic updates."""
+        assert not is_gram_update_epoch(epoch=11, gram_start_epoch=10, gram_update_interval_epoch=0)
+        assert not is_gram_update_epoch(epoch=20, gram_start_epoch=10, gram_update_interval_epoch=0)
+
+    @pytest.mark.parametrize("interval", [1, 2, 5, 10])
+    def test_different_intervals(self, interval):
+        """Test with different gram_update_interval_epoch values."""
+        gram_start = 10
+
+        # First update should be at gram_start + interval
+        assert is_gram_update_epoch(
+            epoch=gram_start + interval,
+            gram_start_epoch=gram_start,
+            gram_update_interval_epoch=interval,
+        )
+
+
 class TestJEPAConfigValidation:
     """Additional validation tests for JEPAConfig."""
 
-    def test_invalid_dense_pred_loss_weight(self):
-        """Test invalid dense prediction loss weight."""
+    def test_invalid_gram_teacher_epoch(self):
+        """Test invalid gram_teacher_epoch."""
         with pytest.raises(ValueError):
-            JEPAConfig(dense_pred_loss_weight=0)
+            JEPAConfig(gram_teacher_epoch=0)
 
         with pytest.raises(ValueError):
-            JEPAConfig(dense_pred_loss_weight=-0.1)
+            JEPAConfig(gram_teacher_epoch=-1)
+
+    def test_invalid_gram_start_epoch(self):
+        """Test invalid gram_start_epoch."""
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_start_epoch=0)
+
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_start_epoch=-1)
+
+    def test_gram_start_before_teacher_epoch(self):
+        """Test that gram_start_epoch must be >= gram_teacher_epoch."""
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_teacher_epoch=100, gram_start_epoch=50)
+
+    def test_invalid_gram_update_interval(self):
+        """Test invalid gram_update_interval_epoch."""
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_update_interval_epoch=-1)
+
+    def test_invalid_gram_resolution_scale(self):
+        """Test invalid gram_resolution_scale."""
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_resolution_scale=0)
+
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_resolution_scale=-0.5)
+
+    def test_invalid_gram_loss_weight(self):
+        """Test invalid gram_loss_weight."""
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_loss_weight=0)
+
+        with pytest.raises(ValueError):
+            JEPAConfig(gram_loss_weight=-0.1)
 
     def test_invalid_sigreg_loss_weight(self):
         """Test invalid sigreg_loss_weight."""
         with pytest.raises(ValueError):
             JEPAConfig(sigreg_loss_weight=-0.1)
 
-    def test_valid_dense_pred_config(self):
-        """Test valid dense prediction configuration."""
+    def test_valid_gram_config(self):
+        """Test valid Gram configuration."""
         config = JEPAConfig(
-            dense_pred_loss_weight=0.5,
+            gram_teacher_epoch=50,
+            gram_start_epoch=100,
+            gram_update_interval_epoch=10,
+            gram_resolution_scale=2.0,
+            gram_remove_neg=True,
+            gram_loss_weight=0.5,
             sigreg_loss_weight=1e-3,
         )
-        assert config.dense_pred_loss_weight == 0.5
+        assert config.gram_teacher_epoch == 50
+        assert config.gram_start_epoch == 100
