@@ -13,10 +13,8 @@ from .jepa import (
     JEPAConfig,
     compute_gram_loss,
     compute_sigreg_loss,
-    forward_gram_teacher,
     generate_masks,
     get_momentum,
-    is_gram_update_epoch,
     setup_teacher,
     update_teacher,
 )
@@ -53,7 +51,7 @@ class MJEPAPredictions:
     context_mask: Tensor
     target_mask: Tensor
 
-    gram_teacher_output: Tensor | None = None
+    gram_target_output: Tensor | None = None
     probes: dict[str, Tensor] = field(default_factory=dict)
 
 
@@ -70,9 +68,7 @@ class MJEPA(nn.Module):
         self.student = backbone
         self.teacher = setup_teacher(backbone)
         self.predictor = predictor
-        self.gram_teacher = setup_teacher(backbone) if config.gram_start_epoch is not None else None
         self.dtype = dtype
-        self._gram_cooldown_end_epoch: int | None = None
 
     @property
     def img_size(self) -> tuple[int, int]:
@@ -104,55 +100,19 @@ class MJEPA(nn.Module):
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
         return dict()
 
-    def forward_gram_teacher(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> Tensor:
-        if self.gram_teacher is None:
-            raise ValueError("Gram teacher is not initialized")
-
-        self.gram_teacher.eval()
+    def forward_gram_target(self, x: Tensor, context_mask: Tensor) -> Tensor:
+        self.teacher.eval()
         with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
-            gram_teacher_output = forward_gram_teacher(
-                self.gram_teacher,
-                x,
-                rope_seed=rope_seed,
-                resolution_scale=self.config.gram_resolution_scale,
-            )
-            gram_teacher_output = apply_mask(context_mask, gram_teacher_output, fill_value=None)
-        return gram_teacher_output.clone()
+            stem_tokens = self.teacher.stem(x)
+            gram_target_output = apply_mask(context_mask, stem_tokens, fill_value=None)
+        return gram_target_output.detach().clone()
 
-    def _is_gram_cooldown_active(self, epoch: int) -> bool:
-        if self._gram_cooldown_end_epoch is None:
-            return False
-        return epoch < self._gram_cooldown_end_epoch
+    def gram_loss_weight_for_epoch(self, epoch: int) -> float:
+        warmup_epochs = self.config.gram_warmup_epochs
+        if warmup_epochs <= 0:
+            return self.config.gram_loss_weight
 
-    def _is_gram_enabled_for_epoch(self, epoch: int) -> bool:
-        if self.config.gram_start_epoch is None:
-            return False
-        return epoch >= self.config.gram_start_epoch and not self._is_gram_cooldown_active(epoch)
-
-    def update_gram_teacher(self, current_epoch: int, resolution_changed: bool = False):
-        if self.gram_teacher is None:
-            return
-
-        should_sync_gram_teacher = current_epoch == self.config.gram_teacher_epoch
-
-        # Initial Gram teacher setup (if necessary)
-        # Pause gram anchoring updates after a resolution transition.
-        interval = self.config.gram_update_interval_epoch
-        if resolution_changed and interval > 0:
-            self._gram_cooldown_end_epoch = current_epoch + interval
-
-        if self._gram_cooldown_end_epoch is not None:
-            if current_epoch < self._gram_cooldown_end_epoch:
-                return
-            should_sync_gram_teacher = should_sync_gram_teacher or current_epoch >= self.config.gram_teacher_epoch
-            self._gram_cooldown_end_epoch = None
-
-        # Gram teacher update
-        if is_gram_update_epoch(current_epoch, self.config.gram_start_epoch, self.config.gram_update_interval_epoch):
-            should_sync_gram_teacher = True
-
-        if should_sync_gram_teacher:
-            update_teacher(self.teacher, self.gram_teacher)
+        return self.config.gram_loss_weight * min(max(epoch, 0), warmup_epochs) / warmup_epochs
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         # Compute JEPA loss
@@ -167,24 +127,22 @@ class MJEPA(nn.Module):
             else 0.0
         )
 
-        # Compute Gram loss (if necessary)
-        if self._is_gram_enabled_for_epoch(epoch):
-            assert output.gram_teacher_output is not None
-            assert self.config.gram_loss_weight > 0
-            gram_loss = compute_gram_loss(
-                output.student_output.visual_tokens.float(),
-                output.gram_teacher_output.float(),
-                remove_neg=self.config.gram_remove_neg,
-            )
-        else:
-            gram_loss = 0.0
+        # Compute Gram loss.
+        gram_target_output = output.gram_target_output
+        assert gram_target_output is not None
+        gram_loss = compute_gram_loss(
+            output.student_output.visual_tokens.float(),
+            gram_target_output.float(),
+            remove_neg=self.config.gram_remove_neg,
+        )
+        gram_loss_weight = self.gram_loss_weight_for_epoch(epoch)
 
         return MJEPALosses(
             jepa_loss=jepa_loss,
             jepa_loss_cls=jepa_loss_cls,
             sigreg_loss=sigreg_loss,
             gram_loss=gram_loss,
-            gram_loss_weight=self.config.gram_loss_weight,
+            gram_loss_weight=gram_loss_weight,
             sigreg_loss_weight=self.config.sigreg_loss_weight,
         )
 
@@ -195,11 +153,9 @@ class MJEPA(nn.Module):
         )
 
         rope_seed = int(torch.randint(0, 1000000, (1,)).item())
-        # Teacher / Gram teacher forward pass
+        # Teacher / Gram target forward pass
         teacher_output = self.forward_teacher(x)
-        gram_teacher_output = (
-            self.forward_gram_teacher(x, context_mask, rope_seed) if self._is_gram_enabled_for_epoch(epoch) else None
-        )
+        gram_target_output = self.forward_gram_target(x, context_mask)
 
         Ht, Wt = cast(tuple[int, int], self.student.stem.tokenized_size(x.shape[-2:]))
 
@@ -223,7 +179,7 @@ class MJEPA(nn.Module):
             teacher_output=teacher_output,
             context_mask=context_mask,
             target_mask=target_mask,
-            gram_teacher_output=gram_teacher_output,
+            gram_target_output=gram_target_output,
             probes=probes,
         )
 

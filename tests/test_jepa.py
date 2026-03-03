@@ -15,7 +15,6 @@ from mjepa.jepa import (
     config_constructor,
     generate_masks,
     get_momentum,
-    is_gram_update_epoch,
     register_constructors,
     setup_teacher,
     update_teacher,
@@ -109,6 +108,7 @@ class TestJEPAConfig:
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
         assert config.disable_predictor_regularizers is False
+        assert config.gram_warmup_epochs == 700
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -119,6 +119,7 @@ class TestJEPAConfig:
             momentum=0.95,
             predictor_depth=6,
             disable_predictor_regularizers=True,
+            gram_warmup_epochs=50,
         )
         assert config.context_ratio == 0.6
         assert config.target_ratio == 0.3
@@ -126,6 +127,7 @@ class TestJEPAConfig:
         assert config.momentum == 0.95
         assert config.predictor_depth == 6
         assert config.disable_predictor_regularizers is True
+        assert config.gram_warmup_epochs == 50
 
     def test_invalid_context_ratio(self):
         """Test invalid context ratio."""
@@ -673,93 +675,13 @@ class TestSetupTeacher:
             assert not param.requires_grad
 
 
-class TestIsGramUpdateEpoch:
-    """Test is_gram_update_epoch function."""
-
-    def test_returns_false_when_gram_start_is_none(self):
-        """Test that function returns False when gram_start_epoch is None."""
-        assert not is_gram_update_epoch(epoch=50, gram_start_epoch=None, gram_update_interval_epoch=10)
-
-    def test_returns_false_before_gram_start(self):
-        """Test that function returns False before gram_start_epoch."""
-        assert not is_gram_update_epoch(epoch=5, gram_start_epoch=10, gram_update_interval_epoch=5)
-
-    def test_returns_false_at_gram_start(self):
-        """Test that function returns False at gram_start_epoch."""
-        # epoch > gram_start_epoch is required, so at gram_start it's False
-        assert not is_gram_update_epoch(epoch=10, gram_start_epoch=10, gram_update_interval_epoch=5)
-
-    def test_returns_true_at_first_update_after_start(self):
-        """Test that function returns True at first update epoch after gram_start."""
-        # First update epoch is gram_start + gram_update_interval
-        assert is_gram_update_epoch(epoch=15, gram_start_epoch=10, gram_update_interval_epoch=5)
-
-    def test_returns_true_at_subsequent_update_epochs(self):
-        """Test that function returns True at subsequent update epochs."""
-        # Epochs 20, 25, 30, etc. should be update epochs
-        assert is_gram_update_epoch(epoch=20, gram_start_epoch=10, gram_update_interval_epoch=5)
-        assert is_gram_update_epoch(epoch=25, gram_start_epoch=10, gram_update_interval_epoch=5)
-        assert is_gram_update_epoch(epoch=30, gram_start_epoch=10, gram_update_interval_epoch=5)
-
-    def test_returns_false_between_update_epochs(self):
-        """Test that function returns False between update epochs."""
-        assert not is_gram_update_epoch(epoch=12, gram_start_epoch=10, gram_update_interval_epoch=5)
-        assert not is_gram_update_epoch(epoch=17, gram_start_epoch=10, gram_update_interval_epoch=5)
-
-    def test_returns_false_when_interval_is_zero(self):
-        """Test that interval zero disables periodic updates."""
-        assert not is_gram_update_epoch(epoch=11, gram_start_epoch=10, gram_update_interval_epoch=0)
-        assert not is_gram_update_epoch(epoch=20, gram_start_epoch=10, gram_update_interval_epoch=0)
-
-    @pytest.mark.parametrize("interval", [1, 2, 5, 10])
-    def test_different_intervals(self, interval):
-        """Test with different gram_update_interval_epoch values."""
-        gram_start = 10
-
-        # First update should be at gram_start + interval
-        assert is_gram_update_epoch(
-            epoch=gram_start + interval,
-            gram_start_epoch=gram_start,
-            gram_update_interval_epoch=interval,
-        )
-
-
 class TestJEPAConfigValidation:
     """Additional validation tests for JEPAConfig."""
 
-    def test_invalid_gram_teacher_epoch(self):
-        """Test invalid gram_teacher_epoch."""
+    def test_invalid_gram_warmup_epochs(self):
+        """Test invalid gram_warmup_epochs."""
         with pytest.raises(ValueError):
-            JEPAConfig(gram_teacher_epoch=0)
-
-        with pytest.raises(ValueError):
-            JEPAConfig(gram_teacher_epoch=-1)
-
-    def test_invalid_gram_start_epoch(self):
-        """Test invalid gram_start_epoch."""
-        with pytest.raises(ValueError):
-            JEPAConfig(gram_start_epoch=0)
-
-        with pytest.raises(ValueError):
-            JEPAConfig(gram_start_epoch=-1)
-
-    def test_gram_start_before_teacher_epoch(self):
-        """Test that gram_start_epoch must be >= gram_teacher_epoch."""
-        with pytest.raises(ValueError):
-            JEPAConfig(gram_teacher_epoch=100, gram_start_epoch=50)
-
-    def test_invalid_gram_update_interval(self):
-        """Test invalid gram_update_interval_epoch."""
-        with pytest.raises(ValueError):
-            JEPAConfig(gram_update_interval_epoch=-1)
-
-    def test_invalid_gram_resolution_scale(self):
-        """Test invalid gram_resolution_scale."""
-        with pytest.raises(ValueError):
-            JEPAConfig(gram_resolution_scale=0)
-
-        with pytest.raises(ValueError):
-            JEPAConfig(gram_resolution_scale=-0.5)
+            JEPAConfig(gram_warmup_epochs=-1)
 
     def test_invalid_gram_loss_weight(self):
         """Test invalid gram_loss_weight."""
@@ -777,13 +699,9 @@ class TestJEPAConfigValidation:
     def test_valid_gram_config(self):
         """Test valid Gram configuration."""
         config = JEPAConfig(
-            gram_teacher_epoch=50,
-            gram_start_epoch=100,
-            gram_update_interval_epoch=10,
-            gram_resolution_scale=2.0,
+            gram_warmup_epochs=250,
             gram_remove_neg=True,
             gram_loss_weight=0.5,
             sigreg_loss_weight=1e-3,
         )
-        assert config.gram_teacher_epoch == 50
-        assert config.gram_start_epoch == 100
+        assert config.gram_warmup_epochs == 250
