@@ -2,12 +2,18 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import torch
 import torch.nn as nn
 import yaml
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, OneCycleLR
 
 from mjepa.optimizer import (
+    ADAMW_COMPONENT_NAME,
+    HYBRID_MUON_OPTIMIZER_KIND,
+    MUON_COMPONENT_NAME,
+    CompositeOptimizer,
+    CompositeScheduler,
     OptimizerConfig,
     _assign_parameter_groups,
     _match_parameters,
@@ -29,9 +35,16 @@ class TestOptimizerConfigInit:
         assert config.lr == 1e-3
         assert config.weight_decay == 0.01
         assert config.betas == (0.9, 0.999)
+        assert config.kind == "adamw"
         assert config.fused is True
         assert config.foreach is None
         assert config.eps == 1e-8
+        assert config.muon_momentum == 0.95
+        assert config.muon_nesterov is True
+        assert config.muon_ns_coefficients == (3.4445, -4.7750, 2.0315)
+        assert config.muon_eps == 1e-7
+        assert config.muon_ns_steps == 5
+        assert config.muon_adjust_lr_fn is None
         assert config.scheduled is False
         assert config.pct_start == 0.05
         assert config.base_momentum == 0.85
@@ -47,9 +60,16 @@ class TestOptimizerConfigInit:
             lr=5e-4,
             weight_decay=0.05,
             betas=(0.85, 0.95),
+            kind="hybrid_muon",
             fused=False,
             foreach=True,
             eps=1e-6,
+            muon_momentum=0.9,
+            muon_nesterov=False,
+            muon_ns_coefficients=(3.0, -4.0, 2.0),
+            muon_eps=1e-6,
+            muon_ns_steps=3,
+            muon_adjust_lr_fn="match_rms_adamw",
             scheduled=True,
             pct_start=0.1,
             base_momentum=0.8,
@@ -62,9 +82,16 @@ class TestOptimizerConfigInit:
         assert config.lr == 5e-4
         assert config.weight_decay == 0.05
         assert config.betas == (0.85, 0.95)
+        assert config.kind == "hybrid_muon"
         assert config.fused is False
         assert config.foreach is True
         assert config.eps == 1e-6
+        assert config.muon_momentum == 0.9
+        assert config.muon_nesterov is False
+        assert config.muon_ns_coefficients == (3.0, -4.0, 2.0)
+        assert config.muon_eps == 1e-6
+        assert config.muon_ns_steps == 3
+        assert config.muon_adjust_lr_fn == "match_rms_adamw"
         assert config.scheduled is True
         assert config.pct_start == 0.1
         assert config.base_momentum == 0.8
@@ -201,6 +228,113 @@ class TestOptimizerConfigInstantiate:
 
         assert isinstance(scheduler, OneCycleLR)
         assert scheduler.total_steps == 1000
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_instantiate_hybrid_muon(self, simple_model):
+        """Test hybrid_muon returns composite optimizer and scheduler."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=False,
+            fused=False,
+            muon_adjust_lr_fn="match_rms_adamw",
+        )
+        optimizer, scheduler = config.instantiate(simple_model, total_steps=1000)
+
+        assert isinstance(optimizer, CompositeOptimizer)
+        assert isinstance(scheduler, CompositeScheduler)
+        assert MUON_COMPONENT_NAME in optimizer.optimizers
+        assert ADAMW_COMPONENT_NAME in optimizer.optimizers
+
+        muon_optimizer = optimizer.optimizers[MUON_COMPONENT_NAME]
+        adamw_optimizer = optimizer.optimizers[ADAMW_COMPONENT_NAME]
+        assert all(param.ndim == 2 for group in muon_optimizer.param_groups for param in group["params"])
+        assert all(param.ndim != 2 for group in adamw_optimizer.param_groups for param in group["params"])
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_instantiate_hybrid_muon_with_onecycle_scheduler(self, simple_model):
+        """Test hybrid_muon with scheduled=True applies OneCycleLR to each optimizer component."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=True,
+            fused=False,
+        )
+        optimizer, scheduler = config.instantiate(simple_model, total_steps=100)
+
+        assert isinstance(optimizer, CompositeOptimizer)
+        assert isinstance(scheduler, CompositeScheduler)
+        assert isinstance(scheduler.schedulers[MUON_COMPONENT_NAME], OneCycleLR)
+        assert isinstance(scheduler.schedulers[ADAMW_COMPONENT_NAME], OneCycleLR)
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_hybrid_muon_optimizer_and_scheduler_state_roundtrip(self, simple_model):
+        """Test state dict round-trip for hybrid optimizer and scheduler."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=False,
+            fused=False,
+        )
+        optimizer, scheduler = config.instantiate(simple_model, total_steps=100)
+
+        inputs = torch.randn(8, 10)
+        loss = simple_model(inputs).sum()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        optimizer_state = optimizer.state_dict()
+        scheduler_state = scheduler.state_dict()
+
+        optimizer_copy, scheduler_copy = config.instantiate(simple_model, total_steps=100)
+        optimizer_copy.load_state_dict(optimizer_state)
+        scheduler_copy.load_state_dict(scheduler_state)
+        assert optimizer_copy.state_dict()["_mjepa_optimizer_kind"] == HYBRID_MUON_OPTIMIZER_KIND
+        assert scheduler_copy.state_dict()["_mjepa_scheduler_kind"] == HYBRID_MUON_OPTIMIZER_KIND
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_hybrid_muon_rejects_legacy_state_dicts(self, simple_model):
+        """Test hybrid optimizer/scheduler reject legacy non-hybrid state dicts."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=False,
+            fused=False,
+        )
+        optimizer, scheduler = config.instantiate(simple_model, total_steps=100)
+
+        legacy_optimizer = AdamW(simple_model.parameters(), lr=1e-3, fused=False)
+        legacy_scheduler = LinearLR(legacy_optimizer, start_factor=0.1, end_factor=1.0, total_iters=2)
+
+        with pytest.raises(ValueError, match="Cannot load checkpoint optimizer kind"):
+            optimizer.load_state_dict(legacy_optimizer.state_dict())
+        with pytest.raises(ValueError, match="Cannot load checkpoint scheduler kind"):
+            scheduler.load_state_dict(legacy_scheduler.state_dict())
+
+    def test_hybrid_muon_requires_torch_muon(self, simple_model, monkeypatch):
+        """Test hybrid_muon raises a clear error when torch.optim.Muon is unavailable."""
+        monkeypatch.delattr(torch.optim, "Muon", raising=False)
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=False,
+            fused=False,
+        )
+
+        with pytest.raises(RuntimeError, match="torch.optim.Muon is unavailable"):
+            config.instantiate(simple_model, total_steps=100)
 
 
 class TestOptimizerConfigFromYAML:
