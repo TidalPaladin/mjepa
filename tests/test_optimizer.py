@@ -8,6 +8,7 @@ import yaml
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, OneCycleLR
 
+import mjepa.optimizer as optimizer_module
 from mjepa.optimizer import (
     ADAMW_COMPONENT_NAME,
     HYBRID_MUON_OPTIMIZER_KIND,
@@ -39,12 +40,14 @@ class TestOptimizerConfigInit:
         assert config.fused is True
         assert config.foreach is None
         assert config.eps == 1e-8
+        assert config.adamw_lr is None
         assert config.muon_momentum == 0.95
         assert config.muon_nesterov is True
         assert config.muon_ns_coefficients == (3.4445, -4.7750, 2.0315)
         assert config.muon_eps == 1e-7
         assert config.muon_ns_steps == 5
         assert config.muon_adjust_lr_fn is None
+        assert config.log_hybrid_adamw_parameters is False
         assert config.scheduled is False
         assert config.pct_start == 0.05
         assert config.base_momentum == 0.85
@@ -64,12 +67,14 @@ class TestOptimizerConfigInit:
             fused=False,
             foreach=True,
             eps=1e-6,
+            adamw_lr=1e-4,
             muon_momentum=0.9,
             muon_nesterov=False,
             muon_ns_coefficients=(3.0, -4.0, 2.0),
             muon_eps=1e-6,
             muon_ns_steps=3,
             muon_adjust_lr_fn="match_rms_adamw",
+            log_hybrid_adamw_parameters=True,
             scheduled=True,
             pct_start=0.1,
             base_momentum=0.8,
@@ -86,12 +91,14 @@ class TestOptimizerConfigInit:
         assert config.fused is False
         assert config.foreach is True
         assert config.eps == 1e-6
+        assert config.adamw_lr == 1e-4
         assert config.muon_momentum == 0.9
         assert config.muon_nesterov is False
         assert config.muon_ns_coefficients == (3.0, -4.0, 2.0)
         assert config.muon_eps == 1e-6
         assert config.muon_ns_steps == 3
         assert config.muon_adjust_lr_fn == "match_rms_adamw"
+        assert config.log_hybrid_adamw_parameters is True
         assert config.scheduled is True
         assert config.pct_start == 0.1
         assert config.base_momentum == 0.8
@@ -123,6 +130,19 @@ class TestOptimizerConfigInstantiate:
             nn.ReLU(),
             nn.Linear(20, 10),
         )
+
+    @pytest.fixture
+    def model_with_head(self):
+        class ModelWithHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = nn.Linear(10, 20)
+                self.head = nn.Linear(20, 5)
+
+            def forward(self, x):
+                return self.head(self.backbone(x))
+
+        return ModelWithHead()
 
     def test_instantiate_with_linear_scheduler(self, simple_model):
         """Test instantiate with scheduled=False returns LinearLR."""
@@ -252,6 +272,116 @@ class TestOptimizerConfigInstantiate:
         adamw_optimizer = optimizer.optimizers[ADAMW_COMPONENT_NAME]
         assert all(param.ndim == 2 for group in muon_optimizer.param_groups for param in group["params"])
         assert all(param.ndim != 2 for group in adamw_optimizer.param_groups for param in group["params"])
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_instantiate_hybrid_muon_with_explicit_adamw_lr(self, simple_model):
+        """Test hybrid mode supports a dedicated AdamW LR."""
+        muon_lr = 1e-3
+        adamw_lr = 2e-4
+        config = OptimizerConfig(
+            lr=muon_lr,
+            adamw_lr=adamw_lr,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=False,
+            fused=False,
+        )
+        optimizer, _ = config.instantiate(simple_model, total_steps=1000)
+
+        assert isinstance(optimizer, CompositeOptimizer)
+        assert optimizer.optimizers[MUON_COMPONENT_NAME].defaults["lr"] == muon_lr
+        assert optimizer.optimizers[ADAMW_COMPONENT_NAME].defaults["lr"] == adamw_lr
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_hybrid_muon_supports_explicit_adamw_parameter_group_assignment(self, model_with_head):
+        """Test parameter groups can force AdamW assignment for selected 2D params."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            fused=False,
+            parameter_groups=[{"params": ("head",), "optimizer": ADAMW_COMPONENT_NAME}],
+        )
+        optimizer, _ = config.instantiate(model_with_head, total_steps=1000)
+
+        assert isinstance(optimizer, CompositeOptimizer)
+        muon_param_ids = {
+            id(param) for group in optimizer.optimizers[MUON_COMPONENT_NAME].param_groups for param in group["params"]
+        }
+        adamw_param_ids = {
+            id(param) for group in optimizer.optimizers[ADAMW_COMPONENT_NAME].param_groups for param in group["params"]
+        }
+        assert id(model_with_head.head.weight) in adamw_param_ids
+        assert id(model_with_head.head.weight) not in muon_param_ids
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_hybrid_muon_rejects_non_2d_group_forced_to_muon(self, simple_model):
+        """Test forcing 1D params to Muon raises a clear error."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            fused=False,
+            parameter_groups=[{"params": ("bias",), "optimizer": MUON_COMPONENT_NAME}],
+        )
+
+        with pytest.raises(ValueError, match="optimizer='muon'"):
+            config.instantiate(simple_model, total_steps=1000)
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_hybrid_muon_rejects_unknown_parameter_group_optimizer_mode(self, simple_model):
+        """Test invalid parameter-group optimizer routing mode fails fast."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            fused=False,
+            parameter_groups=[{"params": ("weight",), "optimizer": "unknown"}],
+        )
+
+        with pytest.raises(ValueError, match="Unsupported parameter group optimizer mode"):
+            config.instantiate(simple_model, total_steps=1000)
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_hybrid_muon_logs_adamw_parameter_names_on_rank_zero(self, model_with_head, monkeypatch, caplog):
+        """Test rank-zero debug logging for AdamW parameter assignments in hybrid mode."""
+        monkeypatch.setattr(optimizer_module, "_is_rank_zero", lambda: True)
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            fused=False,
+            log_hybrid_adamw_parameters=True,
+            parameter_groups=[{"params": ("head",), "optimizer": ADAMW_COMPONENT_NAME}],
+        )
+
+        with caplog.at_level("INFO"):
+            config.instantiate(model_with_head, total_steps=1000)
+        assert any("Hybrid mode AdamW parameters" in record.message for record in caplog.records)
+        assert any("head.weight" in record.message for record in caplog.records)
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_hybrid_muon_does_not_log_on_non_zero_rank(self, model_with_head, monkeypatch, caplog):
+        """Test hybrid AdamW parameter logging is suppressed on non-zero ranks."""
+        monkeypatch.setattr(optimizer_module, "_is_rank_zero", lambda: False)
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            fused=False,
+            log_hybrid_adamw_parameters=True,
+            parameter_groups=[{"params": ("head",), "optimizer": ADAMW_COMPONENT_NAME}],
+        )
+
+        with caplog.at_level("INFO"):
+            config.instantiate(model_with_head, total_steps=1000)
+        assert not any("Hybrid mode AdamW parameters" in record.message for record in caplog.records)
 
     @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
     def test_instantiate_hybrid_muon_with_onecycle_scheduler(self, simple_model):

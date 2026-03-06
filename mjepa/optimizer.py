@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from os import PathLike
@@ -17,6 +18,13 @@ HYBRID_MUON_SCHEDULER_KIND = "hybrid_muon"
 
 MUON_COMPONENT_NAME = "muon"
 ADAMW_COMPONENT_NAME = "adamw"
+AUTO_COMPONENT_NAME = "auto"
+
+PARAMETER_GROUP_OPTIMIZER_MODES = {
+    AUTO_COMPONENT_NAME,
+    MUON_COMPONENT_NAME,
+    ADAMW_COMPONENT_NAME,
+}
 
 _MUON_GROUP_KEYS = {"lr", "weight_decay", "momentum", "nesterov", "ns_coefficients", "eps", "ns_steps", "adjust_lr_fn"}
 _ADAMW_GROUP_KEYS = {
@@ -148,6 +156,25 @@ def get_scheduler_kind_from_state_dict(state_dict: Mapping[str, Any]) -> str:
     return cast(str, state_dict.get("_mjepa_scheduler_kind", ADAMW_SCHEDULER_KIND))
 
 
+def _is_rank_zero() -> bool:
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
+def _collect_parameter_names_by_id(model: nn.Module) -> dict[int, str]:
+    return {id(param): name for name, param in model.named_parameters() if param.requires_grad}
+
+
+def _collect_group_parameter_names(
+    parameter_groups: list[dict[str, Any]], parameter_names_by_id: Mapping[int, str]
+) -> list[str]:
+    names = {
+        parameter_names_by_id.get(id(param), f"<unnamed:{id(param)}>")
+        for group in parameter_groups
+        for param in group["params"]
+    }
+    return sorted(names)
+
+
 @dataclass(frozen=True)
 class OptimizerConfig:
     # Optimizer
@@ -158,12 +185,14 @@ class OptimizerConfig:
     fused: bool | None = True
     foreach: bool | None = None
     eps: float = 1e-8
+    adamw_lr: float | None = None
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
     muon_eps: float = 1e-7
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] | None = None
+    log_hybrid_adamw_parameters: bool = False
 
     # Scheduler
     scheduled: bool = False
@@ -215,7 +244,7 @@ class OptimizerConfig:
         return optimizer, scheduler
 
     def _instantiate_hybrid_muon(
-        self, parameter_groups: list[dict[str, Any]], total_steps: int
+        self, parameter_groups: list[dict[str, Any]], total_steps: int, parameter_names_by_id: Mapping[int, str]
     ) -> tuple[CompositeOptimizer, CompositeScheduler]:
         muon_cls = cast(Any, getattr(torch.optim, "Muon", None))
         if muon_cls is None:
@@ -237,9 +266,10 @@ class OptimizerConfig:
                 adjust_lr_fn=self.muon_adjust_lr_fn,
             )
         if adamw_parameter_groups:
+            adamw_lr = self.adamw_lr if self.adamw_lr is not None else self.lr
             optimizers[ADAMW_COMPONENT_NAME] = AdamW(
                 adamw_parameter_groups,
-                lr=self.lr,
+                lr=adamw_lr,
                 weight_decay=self.weight_decay,
                 betas=self.betas,
                 fused=self.fused,
@@ -249,12 +279,19 @@ class OptimizerConfig:
         if not optimizers:
             raise ValueError("No trainable parameters found for hybrid_muon optimizer")
 
+        if self.log_hybrid_adamw_parameters and adamw_parameter_groups and _is_rank_zero():
+            adamw_parameter_names = _collect_group_parameter_names(adamw_parameter_groups, parameter_names_by_id)
+            logging.info(
+                "Hybrid mode AdamW parameters (%d): %s", len(adamw_parameter_names), ", ".join(adamw_parameter_names)
+            )
+
         schedulers = {
             name: self._instantiate_scheduler(optimizer, total_steps) for name, optimizer in optimizers.items()
         }
         return CompositeOptimizer(optimizers), CompositeScheduler(schedulers)
 
     def instantiate(self, model: nn.Module, total_steps: int) -> tuple[OptimizerLike, SchedulerLike]:
+        parameter_names_by_id = _collect_parameter_names_by_id(model)
         parameter_groups = _assign_parameter_groups(
             model,
             self.parameter_groups,
@@ -263,7 +300,7 @@ class OptimizerConfig:
         if self.kind == ADAMW_OPTIMIZER_KIND:
             return self._instantiate_adamw(parameter_groups, total_steps)
         if self.kind == HYBRID_MUON_OPTIMIZER_KIND:
-            return self._instantiate_hybrid_muon(parameter_groups, total_steps)
+            return self._instantiate_hybrid_muon(parameter_groups, total_steps, parameter_names_by_id)
         raise ValueError(f"Unsupported optimizer kind: {self.kind!r}")
 
     @classmethod
@@ -329,11 +366,28 @@ def _split_parameter_groups_by_ndim(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     muon_parameter_groups: list[dict[str, Any]] = []
     adamw_parameter_groups: list[dict[str, Any]] = []
-    for group in parameter_groups:
+    for index, group in enumerate(parameter_groups):
         params = list(group["params"])
-        kwargs = {k: v for k, v in group.items() if k != "params"}
-        muon_params = [param for param in params if param.ndim == 2]
-        adamw_params = [param for param in params if param.ndim != 2]
+        optimizer_mode = cast(str, group.get("optimizer", AUTO_COMPONENT_NAME))
+        if optimizer_mode not in PARAMETER_GROUP_OPTIMIZER_MODES:
+            raise ValueError(
+                f"Unsupported parameter group optimizer mode {optimizer_mode!r} for group {index}. "
+                f"Expected one of {sorted(PARAMETER_GROUP_OPTIMIZER_MODES)}"
+            )
+        kwargs = {k: v for k, v in group.items() if k not in {"params", "optimizer"}}
+        if optimizer_mode == MUON_COMPONENT_NAME:
+            non_2d_param = next((param for param in params if param.ndim != 2), None)
+            if non_2d_param is not None:
+                raise ValueError(
+                    f"Parameter group {index} with optimizer='muon' contains a non-2D parameter "
+                    f"with shape {tuple(non_2d_param.shape)}"
+                )
+            muon_params, adamw_params = params, []
+        elif optimizer_mode == ADAMW_COMPONENT_NAME:
+            muon_params, adamw_params = [], params
+        else:
+            muon_params = [param for param in params if param.ndim == 2]
+            adamw_params = [param for param in params if param.ndim != 2]
         if muon_params:
             muon_kwargs = {k: v for k, v in kwargs.items() if k in _MUON_GROUP_KEYS}
             muon_parameter_groups.append({"params": muon_params, **muon_kwargs})

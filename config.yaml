@@ -80,4 +80,9 @@ optimizer: !!python/object:mjepa.OptimizerConfig
   div_factor: 10
   # To enable hybrid Muon + AdamW:
   # kind: hybrid_muon
+  # adamw_lr: 0.0002
   # muon_adjust_lr_fn: match_rms_adamw
+  # log_hybrid_adamw_parameters: true
+  # parameter_groups:
+  #   - params: ["heads"]
+  #     optimizer: adamw
