@@ -7,7 +7,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from shutil import copyfile
-from typing import Literal, overload
+from typing import Any, Literal, overload
 from warnings import filterwarnings
 
 import numpy as np
@@ -16,14 +16,20 @@ import torch.distributed as dist
 import torch.nn as nn
 import torchmetrics as tm
 import yaml
-from torch.optim.lr_scheduler import LRScheduler
-from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from vit import ViT
 from vit.pos_enc import LearnablePosition
 
 from .jepa import CrossAttentionPredictor
+from .optimizer import (
+    OptimizerLike,
+    SchedulerLike,
+    get_optimizer_kind,
+    get_optimizer_kind_from_state_dict,
+    get_scheduler_kind,
+    get_scheduler_kind_from_state_dict,
+)
 
 
 DataLoaderFn = Callable[[Sequence[int], int], DataLoader]
@@ -145,8 +151,8 @@ def save_checkpoint(
     backbone: ViT,
     predictor: CrossAttentionPredictor | None,
     teacher: ViT | None,
-    optimizer: Optimizer,
-    scheduler: LRScheduler,
+    optimizer: OptimizerLike,
+    scheduler: SchedulerLike,
     step: int,
     epoch: int,
 ) -> None:
@@ -174,6 +180,8 @@ def save_checkpoint(
         teacher=teacher.state_dict() if teacher else None,
         optimizer=optimizer.state_dict(),
         scheduler=scheduler.state_dict(),
+        optimizer_kind=get_optimizer_kind(optimizer),
+        scheduler_kind=get_scheduler_kind(scheduler),
         step=step,
         epoch=epoch,
         img_size=backbone.config.img_size if hasattr(backbone.config, "img_size") else None,
@@ -193,13 +201,37 @@ def resize_learnable_pos_enc(model: nn.Module, tokenized_size: Sequence[int]) ->
                 raise
 
 
+def _validate_checkpoint_optimizer_and_scheduler_kinds(
+    checkpoint: dict[str, Any], optimizer: OptimizerLike, scheduler: SchedulerLike
+) -> None:
+    checkpoint_optimizer_kind = str(
+        checkpoint.get("optimizer_kind", get_optimizer_kind_from_state_dict(checkpoint["optimizer"]))
+    )
+    expected_optimizer_kind = get_optimizer_kind(optimizer)
+    if checkpoint_optimizer_kind != expected_optimizer_kind:
+        raise ValueError(
+            f"Checkpoint optimizer kind {checkpoint_optimizer_kind!r} does not match "
+            f"configured optimizer kind {expected_optimizer_kind!r}"
+        )
+
+    checkpoint_scheduler_kind = str(
+        checkpoint.get("scheduler_kind", get_scheduler_kind_from_state_dict(checkpoint["scheduler"]))
+    )
+    expected_scheduler_kind = get_scheduler_kind(scheduler)
+    if checkpoint_scheduler_kind != expected_scheduler_kind:
+        raise ValueError(
+            f"Checkpoint scheduler kind {checkpoint_scheduler_kind!r} does not match "
+            f"configured scheduler kind {expected_scheduler_kind!r}"
+        )
+
+
 def load_checkpoint(
     path: os.PathLike,
     backbone: ViT,
     predictor: CrossAttentionPredictor | None,
     teacher: ViT | None,
-    optimizer: Optimizer,
-    scheduler: LRScheduler,
+    optimizer: OptimizerLike,
+    scheduler: SchedulerLike,
     strict: bool = True,
     mode: Literal["resume", "fresh"] = "resume",
 ) -> tuple[int, int]:
@@ -223,6 +255,9 @@ def load_checkpoint(
         Tuple of current step, epoch.
     """
     data = torch.load(path, weights_only=False)
+    if mode == "resume":
+        _validate_checkpoint_optimizer_and_scheduler_kinds(data, optimizer, scheduler)
+
     old_img_size = (256, 256)
     old_tokenized_size = backbone.stem.tokenized_size(old_img_size)
     new_tokenized_size = backbone.stem.tokenized_size(backbone.config.img_size)

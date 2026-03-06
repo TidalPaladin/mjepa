@@ -16,6 +16,7 @@ from mjepa.jepa import CrossAttentionPredictor
 from mjepa.trainer import (
     ResolutionConfig,
     TrainerConfig,
+    _validate_checkpoint_optimizer_and_scheduler_kinds,
     calculate_total_steps,
     count_parameters,
     format_large_number,
@@ -447,6 +448,8 @@ class TestSaveCheckpoint:
             assert "teacher" in checkpoint
             assert "optimizer" in checkpoint
             assert "scheduler" in checkpoint
+            assert checkpoint["optimizer_kind"] == "adamw"
+            assert checkpoint["scheduler_kind"] == "adamw"
             assert checkpoint["step"] == 100
             assert checkpoint["epoch"] == 5
 
@@ -509,6 +512,46 @@ class TestFormatPbarDescription:
         assert "Step:" in desc
         assert "Microbatch:" in desc
         assert "loss=" in desc
+
+
+class TestCheckpointStateCompatibility:
+    """Test checkpoint optimizer/scheduler kind compatibility checks."""
+
+    @pytest.fixture
+    def adamw_components(self):
+        model = nn.Linear(10, 5)
+        optimizer = AdamW(model.parameters(), lr=1e-3)
+        scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=2)
+        return optimizer, scheduler
+
+    def test_accepts_legacy_adamw_checkpoint_state(self, adamw_components):
+        optimizer, scheduler = adamw_components
+        checkpoint = {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        }
+
+        _validate_checkpoint_optimizer_and_scheduler_kinds(checkpoint, optimizer, scheduler)
+
+    def test_rejects_optimizer_kind_mismatch(self, adamw_components):
+        optimizer, scheduler = adamw_components
+        checkpoint = {
+            "optimizer": {"_mjepa_optimizer_kind": "hybrid_muon"},
+            "scheduler": scheduler.state_dict(),
+        }
+
+        with pytest.raises(ValueError, match="optimizer kind"):
+            _validate_checkpoint_optimizer_and_scheduler_kinds(checkpoint, optimizer, scheduler)
+
+    def test_rejects_scheduler_kind_mismatch(self, adamw_components):
+        optimizer, scheduler = adamw_components
+        checkpoint = {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": {"_mjepa_scheduler_kind": "hybrid_muon"},
+        }
+
+        with pytest.raises(ValueError, match="scheduler kind"):
+            _validate_checkpoint_optimizer_and_scheduler_kinds(checkpoint, optimizer, scheduler)
 
 
 class TestYAMLConstructors:

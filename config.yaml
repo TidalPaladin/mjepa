@@ -71,9 +71,18 @@ jepa: !!python/object:mjepa.JEPAConfig
   sigreg_loss_weight: 0.0001
 
 optimizer: !!python/object:mjepa.OptimizerConfig
+  kind: adamw
   lr: 0.0005
   weight_decay: 0.1
   betas: [0.85, 0.95]
   fused: true
   scheduled: false
   div_factor: 10
+  # To enable hybrid Muon + AdamW:
+  # kind: hybrid_muon
+  # adamw_lr: 0.0002
+  # muon_adjust_lr_fn: match_rms_adamw
+  # log_hybrid_adamw_parameters: true
+  # parameter_groups:
+  #   - params: ["heads"]
+  #     optimizer: adamw
