@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
@@ -292,6 +293,32 @@ class TestOptimizerConfigInstantiate:
         assert isinstance(optimizer, CompositeOptimizer)
         assert optimizer.optimizers[MUON_COMPONENT_NAME].defaults["lr"] == muon_lr
         assert optimizer.optimizers[ADAMW_COMPONENT_NAME].defaults["lr"] == adamw_lr
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_hybrid_muon_preserves_skip_weight_decay_on_1d(self, simple_model):
+        """Test 1D params still receive zero weight decay in the AdamW branch."""
+        base_weight_decay = 0.01
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=base_weight_decay,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=False,
+            fused=False,
+            skip_weight_decay_on_1d=True,
+        )
+        optimizer, _ = config.instantiate(simple_model, total_steps=1000)
+
+        assert isinstance(optimizer, CompositeOptimizer)
+        optimizer = cast(CompositeOptimizer, optimizer)
+        adamw_optimizer = optimizer.optimizers[ADAMW_COMPONENT_NAME]
+        weight_decay_by_param_id = {
+            id(param): group["weight_decay"] for group in adamw_optimizer.param_groups for param in group["params"]
+        }
+
+        for param in simple_model.parameters():
+            if param.ndim == 1:
+                assert weight_decay_by_param_id[id(param)] == 0.0
 
     @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
     def test_hybrid_muon_supports_explicit_adamw_parameter_group_assignment(self, model_with_head):

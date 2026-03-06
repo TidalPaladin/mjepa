@@ -56,6 +56,31 @@ class SchedulerLike(Protocol):
     def load_state_dict(self, state_dict: dict[str, Any]): ...
 
 
+def _load_component_state_dicts(
+    state_dict: dict[str, Any],
+    *,
+    kind_key: str,
+    expected_kind: str,
+    component_key: str,
+    components: Mapping[str, OptimizerLike | SchedulerLike],
+    component_label: str,
+) -> None:
+    checkpoint_kind = state_dict.get(kind_key)
+    if checkpoint_kind != expected_kind:
+        raise ValueError(f"Cannot load checkpoint {component_label} kind {checkpoint_kind!r} into {expected_kind!r}")
+
+    component_state_dicts = state_dict.get(component_key)
+    if not isinstance(component_state_dicts, Mapping):
+        raise ValueError(f"Invalid composite {component_label} state dict: missing {component_key!r} mapping")
+
+    missing_components = sorted(name for name in components if name not in component_state_dicts)
+    if missing_components:
+        raise ValueError(f"Missing {component_label} state for components: {missing_components}")
+
+    for name, component in components.items():
+        component.load_state_dict(cast(dict[str, Any], component_state_dicts[name]))
+
+
 class CompositeOptimizer:
     def __init__(self, optimizers: dict[str, Optimizer]):
         if not optimizers:
@@ -86,19 +111,14 @@ class CompositeOptimizer:
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]):
-        checkpoint_kind = state_dict.get("_mjepa_optimizer_kind")
-        if checkpoint_kind != HYBRID_MUON_OPTIMIZER_KIND:
-            raise ValueError(
-                f"Cannot load checkpoint optimizer kind {checkpoint_kind!r} into {HYBRID_MUON_OPTIMIZER_KIND!r}"
-            )
-        optimizer_state_dicts = state_dict.get("optimizers")
-        if not isinstance(optimizer_state_dicts, Mapping):
-            raise ValueError("Invalid composite optimizer state dict: missing 'optimizers' mapping")
-        missing_components = [name for name in self.optimizers if name not in optimizer_state_dicts]
-        if missing_components:
-            raise ValueError(f"Missing optimizer state for components: {missing_components}")
-        for name, optimizer in self.optimizers.items():
-            optimizer.load_state_dict(cast(dict[str, Any], optimizer_state_dicts[name]))
+        _load_component_state_dicts(
+            state_dict,
+            kind_key="_mjepa_optimizer_kind",
+            expected_kind=HYBRID_MUON_OPTIMIZER_KIND,
+            component_key="optimizers",
+            components=self.optimizers,
+            component_label="optimizer",
+        )
 
 
 class CompositeScheduler:
@@ -124,19 +144,14 @@ class CompositeScheduler:
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]):
-        checkpoint_kind = state_dict.get("_mjepa_scheduler_kind")
-        if checkpoint_kind != HYBRID_MUON_SCHEDULER_KIND:
-            raise ValueError(
-                f"Cannot load checkpoint scheduler kind {checkpoint_kind!r} into {HYBRID_MUON_SCHEDULER_KIND!r}"
-            )
-        scheduler_state_dicts = state_dict.get("schedulers")
-        if not isinstance(scheduler_state_dicts, Mapping):
-            raise ValueError("Invalid composite scheduler state dict: missing 'schedulers' mapping")
-        missing_components = [name for name in self.schedulers if name not in scheduler_state_dicts]
-        if missing_components:
-            raise ValueError(f"Missing scheduler state for components: {missing_components}")
-        for name, scheduler in self.schedulers.items():
-            scheduler.load_state_dict(cast(dict[str, Any], scheduler_state_dicts[name]))
+        _load_component_state_dicts(
+            state_dict,
+            kind_key="_mjepa_scheduler_kind",
+            expected_kind=HYBRID_MUON_SCHEDULER_KIND,
+            component_key="schedulers",
+            components=self.schedulers,
+            component_label="scheduler",
+        )
         self._last_lr = self.get_last_lr()
 
 
@@ -173,6 +188,37 @@ def _collect_group_parameter_names(
         for param in group["params"]
     }
     return sorted(names)
+
+
+def _get_group_optimizer_mode(group: Mapping[str, Any], index: int) -> str:
+    optimizer_mode = cast(str, group.get("optimizer", AUTO_COMPONENT_NAME))
+    if optimizer_mode not in PARAMETER_GROUP_OPTIMIZER_MODES:
+        raise ValueError(
+            f"Unsupported parameter group optimizer mode {optimizer_mode!r} for group {index}. "
+            f"Expected one of {sorted(PARAMETER_GROUP_OPTIMIZER_MODES)}"
+        )
+    return optimizer_mode
+
+
+def _split_group_parameters(
+    params: list[nn.Parameter],
+    optimizer_mode: str,
+    index: int,
+) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    if optimizer_mode == MUON_COMPONENT_NAME:
+        non_2d_param = next((param for param in params if param.ndim != 2), None)
+        if non_2d_param is not None:
+            raise ValueError(
+                f"Parameter group {index} with optimizer='muon' contains a non-2D parameter "
+                f"with shape {tuple(non_2d_param.shape)}"
+            )
+        return params, []
+    if optimizer_mode == ADAMW_COMPONENT_NAME:
+        return [], params
+
+    muon_params = [param for param in params if param.ndim == 2]
+    adamw_params = [param for param in params if param.ndim != 2]
+    return muon_params, adamw_params
 
 
 @dataclass(frozen=True)
@@ -279,16 +325,25 @@ class OptimizerConfig:
         if not optimizers:
             raise ValueError("No trainable parameters found for hybrid_muon optimizer")
 
-        if self.log_hybrid_adamw_parameters and adamw_parameter_groups and _is_rank_zero():
-            adamw_parameter_names = _collect_group_parameter_names(adamw_parameter_groups, parameter_names_by_id)
-            logging.info(
-                "Hybrid mode AdamW parameters (%d): %s", len(adamw_parameter_names), ", ".join(adamw_parameter_names)
-            )
+        self._log_hybrid_adamw_parameters(adamw_parameter_groups, parameter_names_by_id)
 
         schedulers = {
             name: self._instantiate_scheduler(optimizer, total_steps) for name, optimizer in optimizers.items()
         }
         return CompositeOptimizer(optimizers), CompositeScheduler(schedulers)
+
+    def _log_hybrid_adamw_parameters(
+        self,
+        adamw_parameter_groups: list[dict[str, Any]],
+        parameter_names_by_id: Mapping[int, str],
+    ) -> None:
+        if not self.log_hybrid_adamw_parameters or not adamw_parameter_groups or not _is_rank_zero():
+            return
+
+        adamw_parameter_names = _collect_group_parameter_names(adamw_parameter_groups, parameter_names_by_id)
+        logging.info(
+            "Hybrid mode AdamW parameters (%d): %s", len(adamw_parameter_names), ", ".join(adamw_parameter_names)
+        )
 
     def instantiate(self, model: nn.Module, total_steps: int) -> tuple[OptimizerLike, SchedulerLike]:
         parameter_names_by_id = _collect_parameter_names_by_id(model)
@@ -368,26 +423,9 @@ def _split_parameter_groups_by_ndim(
     adamw_parameter_groups: list[dict[str, Any]] = []
     for index, group in enumerate(parameter_groups):
         params = list(group["params"])
-        optimizer_mode = cast(str, group.get("optimizer", AUTO_COMPONENT_NAME))
-        if optimizer_mode not in PARAMETER_GROUP_OPTIMIZER_MODES:
-            raise ValueError(
-                f"Unsupported parameter group optimizer mode {optimizer_mode!r} for group {index}. "
-                f"Expected one of {sorted(PARAMETER_GROUP_OPTIMIZER_MODES)}"
-            )
+        optimizer_mode = _get_group_optimizer_mode(group, index)
         kwargs = {k: v for k, v in group.items() if k not in {"params", "optimizer"}}
-        if optimizer_mode == MUON_COMPONENT_NAME:
-            non_2d_param = next((param for param in params if param.ndim != 2), None)
-            if non_2d_param is not None:
-                raise ValueError(
-                    f"Parameter group {index} with optimizer='muon' contains a non-2D parameter "
-                    f"with shape {tuple(non_2d_param.shape)}"
-                )
-            muon_params, adamw_params = params, []
-        elif optimizer_mode == ADAMW_COMPONENT_NAME:
-            muon_params, adamw_params = [], params
-        else:
-            muon_params = [param for param in params if param.ndim == 2]
-            adamw_params = [param for param in params if param.ndim != 2]
+        muon_params, adamw_params = _split_group_parameters(params, optimizer_mode, index)
         if muon_params:
             muon_kwargs = {k: v for k, v in kwargs.items() if k in _MUON_GROUP_KEYS}
             muon_parameter_groups.append({"params": muon_params, **muon_kwargs})
