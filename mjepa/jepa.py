@@ -1,6 +1,6 @@
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
@@ -15,6 +15,37 @@ from vit.tokens import apply_mask, generate_non_overlapping_mask
 
 
 torch._dynamo.config.cache_size_limit = 1024 * 1024 * 1024 * 1024
+
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float64": torch.float64,
+}
+
+
+def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
+    if dtype is None or isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        normalized = _DTYPE_MAP.get(dtype.removeprefix("torch."))
+        if normalized is not None:
+            return normalized
+    raise ValueError(f"Unsupported dtype for {field_name}: {dtype!r}")
+
+
+def _sync_module_config_dtype(model: nn.Module, dtype: torch.dtype) -> None:
+    config = getattr(model, "config", None)
+    if config is None or not hasattr(config, "dtype"):
+        return
+
+    if is_dataclass(config):
+        updated_config = replace(cast(Any, config), dtype=dtype)
+        config_attr = "_config" if hasattr(model, "_config") else "config"
+        setattr(model, config_attr, updated_config)
+        return
+
+    setattr(config, "dtype", dtype)
 
 
 class CrossAttentionPredictor(nn.Module):
@@ -93,7 +124,7 @@ class CrossAttentionPredictor(nn.Module):
         for block in self.blocks:
             query = block(query, context, rope_q=rope_q, rope_k=rope_k)
 
-        return self.predictor_proj(query)
+        return self.predictor_proj(query).float()
 
     if TYPE_CHECKING:
 
@@ -177,7 +208,18 @@ def update_teacher(student: nn.Module, teacher: nn.Module, momentum: float = 0.0
     if momentum == 1.0:
         return
     weight = 1 - momentum
-    torch._foreach_lerp_(list(teacher.parameters()), list(student.parameters()), weight)
+    teacher_params = [cast(Tensor, param) for param in teacher.parameters()]
+    student_params = [cast(Tensor, param) for param in student.parameters()]
+    matching_dtypes = all(
+        teacher_param.dtype == student_param.dtype and teacher_param.device == student_param.device
+        for teacher_param, student_param in zip(teacher_params, student_params)
+    )
+    if matching_dtypes:
+        torch._foreach_lerp_(teacher_params, student_params, weight)
+        return
+
+    for teacher_param, student_param in zip(teacher_params, student_params):
+        teacher_param.lerp_(student_param.to(device=teacher_param.device, dtype=teacher_param.dtype), weight)
 
 
 def get_momentum(step: int, total_steps: int, momentum: float, scheduled: bool = False) -> float:
@@ -198,18 +240,23 @@ def get_momentum(step: int, total_steps: int, momentum: float, scheduled: bool =
 M = TypeVar("M", bound=nn.Module)
 
 
-def setup_teacher(backbone: M) -> M:
+def setup_teacher(backbone: M, dtype: torch.dtype | str | None = None) -> M:
     r"""Create a teacher model from a backbone model.
 
     The teacher will have parameters frozen and will be set to evaluation mode.
 
     Args:
         backbone: Backbone model to create a teacher from.
+        dtype: Optional dtype override for the copied teacher weights.
 
     Returns:
         Teacher model.
     """
     teacher = deepcopy(backbone)
+    teacher_dtype = _normalize_dtype(dtype, "teacher dtype")
+    if teacher_dtype is not None:
+        teacher = cast(M, teacher.to(dtype=teacher_dtype))
+        _sync_module_config_dtype(teacher, teacher_dtype)
     teacher.requires_grad_(False)
     teacher.eval()
     return teacher
@@ -365,6 +412,7 @@ class JEPAConfig:
         predictor_depth: Depth of the predictor network.
         disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
             and attention dropout to ``0.0``.
+        teacher_dtype: Optional dtype override for the teacher and Gram teacher weights.
         gram_teacher_epoch: Epoch when the Gram teacher is first synchronized from the teacher.
         gram_start_epoch: The epoch at which to begin computing the Gram loss.
             If ``None``, the Gram loss will not be computed.
@@ -382,6 +430,7 @@ class JEPAConfig:
     scheduled: bool = False
     predictor_depth: int = 4
     disable_predictor_regularizers: bool = False
+    teacher_dtype: torch.dtype | str | None = None
     gram_teacher_epoch: int = 100
     gram_start_epoch: int | None = None
     gram_update_interval_epoch: int = 10
@@ -391,6 +440,7 @@ class JEPAConfig:
     sigreg_loss_weight: float = 1e-4
 
     def __post_init__(self) -> None:
+        self.teacher_dtype = _normalize_dtype(self.teacher_dtype, "teacher_dtype")
         if not 0 < self.context_ratio <= 1:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:

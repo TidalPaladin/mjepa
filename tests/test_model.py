@@ -77,13 +77,13 @@ def predictor(small_vit):
 @pytest.fixture
 def mjepa_model(jepa_config, small_vit, predictor):
     """Create an MJEPA model for testing."""
-    return MJEPA(jepa_config, small_vit, predictor, dtype=torch.float32)
+    return MJEPA(jepa_config, small_vit, predictor, autocast_dtype=torch.float32)
 
 
 @pytest.fixture
 def mjepa_model_no_gram(jepa_config_no_gram, small_vit, predictor):
     """Create an MJEPA model without Gram teacher for testing."""
-    return MJEPA(jepa_config_no_gram, small_vit, predictor, dtype=torch.float32)
+    return MJEPA(jepa_config_no_gram, small_vit, predictor, autocast_dtype=torch.float32)
 
 
 @pytest.fixture
@@ -270,9 +270,21 @@ class TestMJEPAInitialization:
         assert mjepa_model.config == jepa_config
         assert mjepa_model.student == small_vit
         assert mjepa_model.predictor == predictor
-        assert mjepa_model.dtype == torch.float32
+        assert mjepa_model.autocast_dtype == torch.float32
         assert mjepa_model.teacher is not None
         assert mjepa_model.gram_teacher is not None
+
+    def test_initialization_with_teacher_dtype_override(self, small_vit: ViT, predictor: CrossAttentionPredictor):
+        """Test that teacher dtype override applies to both teacher models."""
+        config = JEPAConfig(gram_teacher_epoch=10, gram_start_epoch=20, teacher_dtype=torch.bfloat16)
+
+        model = MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
+
+        assert next(model.student.parameters()).dtype == torch.float32
+        assert next(model.predictor.parameters()).dtype == torch.float32
+        assert next(model.teacher.parameters()).dtype == torch.bfloat16
+        assert model.gram_teacher is not None
+        assert next(model.gram_teacher.parameters()).dtype == torch.bfloat16
 
     def test_initialization_no_gram(self, mjepa_model_no_gram):
         """Test that MJEPA model without Gram teacher is initialized correctly."""
@@ -347,6 +359,7 @@ class TestMJEPAForwardPasses:
 
         assert isinstance(output, torch.Tensor)
         assert output.shape[0] == 2
+        assert output.dtype == torch.float32
 
     def test_forward_probe(self, mjepa_model: MJEPA, dummy_vit_features):
         """Test forward pass through probe (currently returns empty dict)."""
@@ -595,7 +608,7 @@ class TestMJEPATeacherUpdate:
             gram_loss_weight=1.0,
             sigreg_loss_weight=0.0001,
         )
-        model = MJEPA(config, small_vit, predictor, dtype=torch.float32)
+        model = MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
         assert model.gram_teacher is not None
 
         model.teacher.stem.patch.weight.data.fill_(1.0)

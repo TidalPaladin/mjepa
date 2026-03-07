@@ -65,6 +65,26 @@ class TestUpdateTeacher:
         with pytest.raises(AssertionError):
             update_teacher(student, teacher, 1.1)
 
+    @pytest.mark.parametrize(
+        "student_dtype,teacher_dtype",
+        [
+            (torch.float32, torch.bfloat16),
+            (torch.bfloat16, torch.float32),
+        ],
+    )
+    def test_update_teacher_supports_mixed_dtypes(self, student_dtype, teacher_dtype):
+        """Test mixed-dtype EMA updates preserve the teacher dtype."""
+        student = nn.Linear(4, 4, dtype=student_dtype)
+        teacher = nn.Linear(4, 4, dtype=teacher_dtype)
+        student.weight.data.fill_(2.0)
+        teacher.weight.data.fill_(0.0)
+
+        update_teacher(student, teacher, momentum=0.5)
+
+        assert teacher.weight.dtype == teacher_dtype
+        expected = torch.full_like(teacher.weight.data, 1.0)
+        assert torch.allclose(teacher.weight.data, expected)
+
 
 class TestGetMomentum:
     def test_get_momentum_start(self):
@@ -109,6 +129,7 @@ class TestJEPAConfig:
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
         assert config.disable_predictor_regularizers is False
+        assert config.teacher_dtype is None
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -119,6 +140,7 @@ class TestJEPAConfig:
             momentum=0.95,
             predictor_depth=6,
             disable_predictor_regularizers=True,
+            teacher_dtype=torch.bfloat16,
         )
         assert config.context_ratio == 0.6
         assert config.target_ratio == 0.3
@@ -126,6 +148,7 @@ class TestJEPAConfig:
         assert config.momentum == 0.95
         assert config.predictor_depth == 6
         assert config.disable_predictor_regularizers is True
+        assert config.teacher_dtype == torch.bfloat16
 
     def test_invalid_context_ratio(self):
         """Test invalid context ratio."""
@@ -159,6 +182,7 @@ class TestYAMLConfig:
             "momentum": 0.98,
             "predictor_depth": 8,
             "disable_predictor_regularizers": True,
+            "teacher_dtype": "bfloat16",
         }
         loader.construct_mapping.return_value = config_dict
 
@@ -173,6 +197,7 @@ class TestYAMLConfig:
         assert config.momentum == 0.98
         assert config.predictor_depth == 8
         assert config.disable_predictor_regularizers is True
+        assert config.teacher_dtype == torch.bfloat16
 
         # Verify the loader was called correctly
         loader.construct_mapping.assert_called_once_with(node, deep=True)
@@ -191,6 +216,7 @@ class TestYAMLConfig:
         momentum: 0.97
         predictor_depth: 5
         disable_predictor_regularizers: true
+        teacher_dtype: bfloat16
         """
 
         # Load the YAML
@@ -204,6 +230,12 @@ class TestYAMLConfig:
         assert config.momentum == 0.97
         assert config.predictor_depth == 5
         assert config.disable_predictor_regularizers is True
+        assert config.teacher_dtype == torch.bfloat16
+
+    def test_invalid_teacher_dtype_string(self):
+        """Test invalid teacher dtype string."""
+        with pytest.raises(ValueError, match="Unsupported dtype"):
+            JEPAConfig(teacher_dtype="halfish")
 
 
 class TestComputeSigREGLoss:
@@ -481,6 +513,33 @@ class TestCrossAttentionPredictor:
 
         self._assert_predictor_regularizers(predictor, hidden_dropout, attention_dropout, drop_path_rate)
 
+    def test_predictor_forward_promotes_output_to_float32(self):
+        """Test predictor outputs are promoted to float32."""
+        vit_config = ViTConfig(
+            in_channels=3,
+            hidden_size=64,
+            patch_size=[4, 4],
+            img_size=[32, 32],
+            depth=2,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            num_register_tokens=2,
+            num_cls_tokens=2,
+            pos_enc="rope",
+            dtype=torch.bfloat16,
+        )
+        backbone = vit_config.instantiate()
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        context = torch.randn(2, 32, 64, dtype=torch.bfloat16)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :32] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+
+        output = predictor((8, 8), context, context_mask, target_mask)
+
+        assert output.dtype == torch.float32
+
 
 class TestGenerateMasks:
     """Test generate_masks function."""
@@ -671,6 +730,35 @@ class TestSetupTeacher:
         assert not teacher.training
         for param in teacher.parameters():
             assert not param.requires_grad
+
+    def test_setup_teacher_casts_dtype_when_requested(self):
+        """Test setup_teacher casts teacher weights when requested."""
+        backbone = nn.Linear(10, 10, dtype=torch.float32)
+
+        teacher = setup_teacher(backbone, dtype=torch.bfloat16)
+
+        for param in teacher.parameters():
+            assert param.dtype == torch.bfloat16
+
+    def test_setup_teacher_updates_vit_config_dtype(self):
+        """Test setup_teacher keeps ViT config dtype in sync with cast weights."""
+        vit_config = ViTConfig(
+            in_channels=3,
+            hidden_size=64,
+            patch_size=[4, 4],
+            img_size=[32, 32],
+            depth=2,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            pos_enc="rope",
+            dtype=torch.float32,
+        )
+        backbone = vit_config.instantiate()
+
+        teacher = setup_teacher(backbone, dtype=torch.bfloat16)
+
+        assert teacher.config.dtype == torch.bfloat16
+        assert teacher.stem.patch.weight.dtype == torch.bfloat16
 
 
 class TestIsGramUpdateEpoch:
