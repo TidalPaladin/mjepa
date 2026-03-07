@@ -22,6 +22,7 @@ _DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
     "float64": torch.float64,
 }
+PREDICTOR_PROJ_INIT_STD = 0.02
 
 
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
@@ -76,10 +77,9 @@ class CrossAttentionPredictor(nn.Module):
         disable_predictor_regularizers: bool = False,
     ):
         super().__init__()
+        factory_kwargs = {"device": device, "dtype": backbone.config.dtype}
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
-        self.pos_enc_target = LearnablePosition(
-            backbone.config.hidden_size, spatial_size, device=device, dtype=backbone.config.dtype
-        )
+        self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size, **factory_kwargs)
         self.rope = backbone.rope
 
         # Predictor blocks and output projection
@@ -90,9 +90,16 @@ class CrossAttentionPredictor(nn.Module):
         self.predictor_proj = nn.Linear(
             backbone.config.hidden_size,
             out_dim or backbone.config.hidden_size,
-            device=device,
-            dtype=backbone.config.dtype,
+            **factory_kwargs,
         )
+        self._reset_predictor_proj_parameters()
+
+    def _reset_predictor_proj_parameters(self) -> None:
+        # Teacher targets are RMS-normalized and the predictor query starts at small positional scales,
+        # so keep the output head small and zero-centered at initialization.
+        nn.init.trunc_normal_(self.predictor_proj.weight, std=PREDICTOR_PROJ_INIT_STD)
+        if self.predictor_proj.bias is not None:
+            nn.init.zeros_(self.predictor_proj.bias)
 
     def _disable_predictor_regularizers(self) -> None:
         # Force predictor regularizers to zero without changing the backbone configuration.

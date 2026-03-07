@@ -8,6 +8,7 @@ import yaml
 from vit import ViTConfig
 
 from mjepa.jepa import (
+    PREDICTOR_PROJ_INIT_STD,
     CrossAttentionPredictor,
     JEPAConfig,
     compute_gram_loss,
@@ -303,7 +304,13 @@ class TestCrossAttentionPredictor:
     """Test CrossAttentionPredictor initialization and device/dtype handling."""
 
     @staticmethod
-    def _instantiate_backbone_with_regularizers(hidden_dropout: float, attention_dropout: float, drop_path_rate: float):
+    def _instantiate_backbone(
+        dtype: torch.dtype = torch.float32,
+        *,
+        hidden_dropout: float = 0.1,
+        attention_dropout: float = 0.1,
+        drop_path_rate: float = 0.0,
+    ):
         vit_config = ViTConfig(
             in_channels=3,
             hidden_size=64,
@@ -312,13 +319,26 @@ class TestCrossAttentionPredictor:
             depth=2,
             num_attention_heads=4,
             ffn_hidden_size=128,
+            num_register_tokens=2,
+            num_cls_tokens=2,
             hidden_dropout=hidden_dropout,
             attention_dropout=attention_dropout,
             drop_path_rate=drop_path_rate,
             pos_enc="rope",
-            dtype=torch.float32,
+            dtype=dtype,
         )
         return vit_config.instantiate()
+
+    @staticmethod
+    def _assert_predictor_device_dtype(
+        predictor: CrossAttentionPredictor, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        for name, param in predictor.named_parameters():
+            if device.type == "cuda":
+                assert param.device.type == device.type, f"Parameter {name} is on {param.device}, expected {device}"
+            else:
+                assert param.device == device, f"Parameter {name} is on {param.device}, expected {device}"
+            assert param.dtype == dtype, f"Parameter {name} has dtype {param.dtype}, expected {dtype}"
 
     @staticmethod
     def _assert_predictor_regularizers(
@@ -334,75 +354,25 @@ class TestCrossAttentionPredictor:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
     def test_predictor_initialization_cpu_dtype(self, dtype):
         """Test that CrossAttentionPredictor initializes all params with correct dtype on CPU."""
-        vit_config = ViTConfig(
-            in_channels=3,
-            hidden_size=64,
-            patch_size=[4, 4],
-            img_size=[32, 32],
-            depth=2,
-            num_attention_heads=4,
-            ffn_hidden_size=128,
-            num_register_tokens=2,
-            num_cls_tokens=2,
-            pos_enc="rope",
-            dtype=dtype,
-        )
-        backbone = vit_config.instantiate()
+        backbone = self._instantiate_backbone(dtype)
         device = torch.device("cpu")
-
         predictor = CrossAttentionPredictor(backbone, depth=2, out_dim=None, device=device)
-
-        # Check that all parameters are on the correct device and dtype
-        for name, param in predictor.named_parameters():
-            assert param.device == device, f"Parameter {name} is on {param.device}, expected {device}"
-            assert param.dtype == dtype, f"Parameter {name} has dtype {param.dtype}, expected {dtype}"
+        self._assert_predictor_device_dtype(predictor, device, dtype)
 
     @pytest.mark.cuda
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
     def test_predictor_initialization_cuda_dtype(self, dtype):
         """Test that CrossAttentionPredictor initializes all params with correct dtype on CUDA."""
-        vit_config = ViTConfig(
-            in_channels=3,
-            hidden_size=64,
-            patch_size=[4, 4],
-            img_size=[32, 32],
-            depth=2,
-            num_attention_heads=4,
-            ffn_hidden_size=128,
-            num_register_tokens=2,
-            num_cls_tokens=2,
-            pos_enc="rope",
-            dtype=dtype,
-        )
-        backbone = vit_config.instantiate()
+        backbone = self._instantiate_backbone(dtype)
         device = torch.device("cuda")
-
         predictor = CrossAttentionPredictor(backbone, depth=2, out_dim=None, device=device)
-
-        # Check that all parameters are on the correct device and dtype
-        for name, param in predictor.named_parameters():
-            assert param.device.type == device.type, f"Parameter {name} is on {param.device}, expected {device}"
-            assert param.dtype == dtype, f"Parameter {name} has dtype {param.dtype}, expected {dtype}"
+        self._assert_predictor_device_dtype(predictor, device, dtype)
 
     def test_predictor_all_params_share_backbone_dtype(self):
         """Test that all predictor parameters share the same dtype as backbone.config.dtype."""
         backbone_dtype = torch.bfloat16
-        vit_config = ViTConfig(
-            in_channels=3,
-            hidden_size=64,
-            patch_size=[4, 4],
-            img_size=[32, 32],
-            depth=2,
-            num_attention_heads=4,
-            ffn_hidden_size=128,
-            num_register_tokens=2,
-            num_cls_tokens=2,
-            pos_enc="rope",
-            dtype=backbone_dtype,
-        )
-        backbone = vit_config.instantiate()
+        backbone = self._instantiate_backbone(backbone_dtype)
         device = torch.device("cpu")
-
         predictor = CrossAttentionPredictor(backbone, depth=2, out_dim=128, device=device)
 
         # Verify backbone config dtype
@@ -419,32 +389,22 @@ class TestCrossAttentionPredictor:
         # Ensure we actually checked some parameters
         assert param_count > 0, "No parameters found in predictor"
 
+    def test_predictor_proj_uses_vit_style_initialization(self):
+        """Test predictor output head uses the configured small-weight initialization."""
+        backbone = self._instantiate_backbone()
+        predictor = CrossAttentionPredictor(backbone, depth=2, out_dim=128, device=torch.device("cpu"))
+
+        assert torch.count_nonzero(predictor.predictor_proj.bias) == 0
+        assert predictor.predictor_proj.weight.std().item() == pytest.approx(PREDICTOR_PROJ_INIT_STD, rel=0.25)
+
     @pytest.mark.parametrize("predictor_depth", [1, 2, 4])
     def test_predictor_initialization_different_depths(self, predictor_depth):
         """Test that CrossAttentionPredictor with different depths initializes correctly."""
         dtype = torch.float32
-        vit_config = ViTConfig(
-            in_channels=3,
-            hidden_size=64,
-            patch_size=[4, 4],
-            img_size=[32, 32],
-            depth=2,
-            num_attention_heads=4,
-            ffn_hidden_size=128,
-            num_register_tokens=2,
-            num_cls_tokens=2,
-            pos_enc="rope",
-            dtype=dtype,
-        )
-        backbone = vit_config.instantiate()
+        backbone = self._instantiate_backbone(dtype)
         device = torch.device("cpu")
-
         predictor = CrossAttentionPredictor(backbone, depth=predictor_depth, out_dim=None, device=device)
-
-        # Verify all parameters are on correct device and dtype
-        for name, param in predictor.named_parameters():
-            assert param.device == device, f"Parameter {name} is on {param.device}, expected {device}"
-            assert param.dtype == dtype, f"Parameter {name} has dtype {param.dtype}, expected {dtype}"
+        self._assert_predictor_device_dtype(predictor, device, dtype)
 
         # Check that the number of blocks matches the depth
         assert len(predictor.blocks) == predictor_depth
@@ -454,28 +414,10 @@ class TestCrossAttentionPredictor:
         """Test that CrossAttentionPredictor with different output dimensions initializes correctly."""
         dtype = torch.float32
         hidden_size = 64
-        vit_config = ViTConfig(
-            in_channels=3,
-            hidden_size=hidden_size,
-            patch_size=[4, 4],
-            img_size=[32, 32],
-            depth=2,
-            num_attention_heads=4,
-            ffn_hidden_size=128,
-            num_register_tokens=2,
-            num_cls_tokens=2,
-            pos_enc="rope",
-            dtype=dtype,
-        )
-        backbone = vit_config.instantiate()
+        backbone = self._instantiate_backbone(dtype)
         device = torch.device("cpu")
-
         predictor = CrossAttentionPredictor(backbone, depth=2, out_dim=out_dim, device=device)
-
-        # Verify all parameters are on correct device and dtype
-        for name, param in predictor.named_parameters():
-            assert param.device == device, f"Parameter {name} is on {param.device}, expected {device}"
-            assert param.dtype == dtype, f"Parameter {name} has dtype {param.dtype}, expected {dtype}"
+        self._assert_predictor_device_dtype(predictor, device, dtype)
 
         # Check the output projection dimension
         expected_out_dim = out_dim if out_dim is not None else hidden_size
@@ -486,7 +428,11 @@ class TestCrossAttentionPredictor:
         hidden_dropout = 0.2
         attention_dropout = 0.3
         drop_path_rate = 0.4
-        backbone = self._instantiate_backbone_with_regularizers(hidden_dropout, attention_dropout, drop_path_rate)
+        backbone = self._instantiate_backbone(
+            hidden_dropout=hidden_dropout,
+            attention_dropout=attention_dropout,
+            drop_path_rate=drop_path_rate,
+        )
         predictor = CrossAttentionPredictor(backbone, depth=2, disable_predictor_regularizers=False)
 
         self._assert_predictor_regularizers(predictor, hidden_dropout, attention_dropout, drop_path_rate)
@@ -496,7 +442,11 @@ class TestCrossAttentionPredictor:
         hidden_dropout = 0.2
         attention_dropout = 0.3
         drop_path_rate = 0.4
-        backbone = self._instantiate_backbone_with_regularizers(hidden_dropout, attention_dropout, drop_path_rate)
+        backbone = self._instantiate_backbone(
+            hidden_dropout=hidden_dropout,
+            attention_dropout=attention_dropout,
+            drop_path_rate=drop_path_rate,
+        )
         predictor = CrossAttentionPredictor(backbone, depth=2, disable_predictor_regularizers=True)
 
         self._assert_predictor_regularizers(predictor, 0.0, 0.0, 0.0)
@@ -506,7 +456,11 @@ class TestCrossAttentionPredictor:
         hidden_dropout = 0.2
         attention_dropout = 0.3
         drop_path_rate = 0.4
-        backbone = self._instantiate_backbone_with_regularizers(hidden_dropout, attention_dropout, drop_path_rate)
+        backbone = self._instantiate_backbone(
+            hidden_dropout=hidden_dropout,
+            attention_dropout=attention_dropout,
+            drop_path_rate=drop_path_rate,
+        )
         device = torch.device("cpu")
 
         predictor = CrossAttentionPredictor(backbone, 2, None, device)
