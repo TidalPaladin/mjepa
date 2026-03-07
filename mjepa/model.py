@@ -63,15 +63,18 @@ class MJEPA(nn.Module):
         config: JEPAConfig,
         backbone: ViT,
         predictor: CrossAttentionPredictor,
-        dtype: torch.dtype = torch.bfloat16,
+        autocast_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.config = config
         self.student = backbone
-        self.teacher = setup_teacher(backbone)
+        teacher_dtype = config.teacher_dtype
+        self.teacher = setup_teacher(backbone, dtype=teacher_dtype)
         self.predictor = predictor
-        self.gram_teacher = setup_teacher(backbone) if config.gram_start_epoch is not None else None
-        self.dtype = dtype
+        self.gram_teacher = (
+            setup_teacher(backbone, dtype=teacher_dtype) if config.gram_start_epoch is not None else None
+        )
+        self.autocast_dtype = autocast_dtype
         self._gram_cooldown_end_epoch: int | None = None
 
     @property
@@ -80,14 +83,14 @@ class MJEPA(nn.Module):
 
     def forward_teacher(self, x: Tensor) -> ViTFeatures:
         self.teacher.eval()
-        with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
+        with torch.autocast(device_type=x.device.type, dtype=self.autocast_dtype), torch.inference_mode():
             output = self.teacher(x)
         return ViTFeatures(
             output.dense_features.clone(), output.num_register_tokens, output.num_cls_tokens, output.tokenized_size
         )
 
     def forward_student(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> ViTFeatures:
-        with torch.autocast(device_type=x.device.type, dtype=self.dtype):
+        with torch.autocast(device_type=x.device.type, dtype=self.autocast_dtype):
             return self.student(x, mask=context_mask, rope_seed=rope_seed)
 
     def forward_predictor(
@@ -98,7 +101,7 @@ class MJEPA(nn.Module):
         target_mask: Tensor,
         rope_seed: int | None = None,
     ) -> Tensor:
-        with torch.autocast(device_type=context.device.type, dtype=self.dtype):
+        with torch.autocast(device_type=context.device.type, dtype=self.autocast_dtype):
             return self.predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
 
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
@@ -109,7 +112,7 @@ class MJEPA(nn.Module):
             raise ValueError("Gram teacher is not initialized")
 
         self.gram_teacher.eval()
-        with torch.autocast(device_type=x.device.type, dtype=self.dtype), torch.inference_mode():
+        with torch.autocast(device_type=x.device.type, dtype=self.autocast_dtype), torch.inference_mode():
             gram_teacher_output = forward_gram_teacher(
                 self.gram_teacher,
                 x,
@@ -213,7 +216,7 @@ class MJEPA(nn.Module):
             else None
         )
 
-        with torch.autocast(device_type=pred.device.type, dtype=self.dtype):
+        with torch.autocast(device_type=pred.device.type, dtype=self.autocast_dtype):
             probes = self.forward_probe(teacher_output)
 
         return MJEPAPredictions(
