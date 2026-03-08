@@ -23,7 +23,7 @@ _DTYPE_MAP = {
     "float64": torch.float64,
 }
 PREDICTOR_PROJ_INIT_STD = 0.02
-_AUTOCAST_CPU_DTYPES = {torch.bfloat16, torch.float16}
+_AUTOCAST_DTYPES = {torch.bfloat16, torch.float16}
 
 
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
@@ -51,7 +51,7 @@ def _sync_module_config_dtype(model: nn.Module, dtype: torch.dtype) -> None:
 
 
 def autocast_context(device_type: str, dtype: torch.dtype):
-    enabled = device_type != "cpu" or dtype in _AUTOCAST_CPU_DTYPES
+    enabled = dtype in _AUTOCAST_DTYPES
     return torch.autocast(device_type=device_type, dtype=dtype, enabled=enabled)
 
 
