@@ -1394,8 +1394,8 @@ wheels = [
 
 [[package]]
 name = "vit"
-version = "0.1.1.dev16+g24a5a48f6"
-source = { git = "https://github.com/TidalPaladin/vit.git#24a5a48f684f0d8f4303742bce323344e717c565" }
+version = "0.1.1.dev35+g2fda29ea7"
+source = { git = "https://github.com/TidalPaladin/vit.git#2fda29ea73f41f1e6b04106d3077671c74baf4e8" }
 dependencies = [
     { name = "numpy" },
     { name = "pyyaml" },

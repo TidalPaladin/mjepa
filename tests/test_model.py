@@ -6,6 +6,55 @@ from mjepa.jepa import CrossAttentionPredictor, JEPAConfig
 from mjepa.model import MJEPA, MJEPALosses, MJEPAPredictions
 
 
+TEST_BATCH_SIZE = 2
+TEST_HIDDEN_SIZE = 64
+TEST_PATCH_SIZE = [4, 4]
+TEST_IMG_SIZE = [32, 32]
+TEST_NUM_VISUAL_TOKENS = 64
+TEST_NUM_ATTENTION_HEADS = 4
+TEST_FFN_HIDDEN_SIZE = 128
+TEST_NUM_REGISTER_TOKENS = 2
+TEST_NUM_CLS_TOKENS = 2
+TEST_PREDICTOR_DEPTH = 2
+TEST_TARGET_TOKENS = 16
+
+
+def _make_test_vit_config(
+    *, num_cls_tokens: int = TEST_NUM_CLS_TOKENS, dtype: torch.dtype = torch.float32
+) -> ViTConfig:
+    return ViTConfig(
+        in_channels=3,
+        hidden_size=TEST_HIDDEN_SIZE,
+        patch_size=TEST_PATCH_SIZE,
+        img_size=TEST_IMG_SIZE,
+        depth=TEST_PREDICTOR_DEPTH,
+        num_attention_heads=TEST_NUM_ATTENTION_HEADS,
+        ffn_hidden_size=TEST_FFN_HIDDEN_SIZE,
+        activation="gelu",
+        num_register_tokens=TEST_NUM_REGISTER_TOKENS,
+        num_cls_tokens=num_cls_tokens,
+        pos_enc="rope",
+        rope_base=100,
+        dtype=dtype,
+    )
+
+
+def _make_test_model(*, num_cls_tokens: int, sigreg_loss_weight: float) -> MJEPA:
+    config = JEPAConfig(sigreg_loss_weight=sigreg_loss_weight, gram_start_epoch=None)
+    backbone = _make_test_vit_config(num_cls_tokens=num_cls_tokens).instantiate()
+    predictor = CrossAttentionPredictor(backbone, depth=TEST_PREDICTOR_DEPTH)
+    return MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
+
+
+def _make_test_features(*, num_cls_tokens: int) -> ViTFeatures:
+    dense_features = torch.randn(
+        TEST_BATCH_SIZE,
+        TEST_NUM_VISUAL_TOKENS + TEST_NUM_REGISTER_TOKENS + num_cls_tokens,
+        TEST_HIDDEN_SIZE,
+    )
+    return ViTFeatures(dense_features, TEST_NUM_REGISTER_TOKENS, num_cls_tokens)
+
+
 @pytest.fixture
 def jepa_config():
     """Create a JEPA configuration for testing."""
@@ -45,21 +94,7 @@ def jepa_config_no_gram():
 @pytest.fixture
 def small_vit_config():
     """Create a small ViT configuration for testing."""
-    return ViTConfig(
-        in_channels=3,
-        hidden_size=64,
-        patch_size=[4, 4],
-        img_size=[32, 32],
-        depth=2,
-        num_attention_heads=4,
-        ffn_hidden_size=128,
-        activation="gelu",
-        num_register_tokens=2,
-        num_cls_tokens=2,
-        pos_enc="rope",
-        rope_base=100,
-        dtype=torch.float32,
-    )
+    return _make_test_vit_config()
 
 
 @pytest.fixture
@@ -89,21 +124,13 @@ def mjepa_model_no_gram(jepa_config_no_gram, small_vit, predictor):
 @pytest.fixture
 def dummy_batch():
     """Create a dummy batch of images."""
-    return torch.randn(2, 3, 32, 32)
+    return torch.randn(TEST_BATCH_SIZE, 3, *TEST_IMG_SIZE)
 
 
 @pytest.fixture
 def dummy_vit_features():
     """Create dummy ViT features for testing."""
-    batch_size = 2
-    num_tokens = 64
-    hidden_size = 64
-    num_cls_tokens = 2
-    num_register_tokens = 2
-
-    # dense_features includes cls, register, and visual tokens
-    dense_features = torch.randn(batch_size, num_tokens + num_cls_tokens + num_register_tokens, hidden_size)
-    return ViTFeatures(dense_features, num_register_tokens, num_cls_tokens)
+    return _make_test_features(num_cls_tokens=TEST_NUM_CLS_TOKENS)
 
 
 class TestMJEPALosses:
@@ -737,6 +764,33 @@ class TestMJEPAComputeLosses:
         assert isinstance(losses.sigreg_loss, torch.Tensor)
         assert losses.sigreg_loss.item() > 0
 
+    def test_compute_losses_skips_sigreg_when_no_cls_tokens(self):
+        """Test zero-CLS backbones skip SigREG instead of producing NaNs."""
+        model = _make_test_model(num_cls_tokens=0, sigreg_loss_weight=1e-4)
+        student_output = _make_test_features(num_cls_tokens=0)
+        teacher_output = ViTFeatures(student_output.dense_features.clone(), TEST_NUM_REGISTER_TOKENS, 0)
+
+        target_mask = torch.zeros(TEST_BATCH_SIZE, TEST_NUM_VISUAL_TOKENS, dtype=torch.bool)
+        target_mask[:, :TEST_TARGET_TOKENS] = True
+        pred = torch.randn(TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE)
+
+        predictions = MJEPAPredictions(
+            pred=pred,
+            pred_with_cls=None,
+            student_output=student_output,
+            teacher_output=teacher_output,
+            target_mask=target_mask,
+            context_mask=target_mask,
+        )
+        losses = model.compute_losses(
+            output=predictions,
+            step=0,
+            epoch=0,
+        )
+
+        assert losses.sigreg_loss == 0.0
+        assert torch.isfinite(losses.reduce())
+
     def test_compute_losses_with_gram(self, mjepa_model: MJEPA):
         """Test loss computation with Gram loss."""
         pred = torch.randn(2, 16, 64)
@@ -912,6 +966,27 @@ class TestMJEPAForward:
             predictions_after = mjepa_model(dummy_batch, jepa_scale=2, epoch=20)
         assert predictions_after.gram_teacher_output is not None
         assert isinstance(predictions_after.gram_teacher_output, torch.Tensor)
+
+    def test_forward_without_cls_tokens_skips_cls_predictor(self, dummy_batch):
+        """Test zero-CLS backbones skip the CLS-conditioned predictor pass."""
+        model = _make_test_model(num_cls_tokens=0, sigreg_loss_weight=0.0)
+        model.eval()
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        assert predictions.pred_with_cls is None
+        assert predictions.pred.shape[0] == dummy_batch.shape[0]
+        assert predictions.student_output.num_cls_tokens == 0
+
+    def test_get_probe_tokens_falls_back_to_visual_tokens_without_cls(
+        self, mjepa_model_no_gram: MJEPA, dummy_vit_features: ViTFeatures
+    ):
+        """Test probes use visual tokens when CLS tokens are unavailable."""
+        no_cls_features = _make_test_features(num_cls_tokens=0)
+
+        assert torch.equal(mjepa_model_no_gram._get_probe_tokens(dummy_vit_features), dummy_vit_features.cls_tokens)
+        assert torch.equal(mjepa_model_no_gram._get_probe_tokens(no_cls_features), no_cls_features.visual_tokens)
 
     def test_forward_disables_gram_during_resolution_cooldown(self, mjepa_model, dummy_batch):
         """Test that gram teacher forward is skipped during cooldown and resumes at cooldown end."""

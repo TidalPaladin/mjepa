@@ -11,6 +11,7 @@ from mjepa.jepa import (
     PREDICTOR_PROJ_INIT_STD,
     CrossAttentionPredictor,
     JEPAConfig,
+    autocast_context,
     compute_gram_loss,
     compute_sigreg_loss,
     config_constructor,
@@ -298,6 +299,32 @@ class TestComputeSigREGLoss:
         assert isotropic_loss < non_isotropic_loss
         assert not torch.isnan(isotropic_loss)
         assert not torch.isnan(non_isotropic_loss)
+
+    def test_compute_sigreg_loss_rejects_empty_token_axis(self):
+        """Test empty token sequences raise a clear error instead of returning NaN."""
+        empty_tokens = torch.randn(2, 0, 128)
+
+        with pytest.raises(ValueError, match="at least one token"):
+            compute_sigreg_loss(empty_tokens, global_step=0, num_slices=256)
+
+
+class TestAutocastContext:
+    @pytest.mark.parametrize(
+        ("dtype", "enabled"),
+        [
+            (torch.float32, False),
+            (torch.bfloat16, True),
+            (torch.float16, True),
+        ],
+    )
+    def test_autocast_context_uses_only_amp_safe_dtypes(self, mocker, dtype, enabled):
+        sentinel = mocker.sentinel.autocast_context
+        autocast = mocker.patch("mjepa.jepa.torch.autocast", return_value=sentinel)
+
+        result = autocast_context("cuda", dtype)
+
+        assert result is sentinel
+        autocast.assert_called_once_with(device_type="cuda", dtype=dtype, enabled=enabled)
 
 
 class TestCrossAttentionPredictor:

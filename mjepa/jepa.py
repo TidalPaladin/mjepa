@@ -23,6 +23,7 @@ _DTYPE_MAP = {
     "float64": torch.float64,
 }
 PREDICTOR_PROJ_INIT_STD = 0.02
+_AUTOCAST_DTYPES = {torch.bfloat16, torch.float16}
 
 
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
@@ -47,6 +48,11 @@ def _sync_module_config_dtype(model: nn.Module, dtype: torch.dtype) -> None:
         return
 
     setattr(config, "dtype", dtype)
+
+
+def autocast_context(device_type: str, dtype: torch.dtype):
+    enabled = dtype in _AUTOCAST_DTYPES
+    return torch.autocast(device_type=device_type, dtype=dtype, enabled=enabled)
 
 
 class CrossAttentionPredictor(nn.Module):
@@ -83,7 +89,7 @@ class CrossAttentionPredictor(nn.Module):
         self.rope = backbone.rope
 
         # Predictor blocks and output projection
-        self.blocks = nn.ModuleList([backbone.create_cross_attention_layer(device=device) for _ in range(depth)])
+        self.blocks = nn.ModuleList([self._create_block(backbone, device) for _ in range(depth)])
         if disable_predictor_regularizers:
             self._disable_predictor_regularizers()
 
@@ -93,6 +99,14 @@ class CrossAttentionPredictor(nn.Module):
             **factory_kwargs,
         )
         self._reset_predictor_proj_parameters()
+
+    @property
+    def predictor_dtype(self) -> torch.dtype:
+        return self.predictor_proj.weight.dtype
+
+    @staticmethod
+    def _create_block(backbone: ViT, device: torch.device | None) -> nn.Module:
+        return backbone.create_cross_attention_layer(device=device, dtype=backbone.config.dtype)
 
     def _reset_predictor_proj_parameters(self) -> None:
         # Teacher targets are RMS-normalized and the predictor query starts at small positional scales,
@@ -119,19 +133,21 @@ class CrossAttentionPredictor(nn.Module):
         target_mask: Tensor,
         rope_seed: int | None = None,
     ) -> Tensor:
-        # Create positional encodings
-        B, _ = target_mask.shape
-        pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
+        with autocast_context(context.device.type, self.predictor_dtype):
+            # Create positional encodings
+            B, _ = target_mask.shape
+            pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
 
-        # Prepare inputs
-        query = pos_target
-        rope_q, rope_k = self.prepare_rope(tokenized_size, context_mask, target_mask, rope_seed=rope_seed)
+            # Prepare inputs
+            query = pos_target.to(dtype=self.predictor_dtype)
+            context = context.to(dtype=self.predictor_dtype)
+            rope_q, rope_k = self.prepare_rope(tokenized_size, context_mask, target_mask, rope_seed=rope_seed)
 
-        # Run query and context through predictor
-        for block in self.blocks:
-            query = block(query, context, rope_q=rope_q, rope_k=rope_k)
+            # Run query and context through predictor
+            for block in self.blocks:
+                query = block(query, context, rope_q=rope_q, rope_k=rope_k)
 
-        return self.predictor_proj(query).float()
+            return self.predictor_proj(query).float()
 
     if TYPE_CHECKING:
 
@@ -356,7 +372,7 @@ def forward_gram_teacher(
 
 
 @torch.compile
-def compute_sigreg_loss(x: Tensor, global_step: int, num_slices: int = 256) -> Tensor:
+def _compute_sigreg_loss_impl(x: Tensor, global_step: int, num_slices: int = 256) -> Tensor:
     r"""Compute the LeJEPA SigREG loss.
 
     This loss encourages features to follow an isotropic Gaussian distribution.
@@ -401,6 +417,26 @@ def compute_sigreg_loss(x: Tensor, global_step: int, num_slices: int = 256) -> T
     T = torch.trapz(err, t, dim=-1) * N
     assert T.shape == (B, num_slices)
     return T.mean()
+
+
+def compute_sigreg_loss(x: Tensor, global_step: int, num_slices: int = 256) -> Tensor:
+    r"""Compute the LeJEPA SigREG loss.
+
+    Args:
+        x: Input tensor with a non-empty token dimension.
+        global_step: Global step.
+        num_slices: Number of slices to use for the projection.
+
+    Shapes:
+        x: :math:`(*, L, D)` with :math:`L > 0`
+        Output: Scalar
+
+    Returns:
+        The SigREG loss.
+    """
+    if x.shape[-2] <= 0:
+        raise ValueError("x must contain at least one token")
+    return _compute_sigreg_loss_impl(x, global_step, num_slices)
 
 
 @dataclass
