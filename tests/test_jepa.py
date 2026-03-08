@@ -299,6 +299,13 @@ class TestComputeSigREGLoss:
         assert not torch.isnan(isotropic_loss)
         assert not torch.isnan(non_isotropic_loss)
 
+    def test_compute_sigreg_loss_rejects_empty_token_axis(self):
+        """Test empty token sequences raise a clear error instead of returning NaN."""
+        empty_tokens = torch.randn(2, 0, 128)
+
+        with pytest.raises(ValueError, match="at least one token"):
+            compute_sigreg_loss(empty_tokens, global_step=0, num_slices=256)
+
 
 class TestCrossAttentionPredictor:
     """Test CrossAttentionPredictor initialization and device/dtype handling."""

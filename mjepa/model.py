@@ -11,6 +11,7 @@ from vit.tokens import apply_mask
 from .jepa import (
     CrossAttentionPredictor,
     JEPAConfig,
+    autocast_context,
     compute_gram_loss,
     compute_sigreg_loss,
     forward_gram_teacher,
@@ -83,14 +84,14 @@ class MJEPA(nn.Module):
 
     def forward_teacher(self, x: Tensor) -> ViTFeatures:
         self.teacher.eval()
-        with torch.autocast(device_type=x.device.type, dtype=self.autocast_dtype), torch.inference_mode():
+        with autocast_context(x.device.type, self.autocast_dtype), torch.inference_mode():
             output = self.teacher(x)
         return ViTFeatures(
             output.dense_features.clone(), output.num_register_tokens, output.num_cls_tokens, output.tokenized_size
         )
 
     def forward_student(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> ViTFeatures:
-        with torch.autocast(device_type=x.device.type, dtype=self.autocast_dtype):
+        with autocast_context(x.device.type, self.autocast_dtype):
             return self.student(x, mask=context_mask, rope_seed=rope_seed)
 
     def forward_predictor(
@@ -101,10 +102,19 @@ class MJEPA(nn.Module):
         target_mask: Tensor,
         rope_seed: int | None = None,
     ) -> Tensor:
-        with torch.autocast(device_type=context.device.type, dtype=self.autocast_dtype):
+        with autocast_context(context.device.type, self.autocast_dtype):
             return self.predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
 
+    @staticmethod
+    def _has_cls_tokens(features: ViTFeatures) -> bool:
+        return features.num_cls_tokens > 0
+
+    @classmethod
+    def _get_probe_tokens(cls, features: ViTFeatures) -> Tensor:
+        return features.cls_tokens if cls._has_cls_tokens(features) else features.visual_tokens
+
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
+        """Override in subclasses; use ``_get_probe_tokens`` for zero-CLS-safe inputs."""
         return dict()
 
     def forward_gram_teacher(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> Tensor:
@@ -112,7 +122,7 @@ class MJEPA(nn.Module):
             raise ValueError("Gram teacher is not initialized")
 
         self.gram_teacher.eval()
-        with torch.autocast(device_type=x.device.type, dtype=self.autocast_dtype), torch.inference_mode():
+        with autocast_context(x.device.type, self.autocast_dtype), torch.inference_mode():
             gram_teacher_output = forward_gram_teacher(
                 self.gram_teacher,
                 x,
@@ -158,24 +168,22 @@ class MJEPA(nn.Module):
             update_teacher(self.teacher, self.gram_teacher)
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
-        # Compute JEPA loss
+        student_output = output.student_output
         target = apply_mask(output.target_mask, output.teacher_output.visual_tokens, fill_value=None).float()
         jepa_loss = F.mse_loss(output.pred.float(), target)
         jepa_loss_cls = F.mse_loss(output.pred_with_cls.float(), target) if output.pred_with_cls is not None else 0.0
 
-        # Compute SigREG loss
         sigreg_loss = (
-            compute_sigreg_loss(output.student_output.cls_tokens.transpose(0, 1).float(), step, num_slices=256)
-            if self.config.sigreg_loss_weight > 0
+            compute_sigreg_loss(student_output.cls_tokens.transpose(0, 1).float(), step, num_slices=256)
+            if self.config.sigreg_loss_weight > 0 and self._has_cls_tokens(student_output)
             else 0.0
         )
 
-        # Compute Gram loss (if necessary)
         if self._is_gram_enabled_for_epoch(epoch):
             assert output.gram_teacher_output is not None
             assert self.config.gram_loss_weight > 0
             gram_loss = compute_gram_loss(
-                output.student_output.visual_tokens.float(),
+                student_output.visual_tokens.float(),
                 output.gram_teacher_output.float(),
                 remove_neg=self.config.gram_remove_neg,
             )
@@ -207,16 +215,17 @@ class MJEPA(nn.Module):
         Ht, Wt = cast(tuple[int, int], self.student.stem.tokenized_size(x.shape[-2:]))
 
         student_output = self.forward_student(x, context_mask, rope_seed=rope_seed)
+        student_has_cls_tokens = self._has_cls_tokens(student_output)
         pred = self.forward_predictor(
             (Ht, Wt), student_output.visual_tokens, context_mask, target_mask, rope_seed=rope_seed
         )
         pred_with_cls = (
             self.forward_predictor((Ht, Wt), student_output.cls_tokens, None, target_mask, rope_seed=rope_seed)
-            if student_output.cls_tokens.numel()
+            if student_has_cls_tokens
             else None
         )
 
-        with torch.autocast(device_type=pred.device.type, dtype=self.autocast_dtype):
+        with autocast_context(pred.device.type, self.autocast_dtype):
             probes = self.forward_probe(teacher_output)
 
         return MJEPAPredictions(
