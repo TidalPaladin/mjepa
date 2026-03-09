@@ -336,6 +336,29 @@ class TestOptimizerConfigInstantiate:
         assert clipped_norm.item() == pytest.approx(grad_norm_before)
         assert grad_norm_after <= max_grad_norm + 1e-6
 
+    def test_clip_grad_norm_does_not_modify_parameter_values(self, simple_model):
+        """Test clipping gradients does not mutate parameter data before optimizer.step()."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            scheduled=False,
+            fused=False,
+            max_grad_norm=0.1,
+        )
+        optimizer, _ = config.instantiate(simple_model, total_steps=100)
+
+        _backward_sum(simple_model, batch_size=16, loss_scale=1000)
+        parameters = _trainable_parameters(simple_model)
+        parameter_values_before = [parameter.detach().clone() for parameter in parameters]
+
+        config.clip_grad_norm_(optimizer)
+
+        parameter_values_after = [parameter.detach() for parameter in parameters]
+        assert all(
+            torch.allclose(before, after) for before, after in zip(parameter_values_before, parameter_values_after)
+        )
+
     def test_clip_grad_norm_clips_composite_optimizer_globally(self, simple_model):
         """Test composite optimizers are clipped once across all parameter groups."""
         max_grad_norm = 0.1
@@ -351,6 +374,36 @@ class TestOptimizerConfigInstantiate:
             betas=(0.9, 0.999),
             max_grad_norm=max_grad_norm,
         )
+
+        _backward_sum(simple_model, batch_size=16, loss_scale=1000)
+        parameters = _trainable_parameters(simple_model)
+        grad_norm_before = _total_grad_norm(parameters)
+
+        clipped_norm = config.clip_grad_norm_(optimizer)
+
+        grad_norm_after = _total_grad_norm(parameters)
+        assert clipped_norm is not None
+        assert clipped_norm.item() == pytest.approx(grad_norm_before)
+        assert grad_norm_after <= max_grad_norm + 1e-6
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_clip_grad_norm_clips_hybrid_muon_globally(self, simple_model):
+        """Test clip_grad_norm_ clips both Muon and AdamW hybrid branches with one global norm."""
+        max_grad_norm = 0.1
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=False,
+            fused=False,
+            max_grad_norm=max_grad_norm,
+        )
+        optimizer, _ = config.instantiate(simple_model, total_steps=100)
+
+        assert isinstance(optimizer, CompositeOptimizer)
+        assert MUON_COMPONENT_NAME in optimizer.optimizers
+        assert ADAMW_COMPONENT_NAME in optimizer.optimizers
 
         _backward_sum(simple_model, batch_size=16, loss_scale=1000)
         parameters = _trainable_parameters(simple_model)
