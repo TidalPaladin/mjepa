@@ -191,15 +191,20 @@ def _collect_group_parameter_names(
 
 
 def _collect_unique_parameters(parameter_groups: Sequence[Mapping[str, Any]]) -> list[nn.Parameter]:
+    return _collect_unique_parameters_in_order(
+        parameter for group in parameter_groups for parameter in cast(Sequence[nn.Parameter], group["params"])
+    )
+
+
+def _collect_unique_parameters_in_order(parameters: Iterator[nn.Parameter]) -> list[nn.Parameter]:
     seen_parameter_ids: set[int] = set()
     unique_parameters: list[nn.Parameter] = []
-    for group in parameter_groups:
-        for parameter in cast(Sequence[nn.Parameter], group["params"]):
-            parameter_id = id(parameter)
-            if parameter_id in seen_parameter_ids:
-                continue
-            seen_parameter_ids.add(parameter_id)
-            unique_parameters.append(parameter)
+    for parameter in parameters:
+        parameter_id = id(parameter)
+        if parameter_id in seen_parameter_ids:
+            continue
+        seen_parameter_ids.add(parameter_id)
+        unique_parameters.append(parameter)
     return unique_parameters
 
 
@@ -417,23 +422,28 @@ def _assign_parameter_groups(
     skip_weight_decay_on_1d: bool = False,
 ) -> list[dict[str, Any]]:
     assigned_groups: list[dict[str, Any]] = []
-    assigned_params: set[nn.Parameter] = set()
+    assigned_params: set[int] = set()
     for config in parameter_groups:
         keys = config["params"]
-        params = set(p for p in _match_parameters(model, keys) if p.requires_grad)
-        params = params.difference(assigned_params)
+        # Preserve model traversal order here. Parameter ordering must stay deterministic
+        # across processes so optimizer groups, schedulers, and global grad clipping all
+        # observe the same parameter sequence under DDP.
+        params = _collect_unique_parameters_in_order(
+            param
+            for param in _match_parameters(model, keys)
+            if param.requires_grad and id(param) not in assigned_params
+        )
         if params:
-            assert params.isdisjoint(assigned_params)
             kwargs = {k: v for k, v in config.items() if k != "params"}
-            assigned_groups.append({"params": list(params), **kwargs})
-        assigned_params.update(params)
+            assigned_groups.append({"params": params, **kwargs})
+        assigned_params.update(id(param) for param in params)
 
-    remaining_trainable_params = [p for p in model.parameters() if p.requires_grad and p not in assigned_params]
+    remaining_trainable_params = [p for p in model.parameters() if p.requires_grad and id(p) not in assigned_params]
     if skip_weight_decay_on_1d:
         no_decay_1d_params = [p for p in remaining_trainable_params if p.ndim == 1]
         if no_decay_1d_params:
             assigned_groups.append({"params": no_decay_1d_params, "weight_decay": 0.0})
-            assigned_params.update(no_decay_1d_params)
+            assigned_params.update(id(param) for param in no_decay_1d_params)
             remaining_trainable_params = [p for p in remaining_trainable_params if p.ndim != 1]
 
     # Default param group

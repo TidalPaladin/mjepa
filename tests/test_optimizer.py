@@ -18,6 +18,7 @@ from mjepa.optimizer import (
     CompositeScheduler,
     OptimizerConfig,
     _assign_parameter_groups,
+    _collect_unique_parameters_in_order,
     _match_parameters,
     config_constructor,
     register_constructors,
@@ -876,6 +877,35 @@ class TestAssignParameterGroups:
         # Should have bias group + weight group + default group
         # Note: default group may be empty if all params are assigned
         assert len(groups) >= 2
+
+    def test_explicit_parameter_groups_preserve_model_parameter_order(self, simple_model):
+        """Test explicit group assignment preserves model traversal order."""
+        groups = _assign_parameter_groups(
+            simple_model,
+            [{"params": ("bias",), "weight_decay": 0.0}],
+        )
+
+        expected_bias_params = [param for name, param in simple_model.named_parameters() if "bias" in name]
+
+        assert groups[0]["params"] == expected_bias_params
+
+    def test_collect_unique_parameters_in_order_preserves_first_seen_order(self, simple_model):
+        """Test ordered dedupe keeps the first-seen parameter sequence stable."""
+        parameters = [
+            simple_model[2].weight,
+            simple_model[0].bias,
+            simple_model[2].weight,
+            simple_model[0].weight,
+            simple_model[0].bias,
+        ]
+
+        unique_parameters = _collect_unique_parameters_in_order(iter(parameters))
+
+        assert unique_parameters == [
+            simple_model[2].weight,
+            simple_model[0].bias,
+            simple_model[0].weight,
+        ]
 
     def test_non_overlapping_assignment(self, simple_model):
         """Test that parameters are not assigned to multiple groups."""
