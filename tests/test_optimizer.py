@@ -24,6 +24,37 @@ from mjepa.optimizer import (
 )
 
 
+TEST_INPUT_DIM = 10
+
+
+def _build_simple_model() -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(TEST_INPUT_DIM, 20),
+        nn.ReLU(),
+        nn.Linear(20, TEST_INPUT_DIM),
+    )
+
+
+def _backward_sum(module: nn.Module, *, batch_size: int, loss_scale: float = 1.0) -> None:
+    loss = module(torch.randn(batch_size, TEST_INPUT_DIM))
+    (loss * loss_scale).sum().backward()
+
+
+def _grads(module: nn.Module) -> list[torch.Tensor]:
+    return [parameter.grad.detach() for parameter in module.parameters() if parameter.grad is not None]
+
+
+def _trainable_parameters(module: nn.Module) -> list[nn.Parameter]:
+    return [parameter for parameter in module.parameters() if parameter.requires_grad]
+
+
+def _total_grad_norm(parameters: list[nn.Parameter]) -> float:
+    gradients = [parameter.grad.detach() for parameter in parameters if parameter.grad is not None]
+    if not gradients:
+        return 0.0
+    return torch.linalg.vector_norm(torch.stack([gradient.norm() for gradient in gradients])).item()
+
+
 class TestOptimizerConfigInit:
     """Test OptimizerConfig initialization and field defaults."""
 
@@ -49,6 +80,7 @@ class TestOptimizerConfigInit:
         assert config.muon_ns_steps == 5
         assert config.muon_adjust_lr_fn is None
         assert config.log_hybrid_adamw_parameters is False
+        assert config.max_grad_norm is None
         assert config.scheduled is False
         assert config.pct_start == 0.05
         assert config.base_momentum == 0.85
@@ -76,6 +108,7 @@ class TestOptimizerConfigInit:
             muon_ns_steps=3,
             muon_adjust_lr_fn="match_rms_adamw",
             log_hybrid_adamw_parameters=True,
+            max_grad_norm=1.5,
             scheduled=True,
             pct_start=0.1,
             base_momentum=0.8,
@@ -100,6 +133,7 @@ class TestOptimizerConfigInit:
         assert config.muon_ns_steps == 3
         assert config.muon_adjust_lr_fn == "match_rms_adamw"
         assert config.log_hybrid_adamw_parameters is True
+        assert config.max_grad_norm == 1.5
         assert config.scheduled is True
         assert config.pct_start == 0.1
         assert config.base_momentum == 0.8
@@ -119,6 +153,17 @@ class TestOptimizerConfigInit:
         with pytest.raises(AttributeError):
             config.lr = 1e-4  # type: ignore
 
+    @pytest.mark.parametrize("max_grad_norm", [0.0, -1.0])
+    def test_invalid_max_grad_norm(self, max_grad_norm):
+        """Test non-positive max_grad_norm values fail fast."""
+        with pytest.raises(ValueError, match="max_grad_norm"):
+            OptimizerConfig(
+                lr=1e-3,
+                weight_decay=0.01,
+                betas=(0.9, 0.999),
+                max_grad_norm=max_grad_norm,
+            )
+
 
 class TestOptimizerConfigInstantiate:
     """Test OptimizerConfig.instantiate() method."""
@@ -126,11 +171,7 @@ class TestOptimizerConfigInstantiate:
     @pytest.fixture
     def simple_model(self):
         """Create a simple model for testing."""
-        return nn.Sequential(
-            nn.Linear(10, 20),
-            nn.ReLU(),
-            nn.Linear(20, 10),
-        )
+        return _build_simple_model()
 
     @pytest.fixture
     def model_with_head(self):
@@ -249,6 +290,78 @@ class TestOptimizerConfigInstantiate:
 
         assert isinstance(scheduler, OneCycleLR)
         assert scheduler.total_steps == 1000
+
+    def test_clip_grad_norm_returns_none_when_disabled(self, simple_model):
+        """Test clip_grad_norm_ is a no-op when clipping is disabled."""
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            scheduled=False,
+            fused=False,
+        )
+        optimizer, _ = config.instantiate(simple_model, total_steps=100)
+
+        _backward_sum(simple_model, batch_size=8)
+        gradients_before = [gradient.clone() for gradient in _grads(simple_model)]
+
+        clipped_norm = config.clip_grad_norm_(optimizer)
+
+        gradients_after = _grads(simple_model)
+        assert clipped_norm is None
+        assert len(gradients_before) == len(gradients_after)
+        assert all(torch.allclose(before, after) for before, after in zip(gradients_before, gradients_after))
+
+    def test_clip_grad_norm_clips_adamw_optimizer(self, simple_model):
+        """Test clip_grad_norm_ enforces max_grad_norm on AdamW optimizers."""
+        max_grad_norm = 0.1
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            scheduled=False,
+            fused=False,
+            max_grad_norm=max_grad_norm,
+        )
+        optimizer, _ = config.instantiate(simple_model, total_steps=100)
+
+        _backward_sum(simple_model, batch_size=16, loss_scale=1000)
+        parameters = _trainable_parameters(simple_model)
+        grad_norm_before = _total_grad_norm(parameters)
+
+        clipped_norm = config.clip_grad_norm_(optimizer)
+
+        grad_norm_after = _total_grad_norm(parameters)
+        assert clipped_norm is not None
+        assert clipped_norm.item() == pytest.approx(grad_norm_before)
+        assert grad_norm_after <= max_grad_norm + 1e-6
+
+    def test_clip_grad_norm_clips_composite_optimizer_globally(self, simple_model):
+        """Test composite optimizers are clipped once across all parameter groups."""
+        max_grad_norm = 0.1
+        optimizer = CompositeOptimizer(
+            {
+                "backbone": AdamW(simple_model[0].parameters(), lr=1e-3, fused=False),
+                "head": AdamW(simple_model[2].parameters(), lr=1e-3, fused=False),
+            }
+        )
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            max_grad_norm=max_grad_norm,
+        )
+
+        _backward_sum(simple_model, batch_size=16, loss_scale=1000)
+        parameters = _trainable_parameters(simple_model)
+        grad_norm_before = _total_grad_norm(parameters)
+
+        clipped_norm = config.clip_grad_norm_(optimizer)
+
+        grad_norm_after = _total_grad_norm(parameters)
+        assert clipped_norm is not None
+        assert clipped_norm.item() == pytest.approx(grad_norm_before)
+        assert grad_norm_after <= max_grad_norm + 1e-6
 
     @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
     def test_instantiate_hybrid_muon(self, simple_model):
@@ -506,6 +619,7 @@ betas:
   - 0.9
   - 0.999
 scheduled: false
+max_grad_norm: 1.25
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_content)
@@ -517,6 +631,7 @@ scheduled: false
         # YAML loads lists, not tuples
         assert list(config.betas) == [0.9, 0.999]
         assert config.scheduled is False
+        assert config.max_grad_norm == 1.25
         assert config.skip_weight_decay_on_1d is False
 
     def test_from_yaml_with_parameter_groups(self):
@@ -528,6 +643,7 @@ betas:
   - 0.9
   - 0.999
 scheduled: true
+max_grad_norm: 0.75
 parameter_groups:
   - params:
       - bias
@@ -540,6 +656,7 @@ parameter_groups:
 
         assert config.lr == 0.001
         assert config.scheduled is True
+        assert config.max_grad_norm == 0.75
         assert len(config.parameter_groups) == 1
         assert config.parameter_groups[0]["weight_decay"] == 0.0
 
@@ -595,6 +712,7 @@ betas:
   - 0.85
   - 0.95
 scheduled: true
+max_grad_norm: 2.0
 """
         config = yaml.safe_load(yaml_str)
 
@@ -603,6 +721,7 @@ scheduled: true
         assert config.weight_decay == 0.05
         # YAML loads lists, not tuples
         assert list(config.betas) == [0.85, 0.95]
+        assert config.max_grad_norm == 2.0
         assert config.scheduled is True
 
 

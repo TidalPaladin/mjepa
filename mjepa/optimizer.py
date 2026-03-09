@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from os import PathLike
 from typing import Any, Literal, Protocol, cast
@@ -190,6 +190,19 @@ def _collect_group_parameter_names(
     return sorted(names)
 
 
+def _collect_unique_parameters(parameter_groups: Sequence[Mapping[str, Any]]) -> list[nn.Parameter]:
+    seen_parameter_ids: set[int] = set()
+    unique_parameters: list[nn.Parameter] = []
+    for group in parameter_groups:
+        for parameter in cast(Sequence[nn.Parameter], group["params"]):
+            parameter_id = id(parameter)
+            if parameter_id in seen_parameter_ids:
+                continue
+            seen_parameter_ids.add(parameter_id)
+            unique_parameters.append(parameter)
+    return unique_parameters
+
+
 def _get_group_optimizer_mode(group: Mapping[str, Any], index: int) -> str:
     optimizer_mode = cast(str, group.get("optimizer", AUTO_COMPONENT_NAME))
     if optimizer_mode not in PARAMETER_GROUP_OPTIMIZER_MODES:
@@ -239,6 +252,7 @@ class OptimizerConfig:
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] | None = None
     log_hybrid_adamw_parameters: bool = False
+    max_grad_norm: float | None = None
 
     # Scheduler
     scheduled: bool = False
@@ -251,6 +265,10 @@ class OptimizerConfig:
     # Parameter groups
     parameter_groups: list[dict[str, Any]] = field(default_factory=list)
     skip_weight_decay_on_1d: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_grad_norm is not None and self.max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be a positive float or None")
 
     def _instantiate_scheduler(self, optimizer: Optimizer, total_steps: int) -> LRScheduler:
         if self.scheduled:
@@ -357,6 +375,13 @@ class OptimizerConfig:
         if self.kind == HYBRID_MUON_OPTIMIZER_KIND:
             return self._instantiate_hybrid_muon(parameter_groups, total_steps, parameter_names_by_id)
         raise ValueError(f"Unsupported optimizer kind: {self.kind!r}")
+
+    def clip_grad_norm_(self, optimizer: OptimizerLike) -> torch.Tensor | None:
+        """Clip optimizer gradients by the configured global L2 norm."""
+        if self.max_grad_norm is None:
+            return None
+        parameters = _collect_unique_parameters(optimizer.param_groups)
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm=self.max_grad_norm)
 
     @classmethod
     def from_yaml(cls, path: PathLike) -> "OptimizerConfig":
