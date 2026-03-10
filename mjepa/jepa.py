@@ -1,7 +1,7 @@
 import math
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass, replace
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -24,6 +24,10 @@ _DTYPE_MAP = {
 }
 PREDICTOR_PROJ_INIT_STD = 0.02
 _AUTOCAST_DTYPES = {torch.bfloat16, torch.float16}
+MSE_JEPA_LOSS_KIND = "mse"
+COSINE_JEPA_LOSS_KIND = "cosine"
+JEPALossKind: TypeAlias = Literal["mse", "cosine"]
+JEPA_LOSS_KINDS: tuple[JEPALossKind, ...] = (MSE_JEPA_LOSS_KIND, COSINE_JEPA_LOSS_KIND)
 
 
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
@@ -315,6 +319,36 @@ def compute_gram_loss(student: Tensor, teacher: Tensor, normalize: bool = True, 
     return F.mse_loss(student_sim, teacher_sim)
 
 
+def compute_jepa_prediction_loss(
+    student: Tensor,
+    teacher: Tensor,
+    kind: JEPALossKind = MSE_JEPA_LOSS_KIND,
+) -> Tensor:
+    r"""Compute the JEPA reconstruction loss between student predictions and teacher targets.
+
+    Args:
+        student: Student predictions.
+        teacher: Teacher targets.
+        kind: Reconstruction loss kind to apply.
+
+    Shapes:
+        student: :math:`(*, L, D)`
+        teacher: :math:`(*, L, D)`
+        Output: Scalar
+
+    Returns:
+        The reconstruction loss.
+    """
+    student = student.float()
+    teacher = teacher.float()
+
+    if kind == MSE_JEPA_LOSS_KIND:
+        return F.mse_loss(student, teacher)
+    if kind == COSINE_JEPA_LOSS_KIND:
+        return (1.0 - F.cosine_similarity(student, teacher, dim=-1)).mean()
+    raise ValueError(f"Unsupported JEPA loss kind: {kind!r}")
+
+
 def is_gram_update_epoch(epoch: int, gram_start_epoch: int | None, gram_update_interval_epoch: int) -> bool:
     r"""Check if the current epoch is a Gram update epoch.
 
@@ -464,6 +498,7 @@ class JEPAConfig:
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
         gram_loss_weight: The coefficient of the Gram loss.
         sigreg_loss_weight: The coefficient of the SigREG loss.
+        jepa_loss_kind: Reconstruction loss kind applied to both JEPA prediction losses.
     """
 
     context_ratio: float = 0.5
@@ -481,6 +516,7 @@ class JEPAConfig:
     gram_remove_neg: bool = False
     gram_loss_weight: float = 1.0
     sigreg_loss_weight: float = 1e-4
+    jepa_loss_kind: JEPALossKind = MSE_JEPA_LOSS_KIND
 
     def __post_init__(self) -> None:
         self.teacher_dtype = _normalize_dtype(self.teacher_dtype, "teacher_dtype")
@@ -502,6 +538,8 @@ class JEPAConfig:
             raise ValueError("gram_loss_weight must be a positive float")
         if self.sigreg_loss_weight < 0:
             raise ValueError("sigreg_loss_weight must be a non-negative float")
+        if self.jepa_loss_kind not in JEPA_LOSS_KINDS:
+            raise ValueError(f"jepa_loss_kind must be one of {list(JEPA_LOSS_KINDS)}")
 
 
 def config_constructor(loader, node):
