@@ -8,11 +8,14 @@ import yaml
 from vit import ViTConfig
 
 from mjepa.jepa import (
+    COSINE_JEPA_LOSS_KIND,
+    MSE_JEPA_LOSS_KIND,
     PREDICTOR_PROJ_INIT_STD,
     CrossAttentionPredictor,
     JEPAConfig,
     autocast_context,
     compute_gram_loss,
+    compute_jepa_prediction_loss,
     compute_sigreg_loss,
     config_constructor,
     generate_masks,
@@ -132,6 +135,7 @@ class TestJEPAConfig:
         assert config.predictor_depth == 4
         assert config.disable_predictor_regularizers is False
         assert config.teacher_dtype is None
+        assert config.jepa_loss_kind == MSE_JEPA_LOSS_KIND
 
     def test_custom_config(self):
         """Test custom configuration."""
@@ -143,6 +147,7 @@ class TestJEPAConfig:
             predictor_depth=6,
             disable_predictor_regularizers=True,
             teacher_dtype=torch.bfloat16,
+            jepa_loss_kind=COSINE_JEPA_LOSS_KIND,
         )
         assert config.context_ratio == 0.6
         assert config.target_ratio == 0.3
@@ -151,6 +156,7 @@ class TestJEPAConfig:
         assert config.predictor_depth == 6
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
     def test_invalid_context_ratio(self):
         """Test invalid context ratio."""
@@ -185,6 +191,7 @@ class TestYAMLConfig:
             "predictor_depth": 8,
             "disable_predictor_regularizers": True,
             "teacher_dtype": "bfloat16",
+            "jepa_loss_kind": COSINE_JEPA_LOSS_KIND,
         }
         loader.construct_mapping.return_value = config_dict
 
@@ -200,6 +207,7 @@ class TestYAMLConfig:
         assert config.predictor_depth == 8
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
         # Verify the loader was called correctly
         loader.construct_mapping.assert_called_once_with(node, deep=True)
@@ -219,6 +227,7 @@ class TestYAMLConfig:
         predictor_depth: 5
         disable_predictor_regularizers: true
         teacher_dtype: bfloat16
+        jepa_loss_kind: cosine
         """
 
         # Load the YAML
@@ -233,11 +242,17 @@ class TestYAMLConfig:
         assert config.predictor_depth == 5
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
     def test_invalid_teacher_dtype_string(self):
         """Test invalid teacher dtype string."""
         with pytest.raises(ValueError, match="Unsupported dtype"):
             JEPAConfig(teacher_dtype="halfish")
+
+    def test_invalid_jepa_loss_kind(self):
+        """Test invalid JEPA reconstruction loss kind."""
+        with pytest.raises(ValueError, match="jepa_loss_kind must be one of"):
+            JEPAConfig(jepa_loss_kind=cast(Any, "l1"))
 
 
 class TestComputeSigREGLoss:
@@ -656,6 +671,37 @@ class TestComputeGramLoss:
 
             assert loss.shape == ()
             assert not torch.isnan(loss)
+
+
+class TestComputeJEPAPredictionLoss:
+    """Test compute_jepa_prediction_loss function."""
+
+    def test_mse_matches_torch_mse_loss(self):
+        """Test MSE mode delegates to torch MSE loss."""
+        student = torch.tensor([[[1.0, 3.0], [2.0, 4.0]]])
+        teacher = torch.tensor([[[2.0, 1.0], [0.0, 3.0]]])
+
+        loss = compute_jepa_prediction_loss(student, teacher, kind=MSE_JEPA_LOSS_KIND)
+
+        assert torch.isclose(loss, torch.nn.functional.mse_loss(student, teacher))
+
+    def test_cosine_matches_manual_distance(self):
+        """Test cosine mode computes mean one-minus-cosine distance."""
+        student = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+        teacher = torch.tensor([[[1.0, 0.0], [1.0, 1.0]]])
+
+        loss = compute_jepa_prediction_loss(student, teacher, kind=COSINE_JEPA_LOSS_KIND)
+        expected = (1.0 - torch.nn.functional.cosine_similarity(student, teacher, dim=-1)).mean()
+
+        assert torch.isclose(loss, expected)
+
+    def test_cosine_is_zero_for_identical_nonzero_inputs(self):
+        """Test cosine mode is near zero for identical nonzero inputs."""
+        features = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+
+        loss = compute_jepa_prediction_loss(features, features.clone(), kind=COSINE_JEPA_LOSS_KIND)
+
+        assert loss.item() < 1e-6
 
 
 class TestSetupTeacher:
