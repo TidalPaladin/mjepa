@@ -1,9 +1,8 @@
 import pytest
 import torch
-import torch.nn.functional as F
 from vit import ViT, ViTConfig, ViTFeatures
 
-from mjepa.jepa import COSINE_JEPA_LOSS_KIND, MSE_JEPA_LOSS_KIND, CrossAttentionPredictor, JEPAConfig, JEPALossKind
+from mjepa.jepa import CrossAttentionPredictor, JEPAConfig
 from mjepa.model import MJEPA, MJEPALosses, MJEPAPredictions
 
 
@@ -40,17 +39,8 @@ def _make_test_vit_config(
     )
 
 
-def _make_test_model(
-    *,
-    num_cls_tokens: int,
-    sigreg_loss_weight: float,
-    jepa_loss_kind: JEPALossKind = MSE_JEPA_LOSS_KIND,
-) -> MJEPA:
-    config = JEPAConfig(
-        sigreg_loss_weight=sigreg_loss_weight,
-        gram_start_epoch=None,
-        jepa_loss_kind=jepa_loss_kind,
-    )
+def _make_test_model(*, num_cls_tokens: int, sigreg_loss_weight: float) -> MJEPA:
+    config = JEPAConfig(sigreg_loss_weight=sigreg_loss_weight, gram_start_epoch=None)
     backbone = _make_test_vit_config(num_cls_tokens=num_cls_tokens).instantiate()
     predictor = CrossAttentionPredictor(backbone, depth=TEST_PREDICTOR_DEPTH)
     return MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
@@ -63,16 +53,6 @@ def _make_test_features(*, num_cls_tokens: int) -> ViTFeatures:
         TEST_HIDDEN_SIZE,
     )
     return ViTFeatures(dense_features, TEST_NUM_REGISTER_TOKENS, num_cls_tokens)
-
-
-def _masked_teacher_target(teacher_output: ViTFeatures, target_mask: torch.Tensor) -> torch.Tensor:
-    return torch.masked_select(teacher_output.visual_tokens, target_mask.unsqueeze(-1)).reshape(
-        TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE
-    )
-
-
-def _mean_cosine_distance(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
-    return (1.0 - F.cosine_similarity(student, teacher, dim=-1)).mean()
 
 
 @pytest.fixture
@@ -730,56 +710,9 @@ class TestMJEPAComputeLosses:
         assert isinstance(losses, MJEPALosses)
         assert isinstance(losses.jepa_loss, torch.Tensor)
         assert isinstance(losses.jepa_loss_cls, torch.Tensor)
-        target = _masked_teacher_target(teacher_output, target_mask)
-        assert torch.isclose(losses.jepa_loss, F.mse_loss(pred, target))
-        assert torch.isclose(losses.jepa_loss_cls, F.mse_loss(pred_with_cls, target))
         # sigreg_loss can be a Tensor or 0.0 depending on config
         assert isinstance(losses.sigreg_loss, (torch.Tensor, float))
         assert losses.gram_loss == 0.0  # no gram teacher
-
-    def test_compute_losses_with_cosine_reconstruction(self):
-        """Test JEPA reconstruction losses can use cosine distance."""
-        model = _make_test_model(
-            num_cls_tokens=TEST_NUM_CLS_TOKENS,
-            sigreg_loss_weight=0.0,
-            jepa_loss_kind=COSINE_JEPA_LOSS_KIND,
-        )
-        student_output = _make_test_features(num_cls_tokens=TEST_NUM_CLS_TOKENS)
-        teacher_output = ViTFeatures(
-            student_output.dense_features.clone(), TEST_NUM_REGISTER_TOKENS, TEST_NUM_CLS_TOKENS
-        )
-
-        target_mask = torch.zeros(TEST_BATCH_SIZE, TEST_NUM_VISUAL_TOKENS, dtype=torch.bool)
-        target_mask[:, :TEST_TARGET_TOKENS] = True
-        pred = torch.randn(TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE, requires_grad=True)
-        pred_with_cls = torch.randn(TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE, requires_grad=True)
-
-        predictions = MJEPAPredictions(
-            pred=pred,
-            pred_with_cls=pred_with_cls,
-            student_output=student_output,
-            teacher_output=teacher_output,
-            target_mask=target_mask,
-            context_mask=target_mask,
-        )
-        losses = model.compute_losses(
-            output=predictions,
-            step=0,
-            epoch=0,
-        )
-
-        target = _masked_teacher_target(teacher_output, target_mask)
-        expected_jepa_loss = _mean_cosine_distance(pred, target)
-        expected_jepa_loss_cls = _mean_cosine_distance(pred_with_cls, target)
-
-        assert torch.isclose(losses.jepa_loss, expected_jepa_loss)
-        assert isinstance(losses.jepa_loss_cls, torch.Tensor)
-        assert torch.isclose(losses.jepa_loss_cls, expected_jepa_loss_cls)
-        reduced_loss = losses.reduce()
-        assert torch.isfinite(reduced_loss)
-        reduced_loss.backward()
-        assert pred.grad is not None
-        assert pred_with_cls.grad is not None
 
     def test_compute_losses_with_sigreg(self):
         """Test loss computation with SigREG loss enabled."""
@@ -833,11 +766,7 @@ class TestMJEPAComputeLosses:
 
     def test_compute_losses_skips_sigreg_when_no_cls_tokens(self):
         """Test zero-CLS backbones skip SigREG instead of producing NaNs."""
-        model = _make_test_model(
-            num_cls_tokens=0,
-            sigreg_loss_weight=1e-4,
-            jepa_loss_kind=COSINE_JEPA_LOSS_KIND,
-        )
+        model = _make_test_model(num_cls_tokens=0, sigreg_loss_weight=1e-4)
         student_output = _make_test_features(num_cls_tokens=0)
         teacher_output = ViTFeatures(student_output.dense_features.clone(), TEST_NUM_REGISTER_TOKENS, 0)
 
@@ -860,7 +789,6 @@ class TestMJEPAComputeLosses:
         )
 
         assert losses.sigreg_loss == 0.0
-        assert losses.jepa_loss_cls == 0.0
         assert torch.isfinite(losses.reduce())
 
     def test_compute_losses_with_gram(self, mjepa_model: MJEPA):

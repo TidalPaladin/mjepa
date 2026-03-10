@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from vit import ViT, ViTFeatures
 from vit.tokens import apply_mask
@@ -12,7 +13,6 @@ from .jepa import (
     JEPAConfig,
     autocast_context,
     compute_gram_loss,
-    compute_jepa_prediction_loss,
     compute_sigreg_loss,
     forward_gram_teacher,
     generate_masks,
@@ -169,13 +169,9 @@ class MJEPA(nn.Module):
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         student_output = output.student_output
-        target = apply_mask(output.target_mask, output.teacher_output.visual_tokens, fill_value=None)
-        jepa_loss = compute_jepa_prediction_loss(output.pred, target, kind=self.config.jepa_loss_kind)
-        jepa_loss_cls = (
-            compute_jepa_prediction_loss(output.pred_with_cls, target, kind=self.config.jepa_loss_kind)
-            if output.pred_with_cls is not None
-            else 0.0
-        )
+        target = apply_mask(output.target_mask, output.teacher_output.visual_tokens, fill_value=None).float()
+        jepa_loss = F.mse_loss(output.pred.float(), target)
+        jepa_loss_cls = F.mse_loss(output.pred_with_cls.float(), target) if output.pred_with_cls is not None else 0.0
 
         sigreg_loss = (
             compute_sigreg_loss(student_output.cls_tokens.transpose(0, 1).float(), step, num_slices=256)
