@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from os import PathLike
 from typing import Any, Literal, Protocol, cast
@@ -190,6 +190,24 @@ def _collect_group_parameter_names(
     return sorted(names)
 
 
+def _collect_unique_parameters(parameter_groups: Sequence[Mapping[str, Any]]) -> list[nn.Parameter]:
+    return _collect_unique_parameters_in_order(
+        parameter for group in parameter_groups for parameter in cast(Sequence[nn.Parameter], group["params"])
+    )
+
+
+def _collect_unique_parameters_in_order(parameters: Iterator[nn.Parameter]) -> list[nn.Parameter]:
+    seen_parameter_ids: set[int] = set()
+    unique_parameters: list[nn.Parameter] = []
+    for parameter in parameters:
+        parameter_id = id(parameter)
+        if parameter_id in seen_parameter_ids:
+            continue
+        seen_parameter_ids.add(parameter_id)
+        unique_parameters.append(parameter)
+    return unique_parameters
+
+
 def _get_group_optimizer_mode(group: Mapping[str, Any], index: int) -> str:
     optimizer_mode = cast(str, group.get("optimizer", AUTO_COMPONENT_NAME))
     if optimizer_mode not in PARAMETER_GROUP_OPTIMIZER_MODES:
@@ -239,6 +257,7 @@ class OptimizerConfig:
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] | None = None
     log_hybrid_adamw_parameters: bool = False
+    max_grad_norm: float | None = None
 
     # Scheduler
     scheduled: bool = False
@@ -251,6 +270,10 @@ class OptimizerConfig:
     # Parameter groups
     parameter_groups: list[dict[str, Any]] = field(default_factory=list)
     skip_weight_decay_on_1d: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_grad_norm is not None and self.max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be a positive float or None")
 
     def _instantiate_scheduler(self, optimizer: Optimizer, total_steps: int) -> LRScheduler:
         if self.scheduled:
@@ -358,6 +381,13 @@ class OptimizerConfig:
             return self._instantiate_hybrid_muon(parameter_groups, total_steps, parameter_names_by_id)
         raise ValueError(f"Unsupported optimizer kind: {self.kind!r}")
 
+    def clip_grad_norm_(self, optimizer: OptimizerLike) -> torch.Tensor | None:
+        """Clip optimizer gradients by the configured global L2 norm."""
+        if self.max_grad_norm is None:
+            return None
+        parameters = _collect_unique_parameters(optimizer.param_groups)
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm=self.max_grad_norm)
+
     @classmethod
     def from_yaml(cls, path: PathLike) -> "OptimizerConfig":
         with open(path) as f:
@@ -392,23 +422,28 @@ def _assign_parameter_groups(
     skip_weight_decay_on_1d: bool = False,
 ) -> list[dict[str, Any]]:
     assigned_groups: list[dict[str, Any]] = []
-    assigned_params: set[nn.Parameter] = set()
+    assigned_params: set[int] = set()
     for config in parameter_groups:
         keys = config["params"]
-        params = set(p for p in _match_parameters(model, keys) if p.requires_grad)
-        params = params.difference(assigned_params)
+        # Preserve model traversal order here. Parameter ordering must stay deterministic
+        # across processes so optimizer groups, schedulers, and global grad clipping all
+        # observe the same parameter sequence under DDP.
+        params = _collect_unique_parameters_in_order(
+            param
+            for param in _match_parameters(model, keys)
+            if param.requires_grad and id(param) not in assigned_params
+        )
         if params:
-            assert params.isdisjoint(assigned_params)
             kwargs = {k: v for k, v in config.items() if k != "params"}
-            assigned_groups.append({"params": list(params), **kwargs})
-        assigned_params.update(params)
+            assigned_groups.append({"params": params, **kwargs})
+        assigned_params.update(id(param) for param in params)
 
-    remaining_trainable_params = [p for p in model.parameters() if p.requires_grad and p not in assigned_params]
+    remaining_trainable_params = [p for p in model.parameters() if p.requires_grad and id(p) not in assigned_params]
     if skip_weight_decay_on_1d:
         no_decay_1d_params = [p for p in remaining_trainable_params if p.ndim == 1]
         if no_decay_1d_params:
             assigned_groups.append({"params": no_decay_1d_params, "weight_decay": 0.0})
-            assigned_params.update(no_decay_1d_params)
+            assigned_params.update(id(param) for param in no_decay_1d_params)
             remaining_trainable_params = [p for p in remaining_trainable_params if p.ndim != 1]
 
     # Default param group

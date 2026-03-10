@@ -78,6 +78,7 @@ optimizer: !!python/object:mjepa.OptimizerConfig
   fused: true
   scheduled: false
   div_factor: 10
+  # max_grad_norm: 1.0
   # To enable hybrid Muon + AdamW:
   # kind: hybrid_muon
   # adamw_lr: 0.0002
