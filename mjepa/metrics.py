@@ -17,15 +17,183 @@ CPA_P99 = 0.99
 GRID_HW_NUM_DIMS = 2
 CPA_RESULT_KEYS = ("cpa_mean", "cpa_std", "cpa_p90", "cpa_p99")
 SDC_RESULT_KEY = "sdc_spearman_proxy"
+EFFECTIVE_RANK_RESULT_KEYS = ("effective_rank", "top_eig_frac")
+RETRIEVAL_RESULT_KEYS = ("retrieval_top1", "retrieval_mrr")
+
+
+def _scalar_like(reference: Tensor, value: float) -> Tensor:
+    return torch.tensor(value, dtype=reference.dtype, device=reference.device)
 
 
 def _nan_like(reference: Tensor) -> Tensor:
-    return torch.tensor(float("nan"), dtype=reference.dtype, device=reference.device)
+    return _scalar_like(reference, float("nan"))
 
 
 def _nan_result(reference: Tensor, keys: tuple[str, ...]) -> dict[str, Tensor]:
     nan = _nan_like(reference)
     return {key: nan for key in keys}
+
+
+def _prefixed_keys(prefix: str, base_keys: tuple[str, ...]) -> tuple[str, ...]:
+    cleaned_prefix = prefix.strip("_")
+    if not cleaned_prefix:
+        return base_keys
+    return tuple(f"{cleaned_prefix}_{key}" for key in base_keys)
+
+
+def _flatten_embeddings(embeddings: Tensor, name: str) -> Tensor:
+    if embeddings.ndim == 2:
+        return embeddings
+    if embeddings.ndim == 3:
+        return embeddings.reshape(-1, embeddings.shape[-1])
+    raise ValueError(f"{name} must have shape [B, D] or [B, N, D]")
+
+
+def _result_dict(keys: tuple[str, ...], *values: Tensor) -> dict[str, Tensor]:
+    return dict(zip(keys, values, strict=True))
+
+
+def _flatten_and_validate_paired_embeddings(query_embeddings: Tensor, key_embeddings: Tensor) -> tuple[Tensor, Tensor]:
+    query_embeddings = _flatten_embeddings(query_embeddings, "query_embeddings")
+    key_embeddings = _flatten_embeddings(key_embeddings, "key_embeddings")
+
+    if query_embeddings.shape[0] != key_embeddings.shape[0]:
+        raise ValueError("Leading dimensions must match between query_embeddings and key_embeddings")
+    if query_embeddings.shape[-1] != key_embeddings.shape[-1]:
+        raise ValueError("Hidden dimension mismatch between query_embeddings and key_embeddings")
+
+    return query_embeddings, key_embeddings
+
+
+class EffectiveRankMetric(Metric):
+    """Measure representation richness from the eigenvalue spectrum of the feature covariance.
+
+    The metric accepts either `[B, D]` or `[B, N, D]` inputs. Sequence inputs are flattened
+    across the leading dimensions before the running covariance statistics are updated.
+    """
+
+    full_state_update = False
+
+    def __init__(self, prefix: str = "", eps: float = 1e-12, sync_on_compute: bool = True) -> None:
+        super().__init__(sync_on_compute=sync_on_compute)
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+
+        self.eps = eps
+        self._result_keys = _prefixed_keys(prefix, EFFECTIVE_RANK_RESULT_KEYS)
+
+        self.add_state("count", default=torch.tensor(0, dtype=torch.long), dist_reduce_fx="sum")
+        self.add_state("sum", default=torch.zeros(0, dtype=torch.float64), dist_reduce_fx="sum")
+        self.add_state("sum_outer", default=torch.zeros(0, 0, dtype=torch.float64), dist_reduce_fx="sum")
+
+    def update(self, embeddings: Tensor) -> None:
+        embeddings = _flatten_embeddings(embeddings, "embeddings")
+        if embeddings.shape[0] == 0:
+            return
+
+        embeddings64 = embeddings.to(dtype=torch.float64)
+        hidden_size = embeddings64.shape[-1]
+
+        count_state = cast(Tensor, self.count)
+        sum_state = cast(Tensor, self.sum)
+        sum_outer_state = cast(Tensor, self.sum_outer)
+
+        if sum_state.numel() == 0:
+            sum_state.resize_(hidden_size).zero_()
+            sum_outer_state.resize_(hidden_size, hidden_size).zero_()
+        elif sum_state.shape[0] != hidden_size:
+            raise ValueError("Hidden dimension mismatch across EffectiveRankMetric updates")
+
+        count_state.add_(embeddings64.shape[0])
+        sum_state.add_(embeddings64.sum(dim=0))
+        sum_outer_state.add_(embeddings64.transpose(0, 1).mm(embeddings64))
+
+    def compute(self) -> dict[str, Tensor]:
+        count_state = cast(Tensor, self.count)
+        sum_state = cast(Tensor, self.sum)
+        sum_outer_state = cast(Tensor, self.sum_outer)
+
+        reference = sum_state if sum_state.numel() > 0 else torch.tensor(0.0, dtype=torch.float64)
+        if count_state <= 0:
+            return _nan_result(reference, self._result_keys)
+
+        count = count_state.to(dtype=sum_outer_state.dtype)
+        mean = sum_state / count
+        covariance = sum_outer_state / count - torch.outer(mean, mean)
+        covariance = 0.5 * (covariance + covariance.mT)
+        eigvals = torch.linalg.eigvalsh(covariance).clamp(min=0.0)
+        eigval_sum = eigvals.sum()
+
+        if eigval_sum <= self.eps:
+            one = _scalar_like(sum_outer_state, 1.0)
+            return _result_dict(self._result_keys, one, one)
+
+        probs = eigvals / eigval_sum
+        positive = probs > 0
+        entropy = -(probs[positive] * probs[positive].log()).sum()
+        effective_rank = entropy.exp()
+        top_eig_frac = eigvals.max() / eigval_sum
+        return _result_dict(self._result_keys, effective_rank, top_eig_frac)
+
+    def plot(self, val: Any = None, ax: Any = None) -> Any:
+        raise NotImplementedError("Plotting is not implemented for EffectiveRankMetric")
+
+
+class InBatchRetrievalMetric(Metric):
+    """Measure whether paired embeddings retrieve their matching counterpart within a batch.
+
+    The metric is augmentation-agnostic: callers provide paired embeddings in matching order.
+    For paired-view validation, create the second view outside the metric and reuse a weak
+    subset of the training transforms if that is the desired policy.
+    """
+
+    full_state_update = False
+
+    def __init__(self, prefix: str = "", eps: float = 1e-12, sync_on_compute: bool = True) -> None:
+        super().__init__(sync_on_compute=sync_on_compute)
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+
+        self.eps = eps
+        self._result_keys = _prefixed_keys(prefix, RETRIEVAL_RESULT_KEYS)
+
+        self.add_state("count", default=torch.tensor(0, dtype=torch.long), dist_reduce_fx="sum")
+        self.add_state("top1_sum", default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
+        self.add_state("reciprocal_rank_sum", default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
+
+    def update(self, query_embeddings: Tensor, key_embeddings: Tensor) -> None:
+        query_embeddings, key_embeddings = _flatten_and_validate_paired_embeddings(query_embeddings, key_embeddings)
+        if query_embeddings.shape[0] == 0:
+            return
+
+        query_norm = F.normalize(query_embeddings.float(), dim=-1, eps=self.eps)
+        key_norm = F.normalize(key_embeddings.float(), dim=-1, eps=self.eps)
+
+        similarities = query_norm.mm(key_norm.transpose(0, 1))
+        positive_similarities = similarities.diag().unsqueeze(1)
+        ranks = (similarities > positive_similarities).sum(dim=1).to(dtype=torch.float64) + 1.0
+
+        count_state = cast(Tensor, self.count)
+        top1_sum_state = cast(Tensor, self.top1_sum)
+        reciprocal_rank_sum_state = cast(Tensor, self.reciprocal_rank_sum)
+
+        count_state.add_(query_embeddings.shape[0])
+        top1_sum_state.add_((ranks == 1.0).to(dtype=top1_sum_state.dtype).sum())
+        reciprocal_rank_sum_state.add_((1.0 / ranks).sum())
+
+    def compute(self) -> dict[str, Tensor]:
+        count_state = cast(Tensor, self.count)
+        top1_sum_state = cast(Tensor, self.top1_sum)
+        reciprocal_rank_sum_state = cast(Tensor, self.reciprocal_rank_sum)
+
+        if count_state <= 0:
+            return _nan_result(top1_sum_state, self._result_keys)
+
+        count = count_state.to(dtype=top1_sum_state.dtype)
+        return _result_dict(self._result_keys, top1_sum_state / count, reciprocal_rank_sum_state / count)
+
+    def plot(self, val: Any = None, ax: Any = None) -> Any:
+        raise NotImplementedError("Plotting is not implemented for InBatchRetrievalMetric")
 
 
 class CLSPatchAlignmentMetric(Metric):
