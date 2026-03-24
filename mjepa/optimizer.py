@@ -135,7 +135,7 @@ class CompositeScheduler:
         self._last_lr = self.get_last_lr()
 
     def get_last_lr(self) -> list[float]:
-        return [lr for scheduler in self.schedulers.values() for lr in scheduler.get_last_lr()]
+        return [float(lr) for scheduler in self.schedulers.values() for lr in scheduler.get_last_lr()]
 
     def state_dict(self) -> dict[str, Any]:
         return {

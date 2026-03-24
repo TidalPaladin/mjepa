@@ -91,7 +91,7 @@ def load_image(path: Path, size: Sequence[int]) -> Tensor:
     """Load and preprocess an image file."""
     if path.suffix.lower() in (".tiff", ".tif"):
         try:
-            from dicom_preprocessing import load_tiff_f32
+            from dicom_preprocessing import load_tiff_f32  # pyright: ignore[reportMissingImports]
         except ModuleNotFoundError as exc:
             raise ModuleNotFoundError(
                 "TIFF loading requires optional dependency 'dicom-preprocessing'. "
