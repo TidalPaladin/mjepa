@@ -56,6 +56,13 @@ def _make_test_model(
     return MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
 
 
+def _make_stem_target_model(*, num_cls_tokens: int, sigreg_loss_weight: float) -> MJEPA:
+    model = _make_test_model(num_cls_tokens=num_cls_tokens, sigreg_loss_weight=sigreg_loss_weight)
+    model.config.stem_jepa_loss_weight = 0.5
+    model.predictor.enable_shallow_head()
+    return model
+
+
 def _make_jepa_config(**overrides: object) -> JEPAConfig:
     config_kwargs = {
         "context_ratio": 0.5,
@@ -64,6 +71,7 @@ def _make_jepa_config(**overrides: object) -> JEPAConfig:
         "momentum": 0.98,
         "predictor_depth": 2,
         "scheduled": False,
+        "stem_jepa_loss_weight": 0.0,
         "gram_loss_weight": 1.0,
         "sigreg_loss_weight": 0.0001,
     }
@@ -335,6 +343,14 @@ class TestMJEPAInitialization:
         assert mjepa_model_no_gram.gram_teacher is None
         assert mjepa_model_no_gram.config.gram_start_epoch is None
 
+    def test_initialization_enables_stem_target_head(self, small_vit: ViT, predictor: CrossAttentionPredictor):
+        """Test that enabling stem supervision initializes the shallow predictor head."""
+        config = JEPAConfig(gram_start_epoch=None, stem_jepa_loss_weight=0.5)
+
+        model = MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
+
+        assert model.predictor.predictor_proj_shallow is not None
+
     def test_teacher_frozen(self, mjepa_model):
         """Test that teacher parameters are frozen."""
         for param in mjepa_model.teacher.parameters():
@@ -371,6 +387,14 @@ class TestMJEPAForwardPasses:
         mjepa_model.teacher.train()
         _ = mjepa_model.forward_teacher(dummy_batch)
         assert not mjepa_model.teacher.training
+
+    def test_forward_teacher_stem(self, mjepa_model: MJEPA, dummy_batch):
+        """Test forward pass through teacher stem."""
+        output = mjepa_model.forward_teacher_stem(dummy_batch)
+
+        assert isinstance(output, torch.Tensor)
+        assert output.shape == (dummy_batch.shape[0], TEST_NUM_VISUAL_TOKENS, TEST_HIDDEN_SIZE)
+        assert output.dtype == torch.float32
 
     def test_forward_student(self, mjepa_model: MJEPA, dummy_batch):
         """Test forward pass through student."""
@@ -732,6 +756,7 @@ class TestMJEPAComputeLosses:
         assert torch.isclose(losses.jepa_loss_cls, F.mse_loss(pred_with_cls, target))
         # sigreg_loss can be a Tensor or 0.0 depending on config
         assert isinstance(losses.sigreg_loss, (torch.Tensor, float))
+        assert losses.stem_jepa_loss == 0.0
         assert losses.gram_loss == 0.0  # no gram teacher
 
     def test_compute_losses_with_cosine_reconstruction(self):
@@ -827,6 +852,48 @@ class TestMJEPAComputeLosses:
 
         assert isinstance(losses.sigreg_loss, torch.Tensor)
         assert losses.sigreg_loss.item() > 0
+
+    def test_compute_losses_with_stem_targets(self):
+        """Test loss computation can include an additional stem-target objective."""
+        model = _make_stem_target_model(num_cls_tokens=TEST_NUM_CLS_TOKENS, sigreg_loss_weight=0.0)
+
+        student_output = _make_test_features(num_cls_tokens=TEST_NUM_CLS_TOKENS)
+        teacher_output = ViTFeatures(
+            student_output.dense_features.clone(), TEST_NUM_REGISTER_TOKENS, TEST_NUM_CLS_TOKENS
+        )
+        teacher_stem_output = torch.randn(TEST_BATCH_SIZE, TEST_NUM_VISUAL_TOKENS, TEST_HIDDEN_SIZE)
+        target_mask = torch.zeros(TEST_BATCH_SIZE, TEST_NUM_VISUAL_TOKENS, dtype=torch.bool)
+        target_mask[:, :TEST_TARGET_TOKENS] = True
+        pred = torch.randn(TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE, requires_grad=True)
+        pred_with_cls = torch.randn(TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE, requires_grad=True)
+        stem_pred = torch.randn(TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE, requires_grad=True)
+
+        predictions = MJEPAPredictions(
+            pred=pred,
+            pred_with_cls=pred_with_cls,
+            stem_pred=stem_pred,
+            student_output=student_output,
+            teacher_output=teacher_output,
+            teacher_stem_output=teacher_stem_output,
+            target_mask=target_mask,
+            context_mask=target_mask,
+        )
+        losses = model.compute_losses(
+            output=predictions,
+            step=0,
+            epoch=0,
+        )
+
+        target = _masked_teacher_target(teacher_output, target_mask)
+        stem_target = torch.masked_select(teacher_stem_output, target_mask.unsqueeze(-1)).reshape(
+            TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE
+        )
+        assert torch.isclose(losses.jepa_loss, F.mse_loss(pred, target))
+        assert isinstance(losses.jepa_loss_cls, torch.Tensor)
+        assert isinstance(losses.stem_jepa_loss, torch.Tensor)
+        assert torch.isclose(losses.jepa_loss_cls, F.mse_loss(pred_with_cls, target))
+        assert torch.isclose(losses.stem_jepa_loss, F.mse_loss(stem_pred, stem_target))
+        assert torch.isfinite(losses.reduce())
 
     def test_compute_losses_skips_sigreg_when_no_cls_tokens(self):
         """Test zero-CLS backbones skip SigREG instead of producing NaNs."""
@@ -1020,6 +1087,20 @@ class TestMJEPAForward:
         assert predictions.context_mask.shape[0] == dummy_batch.shape[0]
         assert predictions.target_mask.shape[0] == dummy_batch.shape[0]
         assert predictions.gram_teacher_output is None
+        assert predictions.stem_pred is None
+        assert predictions.teacher_stem_output is None
+
+    def test_forward_with_stem_targets(self, dummy_batch):
+        """Test forward pass emits stem predictions when the objective is enabled."""
+        model = _make_stem_target_model(num_cls_tokens=TEST_NUM_CLS_TOKENS, sigreg_loss_weight=0.0)
+        model.eval()
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        assert predictions.stem_pred is not None
+        assert predictions.teacher_stem_output is not None
+        assert predictions.stem_pred.shape == predictions.pred.shape
 
     def test_forward_with_gram(self, mjepa_model, dummy_batch):
         """Test forward pass with gram teacher."""

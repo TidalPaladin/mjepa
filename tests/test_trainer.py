@@ -16,12 +16,14 @@ from mjepa.jepa import CrossAttentionPredictor
 from mjepa.trainer import (
     ResolutionConfig,
     TrainerConfig,
+    _normalize_predictor_checkpoint_state,
     _validate_checkpoint_optimizer_and_scheduler_kinds,
     calculate_total_steps,
     count_parameters,
     format_large_number,
     format_pbar_description,
     is_rank_zero,
+    load_checkpoint,
     rank_zero_only,
     save_checkpoint,
     seed_everything,
@@ -552,6 +554,85 @@ class TestCheckpointStateCompatibility:
 
         with pytest.raises(ValueError, match="scheduler kind"):
             _validate_checkpoint_optimizer_and_scheduler_kinds(checkpoint, optimizer, scheduler)
+
+
+class TestPredictorCheckpointCompatibility:
+    """Test predictor checkpoint compatibility across stem-head configurations."""
+
+    @pytest.fixture
+    def vit_config(self):
+        return ViTConfig(
+            in_channels=3,
+            hidden_size=64,
+            patch_size=[4, 4],
+            img_size=[32, 32],
+            depth=2,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            pos_enc="rope",
+            dtype=torch.float32,
+        )
+
+    def test_missing_shallow_head_is_synthesized_from_deep_head(self, vit_config):
+        backbone = vit_config.instantiate()
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        checkpoint_state = predictor.state_dict()
+
+        predictor.enable_shallow_head()
+        normalized_state = _normalize_predictor_checkpoint_state(predictor, checkpoint_state)
+
+        assert torch.equal(normalized_state["predictor_proj_shallow.weight"], checkpoint_state["predictor_proj.weight"])
+        assert torch.equal(normalized_state["predictor_proj_shallow.bias"], checkpoint_state["predictor_proj.bias"])
+
+    def test_extra_shallow_head_is_dropped_when_predictor_does_not_use_it(self, vit_config):
+        backbone = vit_config.instantiate()
+        predictor_with_shallow = CrossAttentionPredictor(backbone, depth=2)
+        predictor_with_shallow.enable_shallow_head()
+        checkpoint_state = predictor_with_shallow.state_dict()
+
+        predictor_without_shallow = CrossAttentionPredictor(backbone, depth=2)
+        normalized_state = _normalize_predictor_checkpoint_state(predictor_without_shallow, checkpoint_state)
+
+        assert "predictor_proj_shallow.weight" not in normalized_state
+        assert "predictor_proj_shallow.bias" not in normalized_state
+
+    def test_resume_rejects_mismatched_shallow_head_configuration(self, vit_config):
+        backbone = vit_config.instantiate()
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        teacher = vit_config.instantiate()
+        optimizer = AdamW(backbone.parameters(), lr=1e-3)
+        scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.pt"
+            save_checkpoint(
+                path,
+                backbone=backbone,
+                predictor=predictor,
+                teacher=teacher,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=1,
+                epoch=1,
+            )
+
+            resume_backbone = vit_config.instantiate()
+            resume_predictor = CrossAttentionPredictor(resume_backbone, depth=2)
+            resume_predictor.enable_shallow_head()
+            resume_teacher = vit_config.instantiate()
+            resume_optimizer = AdamW(resume_backbone.parameters(), lr=1e-3)
+            resume_scheduler = LinearLR(resume_optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+            with pytest.raises(ValueError, match="mode='fresh'"):
+                load_checkpoint(
+                    path,
+                    backbone=resume_backbone,
+                    predictor=resume_predictor,
+                    teacher=resume_teacher,
+                    optimizer=resume_optimizer,
+                    scheduler=resume_scheduler,
+                    mode="resume",
+                )
 
 
 class TestYAMLConstructors:

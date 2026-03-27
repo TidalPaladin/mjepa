@@ -31,6 +31,8 @@ class MJEPALosses:
     sigreg_loss: Tensor | float
     gram_loss: Tensor | float
 
+    stem_jepa_loss: Tensor | float = 0.0
+    stem_jepa_loss_weight: float = 0.0
     gram_loss_weight: float = 1.0
     sigreg_loss_weight: float = 1e-4
 
@@ -38,6 +40,7 @@ class MJEPALosses:
         loss = (
             self.jepa_loss
             + self.jepa_loss_cls
+            + self.stem_jepa_loss * self.stem_jepa_loss_weight
             + self.gram_loss * self.gram_loss_weight
             + self.sigreg_loss * self.sigreg_loss_weight
         )
@@ -54,6 +57,8 @@ class MJEPAPredictions:
     context_mask: Tensor
     target_mask: Tensor
 
+    stem_pred: Tensor | None = None
+    teacher_stem_output: Tensor | None = None
     gram_teacher_output: Tensor | None = None
     probes: dict[str, Tensor] = field(default_factory=dict)
 
@@ -72,6 +77,8 @@ class MJEPA(nn.Module):
         teacher_dtype = config.teacher_dtype
         self.teacher = setup_teacher(backbone, dtype=teacher_dtype)
         self.predictor = predictor
+        if self._use_stem_targets():
+            self.predictor.enable_shallow_head()
         self.gram_teacher = (
             setup_teacher(backbone, dtype=teacher_dtype) if config.gram_start_epoch is not None else None
         )
@@ -90,6 +97,13 @@ class MJEPA(nn.Module):
             output.dense_features.clone(), output.num_register_tokens, output.num_cls_tokens, output.tokenized_size
         )
 
+    def forward_teacher_stem(self, x: Tensor) -> Tensor:
+        self.teacher.eval()
+        with autocast_context(x.device.type, self.autocast_dtype), torch.inference_mode():
+            stem_output = self.teacher.stem(x)
+            stem_output = self.teacher.normalize_patch_embeddings(stem_output)
+        return stem_output.clone()
+
     def forward_student(self, x: Tensor, context_mask: Tensor, rope_seed: int | None = None) -> ViTFeatures:
         with autocast_context(x.device.type, self.autocast_dtype):
             return self.student(x, mask=context_mask, rope_seed=rope_seed)
@@ -105,6 +119,17 @@ class MJEPA(nn.Module):
         with autocast_context(context.device.type, self.autocast_dtype):
             return self.predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
 
+    def forward_predictor_heads(
+        self,
+        tokenized_size: tuple[int, int],
+        context: Tensor,
+        context_mask: Tensor | None,
+        target_mask: Tensor,
+        rope_seed: int | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        with autocast_context(context.device.type, self.autocast_dtype):
+            return self.predictor.forward_heads(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+
     @staticmethod
     def _has_cls_tokens(features: ViTFeatures) -> bool:
         return features.num_cls_tokens > 0
@@ -112,6 +137,13 @@ class MJEPA(nn.Module):
     @classmethod
     def _get_probe_tokens(cls, features: ViTFeatures) -> Tensor:
         return features.cls_tokens if cls._has_cls_tokens(features) else features.visual_tokens
+
+    @staticmethod
+    def _masked_target(target_mask: Tensor, target_features: Tensor) -> Tensor:
+        return apply_mask(target_mask, target_features, fill_value=None)
+
+    def _use_stem_targets(self) -> bool:
+        return self.config.stem_jepa_loss_weight > 0
 
     def forward_probe(self, features: ViTFeatures) -> dict[str, Tensor]:
         """Override in subclasses; use ``_get_probe_tokens`` for zero-CLS-safe inputs."""
@@ -169,11 +201,20 @@ class MJEPA(nn.Module):
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         student_output = output.student_output
-        target = apply_mask(output.target_mask, output.teacher_output.visual_tokens, fill_value=None)
+        target = self._masked_target(output.target_mask, output.teacher_output.visual_tokens)
         jepa_loss = compute_jepa_prediction_loss(output.pred, target, kind=self.config.jepa_loss_kind)
         jepa_loss_cls = (
             compute_jepa_prediction_loss(output.pred_with_cls, target, kind=self.config.jepa_loss_kind)
             if output.pred_with_cls is not None
+            else 0.0
+        )
+        stem_jepa_loss = (
+            compute_jepa_prediction_loss(
+                output.stem_pred,
+                self._masked_target(output.target_mask, output.teacher_stem_output),
+                kind=self.config.jepa_loss_kind,
+            )
+            if output.stem_pred is not None and output.teacher_stem_output is not None
             else 0.0
         )
 
@@ -197,8 +238,10 @@ class MJEPA(nn.Module):
         return MJEPALosses(
             jepa_loss=jepa_loss,
             jepa_loss_cls=jepa_loss_cls,
+            stem_jepa_loss=stem_jepa_loss,
             sigreg_loss=sigreg_loss,
             gram_loss=gram_loss,
+            stem_jepa_loss_weight=self.config.stem_jepa_loss_weight,
             gram_loss_weight=self.config.gram_loss_weight,
             sigreg_loss_weight=self.config.sigreg_loss_weight,
         )
@@ -212,6 +255,7 @@ class MJEPA(nn.Module):
         rope_seed = int(torch.randint(0, 1000000, (1,)).item())
         # Teacher / Gram teacher forward pass
         teacher_output = self.forward_teacher(x)
+        teacher_stem_output = self.forward_teacher_stem(x) if self._use_stem_targets() else None
         gram_teacher_output = (
             self.forward_gram_teacher(x, context_mask, rope_seed) if self._is_gram_enabled_for_epoch(epoch) else None
         )
@@ -220,7 +264,7 @@ class MJEPA(nn.Module):
 
         student_output = self.forward_student(x, context_mask, rope_seed=rope_seed)
         student_has_cls_tokens = self._has_cls_tokens(student_output)
-        pred = self.forward_predictor(
+        pred, stem_pred = self.forward_predictor_heads(
             (Ht, Wt), student_output.visual_tokens, context_mask, target_mask, rope_seed=rope_seed
         )
         pred_with_cls = (
@@ -235,10 +279,12 @@ class MJEPA(nn.Module):
         return MJEPAPredictions(
             pred=pred,
             pred_with_cls=pred_with_cls,
+            stem_pred=stem_pred,
             student_output=student_output,
             teacher_output=teacher_output,
             context_mask=context_mask,
             target_mask=target_mask,
+            teacher_stem_output=teacher_stem_output,
             gram_teacher_output=gram_teacher_output,
             probes=probes,
         )
