@@ -135,6 +135,7 @@ class TestJEPAConfig:
         assert config.predictor_depth == 4
         assert config.disable_predictor_regularizers is False
         assert config.teacher_dtype is None
+        assert config.use_gram_anchoring is False
         assert config.stem_jepa_loss_weight == 0.0
         assert config.jepa_loss_kind == MSE_JEPA_LOSS_KIND
 
@@ -194,6 +195,9 @@ class TestYAMLConfig:
             "predictor_depth": 8,
             "disable_predictor_regularizers": True,
             "teacher_dtype": "bfloat16",
+            "use_gram_anchoring": True,
+            "gram_teacher_epoch": 8,
+            "gram_start_epoch": 16,
             "stem_jepa_loss_weight": 0.25,
             "jepa_loss_kind": COSINE_JEPA_LOSS_KIND,
         }
@@ -211,6 +215,8 @@ class TestYAMLConfig:
         assert config.predictor_depth == 8
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.use_gram_anchoring is True
+        assert config.gram_start_epoch == 16
         assert config.stem_jepa_loss_weight == 0.25
         assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
@@ -232,6 +238,9 @@ class TestYAMLConfig:
         predictor_depth: 5
         disable_predictor_regularizers: true
         teacher_dtype: bfloat16
+        use_gram_anchoring: true
+        gram_teacher_epoch: 12
+        gram_start_epoch: 24
         stem_jepa_loss_weight: 0.75
         jepa_loss_kind: cosine
         """
@@ -248,6 +257,8 @@ class TestYAMLConfig:
         assert config.predictor_depth == 5
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.use_gram_anchoring is True
+        assert config.gram_start_epoch == 24
         assert config.stem_jepa_loss_weight == 0.75
         assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
@@ -923,6 +934,11 @@ class TestJEPAConfigValidation:
         with pytest.raises(ValueError):
             JEPAConfig(gram_start_epoch=-1)
 
+    def test_enabled_gram_requires_start_epoch(self):
+        """Test that enabling Gram anchoring requires a start epoch."""
+        with pytest.raises(ValueError, match="gram_start_epoch must be set"):
+            JEPAConfig(use_gram_anchoring=True)
+
     def test_gram_start_before_teacher_epoch(self):
         """Test that gram_start_epoch must be >= gram_teacher_epoch."""
         with pytest.raises(ValueError):
@@ -957,6 +973,7 @@ class TestJEPAConfigValidation:
     def test_valid_gram_config(self):
         """Test valid Gram configuration."""
         config = JEPAConfig(
+            use_gram_anchoring=True,
             gram_teacher_epoch=50,
             gram_start_epoch=100,
             gram_update_interval_epoch=10,
@@ -965,5 +982,6 @@ class TestJEPAConfigValidation:
             gram_loss_weight=0.5,
             sigreg_loss_weight=1e-3,
         )
+        assert config.use_gram_anchoring is True
         assert config.gram_teacher_epoch == 50
         assert config.gram_start_epoch == 100

@@ -79,9 +79,7 @@ class MJEPA(nn.Module):
         self.predictor = predictor
         if self._use_stem_targets():
             self.predictor.enable_shallow_head()
-        self.gram_teacher = (
-            setup_teacher(backbone, dtype=teacher_dtype) if config.gram_start_epoch is not None else None
-        )
+        self.gram_teacher = setup_teacher(backbone, dtype=teacher_dtype) if self.config.use_gram_anchoring else None
         self.autocast_dtype = autocast_dtype
         self._gram_cooldown_end_epoch: int | None = None
 
@@ -170,7 +168,7 @@ class MJEPA(nn.Module):
         return epoch < self._gram_cooldown_end_epoch
 
     def _is_gram_enabled_for_epoch(self, epoch: int) -> bool:
-        if self.config.gram_start_epoch is None:
+        if not self.config.use_gram_anchoring or self.config.gram_start_epoch is None:
             return False
         return epoch >= self.config.gram_start_epoch and not self._is_gram_cooldown_active(epoch)
 

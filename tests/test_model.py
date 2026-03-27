@@ -48,7 +48,6 @@ def _make_test_model(
 ) -> MJEPA:
     config = _make_jepa_config(
         sigreg_loss_weight=sigreg_loss_weight,
-        gram_start_epoch=None,
         jepa_loss_kind=jepa_loss_kind,
     )
     backbone = _make_test_vit_config(num_cls_tokens=num_cls_tokens).instantiate()
@@ -71,6 +70,7 @@ def _make_jepa_config(**overrides: object) -> JEPAConfig:
         "momentum": 0.98,
         "predictor_depth": 2,
         "scheduled": False,
+        "use_gram_anchoring": False,
         "stem_jepa_loss_weight": 0.0,
         "gram_loss_weight": 1.0,
         "sigreg_loss_weight": 0.0001,
@@ -102,6 +102,7 @@ def _mean_cosine_distance(student: torch.Tensor, teacher: torch.Tensor) -> torch
 def jepa_config():
     """Create a JEPA configuration for testing."""
     return _make_jepa_config(
+        use_gram_anchoring=True,
         gram_teacher_epoch=10,
         gram_start_epoch=20,
         gram_update_interval_epoch=5,
@@ -113,7 +114,20 @@ def jepa_config():
 @pytest.fixture
 def jepa_config_no_gram():
     """Create a JEPA configuration without Gram loss for testing."""
-    return _make_jepa_config(gram_start_epoch=None)
+    return _make_jepa_config()
+
+
+@pytest.fixture
+def jepa_config_gram_schedule_disabled():
+    """Create a JEPA configuration with Gram schedule values that are explicitly disabled."""
+    return _make_jepa_config(
+        use_gram_anchoring=False,
+        gram_teacher_epoch=10,
+        gram_start_epoch=20,
+        gram_update_interval_epoch=5,
+        gram_resolution_scale=1.0,
+        gram_remove_neg=False,
+    )
 
 
 @pytest.fixture
@@ -144,6 +158,12 @@ def mjepa_model(jepa_config, small_vit, predictor):
 def mjepa_model_no_gram(jepa_config_no_gram, small_vit, predictor):
     """Create an MJEPA model without Gram teacher for testing."""
     return MJEPA(jepa_config_no_gram, small_vit, predictor, autocast_dtype=torch.float32)
+
+
+@pytest.fixture
+def mjepa_model_gram_schedule_disabled(jepa_config_gram_schedule_disabled, small_vit, predictor):
+    """Create an MJEPA model with Gram schedule present but explicitly disabled."""
+    return MJEPA(jepa_config_gram_schedule_disabled, small_vit, predictor, autocast_dtype=torch.float32)
 
 
 @pytest.fixture
@@ -328,7 +348,12 @@ class TestMJEPAInitialization:
 
     def test_initialization_with_teacher_dtype_override(self, small_vit: ViT, predictor: CrossAttentionPredictor):
         """Test that teacher dtype override applies to both teacher models."""
-        config = JEPAConfig(gram_teacher_epoch=10, gram_start_epoch=20, teacher_dtype=torch.bfloat16)
+        config = JEPAConfig(
+            use_gram_anchoring=True,
+            gram_teacher_epoch=10,
+            gram_start_epoch=20,
+            teacher_dtype=torch.bfloat16,
+        )
 
         model = MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
 
@@ -343,9 +368,15 @@ class TestMJEPAInitialization:
         assert mjepa_model_no_gram.gram_teacher is None
         assert mjepa_model_no_gram.config.gram_start_epoch is None
 
+    def test_initialization_with_disabled_gram_schedule(self, mjepa_model_gram_schedule_disabled):
+        """Test that an explicit disable flag prevents Gram teacher setup."""
+        assert mjepa_model_gram_schedule_disabled.gram_teacher is None
+        assert mjepa_model_gram_schedule_disabled.config.use_gram_anchoring is False
+        assert mjepa_model_gram_schedule_disabled.config.gram_start_epoch == 20
+
     def test_initialization_enables_stem_target_head(self, small_vit: ViT, predictor: CrossAttentionPredictor):
         """Test that enabling stem supervision initializes the shallow predictor head."""
-        config = JEPAConfig(gram_start_epoch=None, stem_jepa_loss_weight=0.5)
+        config = JEPAConfig(stem_jepa_loss_weight=0.5)
 
         model = MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
 
@@ -495,7 +526,6 @@ class TestMJEPATeacherUpdate:
         config = JEPAConfig(
             momentum=0.9,
             scheduled=True,
-            gram_start_epoch=None,
         )
         vit_config = ViTConfig(
             in_channels=3,
@@ -597,6 +627,14 @@ class TestMJEPATeacherUpdate:
         mjepa_model_no_gram.update_gram_teacher(current_epoch=10)
         mjepa_model_no_gram.update_gram_teacher(current_epoch=20)
 
+    def test_update_gram_teacher_disabled_flag_ignores_schedule(self, mjepa_model_gram_schedule_disabled):
+        """Test that the explicit disable flag keeps Gram updates as a no-op."""
+        mjepa_model_gram_schedule_disabled.update_gram_teacher(current_epoch=10)
+        mjepa_model_gram_schedule_disabled.update_gram_teacher(current_epoch=20, resolution_changed=True)
+
+        assert mjepa_model_gram_schedule_disabled.gram_teacher is None
+        assert mjepa_model_gram_schedule_disabled._gram_cooldown_end_epoch is None
+
     def test_update_gram_teacher_resolution_change_starts_cooldown(self, mjepa_model: MJEPA):
         """Test that resolution changes pause gram teacher updates until cooldown ends."""
         resolution_change_epoch = 20
@@ -668,6 +706,7 @@ class TestMJEPATeacherUpdate:
             momentum=0.98,
             predictor_depth=2,
             scheduled=False,
+            use_gram_anchoring=True,
             gram_teacher_epoch=10,
             gram_start_epoch=20,
             gram_update_interval_epoch=0,
@@ -719,8 +758,10 @@ class TestMJEPATeacherUpdate:
 class TestMJEPAComputeLosses:
     """Test MJEPA loss computation."""
 
-    def test_compute_losses_basic(self, mjepa_model_no_gram: MJEPA):
-        """Test basic loss computation without gram loss."""
+    @staticmethod
+    def _make_predictions_for_loss_tests(
+        *, gram_teacher_output: torch.Tensor | None = None
+    ) -> tuple[MJEPAPredictions, torch.Tensor, torch.Tensor, ViTFeatures]:
         pred = torch.randn(2, 16, 64)
         pred_with_cls = torch.randn(2, 16, 64)
 
@@ -741,7 +782,13 @@ class TestMJEPAComputeLosses:
             teacher_output=teacher_output,
             target_mask=target_mask,
             context_mask=target_mask,
+            gram_teacher_output=gram_teacher_output,
         )
+        return predictions, pred, pred_with_cls, teacher_output
+
+    def test_compute_losses_basic(self, mjepa_model_no_gram: MJEPA):
+        """Test basic loss computation without gram loss."""
+        predictions, pred, pred_with_cls, teacher_output = self._make_predictions_for_loss_tests()
         losses = mjepa_model_no_gram.compute_losses(
             output=predictions,
             step=0,
@@ -751,13 +798,25 @@ class TestMJEPAComputeLosses:
         assert isinstance(losses, MJEPALosses)
         assert isinstance(losses.jepa_loss, torch.Tensor)
         assert isinstance(losses.jepa_loss_cls, torch.Tensor)
-        target = _masked_teacher_target(teacher_output, target_mask)
+        target = _masked_teacher_target(teacher_output, predictions.target_mask)
         assert torch.isclose(losses.jepa_loss, F.mse_loss(pred, target))
         assert torch.isclose(losses.jepa_loss_cls, F.mse_loss(pred_with_cls, target))
         # sigreg_loss can be a Tensor or 0.0 depending on config
         assert isinstance(losses.sigreg_loss, (torch.Tensor, float))
         assert losses.stem_jepa_loss == 0.0
         assert losses.gram_loss == 0.0  # no gram teacher
+
+    def test_compute_losses_gram_flag_disabled_ignores_schedule(self, mjepa_model_gram_schedule_disabled: MJEPA):
+        """Test that Gram loss stays disabled when the flag is off even if the schedule is present."""
+        predictions, _, _, _ = self._make_predictions_for_loss_tests(gram_teacher_output=torch.randn(2, 64, 64))
+
+        losses = mjepa_model_gram_schedule_disabled.compute_losses(
+            output=predictions,
+            step=0,
+            epoch=20,
+        )
+
+        assert losses.gram_loss == 0.0
 
     def test_compute_losses_with_cosine_reconstruction(self):
         """Test JEPA reconstruction losses can use cosine distance."""
@@ -807,7 +866,6 @@ class TestMJEPAComputeLosses:
         """Test loss computation with SigREG loss enabled."""
         config = JEPAConfig(
             sigreg_loss_weight=1e-4,
-            gram_start_epoch=None,
         )
         vit_config = ViTConfig(
             in_channels=3,
@@ -1117,6 +1175,15 @@ class TestMJEPAForward:
         assert predictions_after.gram_teacher_output is not None
         assert isinstance(predictions_after.gram_teacher_output, torch.Tensor)
 
+    def test_forward_with_disabled_gram_schedule(self, mjepa_model_gram_schedule_disabled: MJEPA, dummy_batch):
+        """Test that a disabled Gram flag skips Gram outputs even with a configured schedule."""
+        mjepa_model_gram_schedule_disabled.eval()
+
+        with torch.no_grad():
+            predictions = mjepa_model_gram_schedule_disabled(dummy_batch, jepa_scale=2, epoch=20)
+
+        assert predictions.gram_teacher_output is None
+
     def test_forward_without_cls_tokens_skips_cls_predictor(self, dummy_batch):
         """Test zero-CLS backbones skip the CLS-conditioned predictor pass."""
         model = _make_test_model(num_cls_tokens=0, sigreg_loss_weight=0.0)
@@ -1192,7 +1259,7 @@ class TestMJEPAForward:
 
     def test_forward_full_target_ratio_targets_all_visual_tokens(self, small_vit, predictor, dummy_batch):
         """Test that target_ratio=1.0 includes every visual token in the prediction target."""
-        config = _make_jepa_config(target_ratio=1.0, gram_start_epoch=None)
+        config = _make_jepa_config(target_ratio=1.0)
         model = MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
         model.eval()
 
@@ -1278,7 +1345,7 @@ class TestMJEPAEndToEnd:
 
     @pytest.mark.cuda
     def test_full_workflow(self):
-        config = JEPAConfig(gram_start_epoch=None, sigreg_loss_weight=0.0)
+        config = JEPAConfig(sigreg_loss_weight=0.0)
         vit_config = ViTConfig(
             in_channels=3,
             hidden_size=64,
