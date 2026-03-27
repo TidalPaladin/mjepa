@@ -1,7 +1,7 @@
 import logging
 import os
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import wraps
@@ -248,6 +248,14 @@ def _normalize_predictor_checkpoint_state(
     return predictor_state
 
 
+def _predictor_checkpoint_has_shallow_head(predictor_state: Mapping[str, Any]) -> bool:
+    return "predictor_proj_shallow.weight" in predictor_state
+
+
+def _predictor_shallow_head_mismatch(predictor: CrossAttentionPredictor, predictor_state: Mapping[str, Any]) -> bool:
+    return (predictor.predictor_proj_shallow is not None) != _predictor_checkpoint_has_shallow_head(predictor_state)
+
+
 def load_checkpoint(
     path: os.PathLike,
     backbone: ViT,
@@ -286,6 +294,12 @@ def load_checkpoint(
     new_tokenized_size = backbone.stem.tokenized_size(backbone.config.img_size)
     step = int(data["step"])
     epoch = int(data["epoch"])
+
+    if mode == "resume" and predictor and _predictor_shallow_head_mismatch(predictor, data["predictor"]):
+        raise ValueError(
+            "Cannot resume across predictor shallow-head configuration changes; "
+            "load with mode='fresh' or match stem-target settings."
+        )
 
     # Validate image size
     if mode == "resume" and old_img_size != backbone.config.img_size:

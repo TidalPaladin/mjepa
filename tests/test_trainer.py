@@ -23,6 +23,7 @@ from mjepa.trainer import (
     format_large_number,
     format_pbar_description,
     is_rank_zero,
+    load_checkpoint,
     rank_zero_only,
     save_checkpoint,
     seed_everything,
@@ -594,6 +595,44 @@ class TestPredictorCheckpointCompatibility:
 
         assert "predictor_proj_shallow.weight" not in normalized_state
         assert "predictor_proj_shallow.bias" not in normalized_state
+
+    def test_resume_rejects_mismatched_shallow_head_configuration(self, vit_config):
+        backbone = vit_config.instantiate()
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        teacher = vit_config.instantiate()
+        optimizer = AdamW(backbone.parameters(), lr=1e-3)
+        scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.pt"
+            save_checkpoint(
+                path,
+                backbone=backbone,
+                predictor=predictor,
+                teacher=teacher,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=1,
+                epoch=1,
+            )
+
+            resume_backbone = vit_config.instantiate()
+            resume_predictor = CrossAttentionPredictor(resume_backbone, depth=2)
+            resume_predictor.enable_shallow_head()
+            resume_teacher = vit_config.instantiate()
+            resume_optimizer = AdamW(resume_backbone.parameters(), lr=1e-3)
+            resume_scheduler = LinearLR(resume_optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+            with pytest.raises(ValueError, match="mode='fresh'"):
+                load_checkpoint(
+                    path,
+                    backbone=resume_backbone,
+                    predictor=resume_predictor,
+                    teacher=resume_teacher,
+                    optimizer=resume_optimizer,
+                    scheduler=resume_scheduler,
+                    mode="resume",
+                )
 
 
 class TestYAMLConstructors:

@@ -548,6 +548,32 @@ class TestCrossAttentionPredictor:
 
         assert output.dtype == torch.float32
 
+    def test_predictor_forward_heads_disable_outer_autocast_for_fp32_projections(self):
+        """Test projection heads do not inherit a lower-precision outer autocast context."""
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        predictor.enable_shallow_head()
+
+        context = torch.randn(2, 32, 64)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :32] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+
+        autocast_enabled: list[bool] = []
+
+        def capture_autocast(_module, _inputs):
+            autocast_enabled.append(torch.is_autocast_enabled("cpu"))
+
+        hook = predictor.predictor_proj.register_forward_pre_hook(capture_autocast)
+        try:
+            with autocast_context("cpu", torch.bfloat16):
+                predictor.forward_heads((8, 8), context, context_mask, target_mask)
+        finally:
+            hook.remove()
+
+        assert autocast_enabled == [False]
+
     def test_predictor_can_enable_and_emit_shallow_head(self):
         """Test predictor can emit both deep and shallow targets from the shared trunk."""
         backbone = self._instantiate_backbone(torch.float32)

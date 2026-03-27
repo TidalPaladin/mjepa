@@ -184,8 +184,9 @@ class CrossAttentionPredictor(nn.Module):
         rope_seed: int | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         query = self.forward_features(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
-        deep_output = self.predictor_proj(query).float()
-        shallow_output = self._project(query, self.predictor_proj_shallow)
+        with autocast_context(query.device.type, self.predictor_dtype):
+            deep_output = self.predictor_proj(query).float()
+            shallow_output = self._project(query, self.predictor_proj_shallow)
         return deep_output, shallow_output
 
     def forward(
