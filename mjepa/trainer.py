@@ -225,6 +225,29 @@ def _validate_checkpoint_optimizer_and_scheduler_kinds(
         )
 
 
+def _normalize_predictor_checkpoint_state(
+    predictor: CrossAttentionPredictor, predictor_state: dict[str, Any]
+) -> dict[str, Any]:
+    shallow_weight_key = "predictor_proj_shallow.weight"
+    shallow_bias_key = "predictor_proj_shallow.bias"
+    deep_weight_key = "predictor_proj.weight"
+    deep_bias_key = "predictor_proj.bias"
+    predictor_has_shallow_head = predictor.predictor_proj_shallow is not None
+    checkpoint_has_shallow_head = shallow_weight_key in predictor_state
+
+    if predictor_has_shallow_head and not checkpoint_has_shallow_head:
+        predictor_state = dict(predictor_state)
+        predictor_state[shallow_weight_key] = predictor_state[deep_weight_key].clone()
+        if deep_bias_key in predictor_state:
+            predictor_state[shallow_bias_key] = predictor_state[deep_bias_key].clone()
+        return predictor_state
+
+    if checkpoint_has_shallow_head and not predictor_has_shallow_head:
+        return {key: value for key, value in predictor_state.items() if not key.startswith("predictor_proj_shallow.")}
+
+    return predictor_state
+
+
 def load_checkpoint(
     path: os.PathLike,
     backbone: ViT,
@@ -277,7 +300,8 @@ def load_checkpoint(
         resize_learnable_pos_enc(backbone, new_tokenized_size)
     if predictor:
         resize_learnable_pos_enc(predictor, old_tokenized_size)
-        predictor.load_state_dict(data["predictor"], strict=strict)
+        predictor_state = _normalize_predictor_checkpoint_state(predictor, data["predictor"])
+        predictor.load_state_dict(predictor_state, strict=strict)
         resize_learnable_pos_enc(predictor, new_tokenized_size)
     if teacher:
         resize_learnable_pos_enc(teacher, old_tokenized_size)

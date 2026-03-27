@@ -135,6 +135,7 @@ class TestJEPAConfig:
         assert config.predictor_depth == 4
         assert config.disable_predictor_regularizers is False
         assert config.teacher_dtype is None
+        assert config.stem_jepa_loss_weight == 0.0
         assert config.jepa_loss_kind == MSE_JEPA_LOSS_KIND
 
     def test_custom_config(self):
@@ -147,6 +148,7 @@ class TestJEPAConfig:
             predictor_depth=6,
             disable_predictor_regularizers=True,
             teacher_dtype=torch.bfloat16,
+            stem_jepa_loss_weight=0.5,
             jepa_loss_kind=COSINE_JEPA_LOSS_KIND,
         )
         assert config.context_ratio == 0.6
@@ -156,6 +158,7 @@ class TestJEPAConfig:
         assert config.predictor_depth == 6
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.stem_jepa_loss_weight == 0.5
         assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
     def test_invalid_context_ratio(self):
@@ -191,6 +194,7 @@ class TestYAMLConfig:
             "predictor_depth": 8,
             "disable_predictor_regularizers": True,
             "teacher_dtype": "bfloat16",
+            "stem_jepa_loss_weight": 0.25,
             "jepa_loss_kind": COSINE_JEPA_LOSS_KIND,
         }
         loader.construct_mapping.return_value = config_dict
@@ -207,6 +211,7 @@ class TestYAMLConfig:
         assert config.predictor_depth == 8
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.stem_jepa_loss_weight == 0.25
         assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
         # Verify the loader was called correctly
@@ -227,6 +232,7 @@ class TestYAMLConfig:
         predictor_depth: 5
         disable_predictor_regularizers: true
         teacher_dtype: bfloat16
+        stem_jepa_loss_weight: 0.75
         jepa_loss_kind: cosine
         """
 
@@ -242,6 +248,7 @@ class TestYAMLConfig:
         assert config.predictor_depth == 5
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.stem_jepa_loss_weight == 0.75
         assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
     def test_invalid_teacher_dtype_string(self):
@@ -253,6 +260,11 @@ class TestYAMLConfig:
         """Test invalid JEPA reconstruction loss kind."""
         with pytest.raises(ValueError, match="jepa_loss_kind must be one of"):
             JEPAConfig(jepa_loss_kind=cast(Any, "l1"))
+
+    def test_invalid_stem_jepa_loss_weight(self):
+        """Test invalid stem JEPA loss weight."""
+        with pytest.raises(ValueError, match="stem_jepa_loss_weight"):
+            JEPAConfig(stem_jepa_loss_weight=-0.1)
 
 
 class TestComputeSigREGLoss:
@@ -535,6 +547,25 @@ class TestCrossAttentionPredictor:
         output = predictor((8, 8), context, context_mask, target_mask)
 
         assert output.dtype == torch.float32
+
+    def test_predictor_can_enable_and_emit_shallow_head(self):
+        """Test predictor can emit both deep and shallow targets from the shared trunk."""
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        predictor.enable_shallow_head()
+
+        context = torch.randn(2, 32, 64)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :32] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+
+        deep_output, shallow_output = predictor.forward_heads((8, 8), context, context_mask, target_mask)
+
+        assert deep_output.dtype == torch.float32
+        assert shallow_output is not None
+        assert shallow_output.dtype == torch.float32
+        assert shallow_output.shape == deep_output.shape
 
 
 class TestGenerateMasks:

@@ -88,6 +88,8 @@ class CrossAttentionPredictor(nn.Module):
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": backbone.config.dtype}
+        self.hidden_size = backbone.config.hidden_size
+        self.out_dim = out_dim or backbone.config.hidden_size
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size, **factory_kwargs)
         self.rope = backbone.rope
@@ -97,12 +99,8 @@ class CrossAttentionPredictor(nn.Module):
         if disable_predictor_regularizers:
             self._disable_predictor_regularizers()
 
-        self.predictor_proj = nn.Linear(
-            backbone.config.hidden_size,
-            out_dim or backbone.config.hidden_size,
-            **factory_kwargs,
-        )
-        self._reset_predictor_proj_parameters()
+        self.predictor_proj = self._create_projection(device=device, dtype=backbone.config.dtype)
+        self.predictor_proj_shallow: nn.Linear | None = None
 
     @property
     def predictor_dtype(self) -> torch.dtype:
@@ -112,12 +110,36 @@ class CrossAttentionPredictor(nn.Module):
     def _create_block(backbone: ViT, device: torch.device | None) -> nn.Module:
         return backbone.create_cross_attention_layer(device=device, dtype=backbone.config.dtype)
 
-    def _reset_predictor_proj_parameters(self) -> None:
+    @staticmethod
+    def _reset_projection_parameters(projection: nn.Linear) -> None:
         # Teacher targets are RMS-normalized and the predictor query starts at small positional scales,
         # so keep the output head small and zero-centered at initialization.
-        nn.init.trunc_normal_(self.predictor_proj.weight, std=PREDICTOR_PROJ_INIT_STD)
-        if self.predictor_proj.bias is not None:
-            nn.init.zeros_(self.predictor_proj.bias)
+        nn.init.trunc_normal_(projection.weight, std=PREDICTOR_PROJ_INIT_STD)
+        if projection.bias is not None:
+            nn.init.zeros_(projection.bias)
+
+    def _create_projection(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> nn.Linear:
+        projection = nn.Linear(
+            self.hidden_size,
+            self.out_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self._reset_projection_parameters(projection)
+        return projection
+
+    def enable_shallow_head(self) -> None:
+        if self.predictor_proj_shallow is not None:
+            return
+
+        self.predictor_proj_shallow = self._create_projection(
+            device=self.predictor_proj.weight.device,
+            dtype=self.predictor_proj.weight.dtype,
+        )
+
+    @staticmethod
+    def _project(query: Tensor, projection: nn.Linear | None) -> Tensor | None:
+        return projection(query).float() if projection is not None else None
 
     def _disable_predictor_regularizers(self) -> None:
         # Force predictor regularizers to zero without changing the backbone configuration.
@@ -129,7 +151,7 @@ class CrossAttentionPredictor(nn.Module):
             block.cross_attention.attention_dropout.p = no_regularization
             block.mlp.dropout.p = no_regularization
 
-    def forward(
+    def forward_features(
         self,
         tokenized_size: tuple[int, int],
         context: Tensor,
@@ -151,7 +173,44 @@ class CrossAttentionPredictor(nn.Module):
             for block in self.blocks:
                 query = block(query, context, rope_q=rope_q, rope_k=rope_k)
 
-            return self.predictor_proj(query).float()
+            return query
+
+    def forward_heads(
+        self,
+        tokenized_size: tuple[int, int],
+        context: Tensor,
+        context_mask: Tensor | None,
+        target_mask: Tensor,
+        rope_seed: int | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        query = self.forward_features(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+        deep_output = self.predictor_proj(query).float()
+        shallow_output = self._project(query, self.predictor_proj_shallow)
+        return deep_output, shallow_output
+
+    def forward(
+        self,
+        tokenized_size: tuple[int, int],
+        context: Tensor,
+        context_mask: Tensor | None,
+        target_mask: Tensor,
+        rope_seed: int | None = None,
+    ) -> Tensor:
+        deep_output, _ = self.forward_heads(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+        return deep_output
+
+    def forward_shallow(
+        self,
+        tokenized_size: tuple[int, int],
+        context: Tensor,
+        context_mask: Tensor | None,
+        target_mask: Tensor,
+        rope_seed: int | None = None,
+    ) -> Tensor:
+        _, shallow_output = self.forward_heads(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+        if shallow_output is None:
+            raise ValueError("Shallow predictor head is not enabled")
+        return shallow_output
 
     if TYPE_CHECKING:
 
@@ -502,6 +561,7 @@ class JEPAConfig:
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
         gram_loss_weight: The coefficient of the Gram loss.
         sigreg_loss_weight: The coefficient of the SigREG loss.
+        stem_jepa_loss_weight: The coefficient of the stem-target JEPA loss.
         jepa_loss_kind: Reconstruction loss kind applied to both JEPA prediction losses.
     """
 
@@ -520,6 +580,7 @@ class JEPAConfig:
     gram_remove_neg: bool = False
     gram_loss_weight: float = 1.0
     sigreg_loss_weight: float = 1e-4
+    stem_jepa_loss_weight: float = 0.0
     jepa_loss_kind: JEPALossKind = MSE_JEPA_LOSS_KIND
 
     def __post_init__(self) -> None:
@@ -542,6 +603,8 @@ class JEPAConfig:
             raise ValueError("gram_loss_weight must be a positive float")
         if self.sigreg_loss_weight < 0:
             raise ValueError("sigreg_loss_weight must be a non-negative float")
+        if self.stem_jepa_loss_weight < 0:
+            raise ValueError("stem_jepa_loss_weight must be a non-negative float")
         if self.jepa_loss_kind not in JEPA_LOSS_KINDS:
             raise ValueError(f"jepa_loss_kind must be one of {list(JEPA_LOSS_KINDS)}")
 
