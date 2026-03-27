@@ -584,6 +584,14 @@ class TestGenerateMasks:
         overlap = context_mask & target_mask
         assert not overlap.any(), "Context and target masks should not overlap"
 
+    def test_target_ratio_one_targets_all_tokens(self, backbone):
+        """Test that a full target ratio marks every visual token as a target."""
+        x = torch.randn(2, 3, 32, 32)
+        context_mask, target_mask = generate_masks(backbone, x, context_ratio=0.5, target_ratio=1.0, scale=2)
+
+        assert target_mask.all()
+        assert (context_mask & target_mask).any(), "Full target masks should include context tokens"
+
     def test_context_ratio_approximate(self, backbone):
         """Test that context mask has approximately the expected ratio of True values."""
         x = torch.randn(4, 3, 32, 32)

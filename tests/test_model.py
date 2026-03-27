@@ -46,7 +46,7 @@ def _make_test_model(
     sigreg_loss_weight: float,
     jepa_loss_kind: JEPALossKind = MSE_JEPA_LOSS_KIND,
 ) -> MJEPA:
-    config = JEPAConfig(
+    config = _make_jepa_config(
         sigreg_loss_weight=sigreg_loss_weight,
         gram_start_epoch=None,
         jepa_loss_kind=jepa_loss_kind,
@@ -54,6 +54,21 @@ def _make_test_model(
     backbone = _make_test_vit_config(num_cls_tokens=num_cls_tokens).instantiate()
     predictor = CrossAttentionPredictor(backbone, depth=TEST_PREDICTOR_DEPTH)
     return MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
+
+
+def _make_jepa_config(**overrides: object) -> JEPAConfig:
+    config_kwargs = {
+        "context_ratio": 0.5,
+        "target_ratio": 0.25,
+        "scale": 2,
+        "momentum": 0.98,
+        "predictor_depth": 2,
+        "scheduled": False,
+        "gram_loss_weight": 1.0,
+        "sigreg_loss_weight": 0.0001,
+    }
+    config_kwargs.update(overrides)
+    return JEPAConfig(**config_kwargs)
 
 
 def _make_test_features(*, num_cls_tokens: int) -> ViTFeatures:
@@ -78,37 +93,19 @@ def _mean_cosine_distance(student: torch.Tensor, teacher: torch.Tensor) -> torch
 @pytest.fixture
 def jepa_config():
     """Create a JEPA configuration for testing."""
-    return JEPAConfig(
-        context_ratio=0.5,
-        target_ratio=0.25,
-        scale=2,
-        momentum=0.98,
-        predictor_depth=2,
-        scheduled=False,
+    return _make_jepa_config(
         gram_teacher_epoch=10,
         gram_start_epoch=20,
         gram_update_interval_epoch=5,
         gram_resolution_scale=1.0,
         gram_remove_neg=False,
-        gram_loss_weight=1.0,
-        sigreg_loss_weight=0.0001,
     )
 
 
 @pytest.fixture
 def jepa_config_no_gram():
     """Create a JEPA configuration without Gram loss for testing."""
-    return JEPAConfig(
-        context_ratio=0.5,
-        target_ratio=0.25,
-        scale=2,
-        momentum=0.98,
-        predictor_depth=2,
-        scheduled=False,
-        gram_start_epoch=None,
-        gram_loss_weight=1.0,
-        sigreg_loss_weight=0.0001,
-    )
+    return _make_jepa_config(gram_start_epoch=None)
 
 
 @pytest.fixture
@@ -1111,6 +1108,19 @@ class TestMJEPAForward:
         # Check that context and target masks don't overlap
         overlap = predictions.context_mask & predictions.target_mask
         assert not overlap.any()
+
+    def test_forward_full_target_ratio_targets_all_visual_tokens(self, small_vit, predictor, dummy_batch):
+        """Test that target_ratio=1.0 includes every visual token in the prediction target."""
+        config = _make_jepa_config(target_ratio=1.0, gram_start_epoch=None)
+        model = MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
+        model.eval()
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        assert predictions.target_mask.all()
+        assert (predictions.context_mask & predictions.target_mask).any()
+        assert predictions.pred.shape[1] == TEST_NUM_VISUAL_TOKENS
 
     @pytest.mark.parametrize("batch_size", [1, 2, 4])
     def test_forward_different_batch_sizes(self, mjepa_model_no_gram, batch_size):
