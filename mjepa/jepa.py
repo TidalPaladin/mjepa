@@ -202,7 +202,7 @@ def generate_masks(
     scale: int,
     roll: bool = True,
 ) -> tuple[Tensor, Tensor]:
-    r"""Generate non-overlapping and non-ragged context and target masks.
+    r"""Generate context masks and the corresponding prediction target masks.
 
     Args:
         backbone: Backbone implementing a :meth:`create_mask` method.
@@ -217,8 +217,12 @@ def generate_masks(
     # generate context mask - will always be non-ragged
     context_mask = backbone.create_mask(x, context_ratio, scale, roll=roll)
 
-    # generate target mask - select non-ragged target mask from locations not in context mask
-    target_mask = generate_non_overlapping_mask(context_mask, context_ratio, target_ratio)
+    if target_ratio == 1.0:
+        # Full target coverage intentionally includes context tokens.
+        target_mask = torch.ones_like(context_mask)
+    else:
+        # For partial targets, keep the existing non-overlapping behavior.
+        target_mask = generate_non_overlapping_mask(context_mask, context_ratio, target_ratio)
     return context_mask, target_mask
 
 
