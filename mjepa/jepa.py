@@ -554,9 +554,10 @@ class JEPAConfig:
         disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
             and attention dropout to ``0.0``.
         teacher_dtype: Optional dtype override for the teacher and Gram teacher weights.
+        use_gram_anchoring: Whether to enable Gram anchoring at all.
         gram_teacher_epoch: Epoch when the Gram teacher is first synchronized from the teacher.
         gram_start_epoch: The epoch at which to begin computing the Gram loss.
-            If ``None``, the Gram loss will not be computed.
+            If ``None``, the Gram loss cannot be computed.
         gram_update_interval_epoch: The interval at which to update the Gram teacher after the initial setup.
         gram_resolution_scale: The scale at which to feed inputs through the Gram teacher.
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
@@ -574,6 +575,7 @@ class JEPAConfig:
     predictor_depth: int = 4
     disable_predictor_regularizers: bool = False
     teacher_dtype: torch.dtype | str | None = None
+    use_gram_anchoring: bool = False
     gram_teacher_epoch: int = 100
     gram_start_epoch: int | None = None
     gram_update_interval_epoch: int = 10
@@ -590,6 +592,8 @@ class JEPAConfig:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:
             raise ValueError("target_ratio must be in the range (0, 1]")
+        if self.use_gram_anchoring and self.gram_start_epoch is None:
+            raise ValueError("gram_start_epoch must be set when use_gram_anchoring is enabled")
         if self.gram_teacher_epoch <= 0:
             raise ValueError("gram_teacher_epoch must be a positive integer")
         if self.gram_start_epoch is not None and self.gram_start_epoch <= 0:
