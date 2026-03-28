@@ -4,7 +4,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from mjepa.metrics import CLSPatchAlignmentMetric, SimilarityDistanceCouplingMetric
+from mjepa.metrics import (
+    CLSPatchAlignmentMetric,
+    EffectiveRankMetric,
+    InBatchRetrievalMetric,
+    SimilarityDistanceCouplingMetric,
+)
 
 
 STRICT_ATOL = 1e-7
@@ -13,6 +18,7 @@ QUANTILE_TOLERANCE_SCALE = 4.0
 RANDOM_TEST_SEED = 123
 COUPLING_TEST_SEED = 0
 DETERMINISM_TEST_SEED = 1234
+RANK_TEST_SEED = 7
 
 
 def assert_metric_allclose(actual: torch.Tensor, expected: torch.Tensor, *, atol: float) -> None:
@@ -269,3 +275,191 @@ class TestSimilarityDistanceCouplingMetric:
         out_after = metric.compute()
 
         assert torch.allclose(out_after["sdc_spearman_proxy"], out_before["sdc_spearman_proxy"], atol=STRICT_ATOL)
+
+
+class TestEffectiveRankMetric:
+    def test_outputs_named_keys(self):
+        metric = EffectiveRankMetric()
+        metric.update(torch.randn(4, 8))
+
+        out = metric.compute()
+
+        assert set(out.keys()) == {"effective_rank", "top_eig_frac"}
+
+    def test_prefixes_output_keys(self):
+        metric = EffectiveRankMetric(prefix="global")
+        metric.update(torch.randn(4, 8))
+
+        out = metric.compute()
+
+        assert set(out.keys()) == {"global_effective_rank", "global_top_eig_frac"}
+
+    def test_rejects_invalid_init(self):
+        with pytest.raises(ValueError, match="eps must be positive"):
+            EffectiveRankMetric(eps=0.0)
+
+    def test_rejects_invalid_update_inputs(self):
+        metric = EffectiveRankMetric()
+
+        with pytest.raises(ValueError, match="embeddings must have shape"):
+            metric.update(torch.randn(2))
+
+        with pytest.raises(ValueError, match="embeddings must have shape"):
+            metric.update(torch.randn(2, 3, 4, 5))
+
+        metric.update(torch.randn(2, 4))
+        with pytest.raises(ValueError, match="Hidden dimension mismatch"):
+            metric.update(torch.randn(2, 5))
+
+    def test_flattened_sequence_matches_matrix_input(self):
+        torch.manual_seed(RANK_TEST_SEED)
+        embeddings = torch.randn(3, 4, 5)
+
+        metric_seq = EffectiveRankMetric()
+        metric_seq.update(embeddings)
+        out_seq = metric_seq.compute()
+
+        metric_flat = EffectiveRankMetric()
+        metric_flat.update(embeddings.reshape(-1, embeddings.shape[-1]))
+        out_flat = metric_flat.compute()
+
+        assert_metric_allclose(out_seq["effective_rank"], out_flat["effective_rank"], atol=STRICT_ATOL)
+        assert_metric_allclose(out_seq["top_eig_frac"], out_flat["top_eig_frac"], atol=STRICT_ATOL)
+
+    def test_collapsed_features_have_rank_one_and_dominant_top_eigenvalue(self):
+        metric = EffectiveRankMetric()
+        embeddings = torch.ones(6, 4)
+
+        metric.update(embeddings)
+        out = metric.compute()
+
+        assert_metric_allclose(out["effective_rank"], torch.tensor(1.0), atol=STRICT_ATOL)
+        assert_metric_allclose(out["top_eig_frac"], torch.tensor(1.0), atol=STRICT_ATOL)
+
+    def test_isotropic_features_have_higher_rank_than_anisotropic_features(self):
+        torch.manual_seed(RANK_TEST_SEED)
+        num_samples = 2048
+        hidden_size = 16
+        isotropic = torch.randn(num_samples, hidden_size)
+        anisotropic = isotropic.clone()
+        anisotropic[:, 0] *= 8.0
+        anisotropic[:, 1:] *= 0.1
+
+        isotropic_metric = EffectiveRankMetric()
+        isotropic_metric.update(isotropic)
+        isotropic_out = isotropic_metric.compute()
+
+        anisotropic_metric = EffectiveRankMetric()
+        anisotropic_metric.update(anisotropic)
+        anisotropic_out = anisotropic_metric.compute()
+
+        assert isotropic_out["effective_rank"] > anisotropic_out["effective_rank"]
+        assert isotropic_out["top_eig_frac"] < anisotropic_out["top_eig_frac"]
+
+    def test_empty_returns_nans(self):
+        metric = EffectiveRankMetric()
+        out = metric.compute()
+
+        for value in out.values():
+            assert torch.isnan(value)
+
+    def test_reset_clears_state(self):
+        metric = EffectiveRankMetric()
+        metric.update(torch.randn(3, 6))
+
+        metric.reset()
+        out = metric.compute()
+
+        for value in out.values():
+            assert torch.isnan(value)
+
+
+class TestInBatchRetrievalMetric:
+    def test_outputs_named_keys(self):
+        metric = InBatchRetrievalMetric()
+        metric.update(torch.eye(3), torch.eye(3))
+
+        out = metric.compute()
+
+        assert set(out.keys()) == {"retrieval_top1", "retrieval_mrr"}
+
+    def test_prefixes_output_keys(self):
+        metric = InBatchRetrievalMetric(prefix="mask_global")
+        metric.update(torch.eye(3), torch.eye(3))
+
+        out = metric.compute()
+
+        assert set(out.keys()) == {"mask_global_retrieval_top1", "mask_global_retrieval_mrr"}
+
+    def test_rejects_invalid_init(self):
+        with pytest.raises(ValueError, match="eps must be positive"):
+            InBatchRetrievalMetric(eps=0.0)
+
+    def test_rejects_invalid_update_inputs(self):
+        metric = InBatchRetrievalMetric()
+
+        with pytest.raises(ValueError, match="query_embeddings must have shape"):
+            metric.update(torch.randn(4), torch.randn(1, 4))
+
+        with pytest.raises(ValueError, match="key_embeddings must have shape"):
+            metric.update(torch.randn(1, 4), torch.randn(4))
+
+        with pytest.raises(ValueError, match="Leading dimensions must match"):
+            metric.update(torch.randn(2, 4), torch.randn(3, 4))
+
+        with pytest.raises(ValueError, match="Hidden dimension mismatch"):
+            metric.update(torch.randn(2, 4), torch.randn(2, 5))
+
+    def test_identical_pairs_have_perfect_retrieval(self):
+        metric = InBatchRetrievalMetric()
+        embeddings = torch.eye(4)
+
+        metric.update(embeddings, embeddings)
+        out = metric.compute()
+
+        assert_metric_allclose(out["retrieval_top1"], torch.tensor(1.0), atol=STRICT_ATOL)
+        assert_metric_allclose(out["retrieval_mrr"], torch.tensor(1.0), atol=STRICT_ATOL)
+
+    def test_permuted_keys_reduce_retrieval(self):
+        metric = InBatchRetrievalMetric()
+        query = torch.eye(4)
+        key = query.roll(shifts=1, dims=0)
+
+        metric.update(query, key)
+        out = metric.compute()
+
+        assert out["retrieval_top1"] < 1.0
+        assert out["retrieval_mrr"] < 1.0
+
+    def test_sequence_inputs_are_flattened_pairwise(self):
+        metric = InBatchRetrievalMetric()
+        query = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[1.0, 1.0], [1.0, -1.0]],
+            ]
+        )
+        key = query.clone()
+
+        metric.update(query, key)
+        out = metric.compute()
+
+        assert_metric_allclose(out["retrieval_top1"], torch.tensor(1.0), atol=STRICT_ATOL)
+        assert_metric_allclose(out["retrieval_mrr"], torch.tensor(1.0), atol=STRICT_ATOL)
+
+    def test_empty_returns_nans(self):
+        metric = InBatchRetrievalMetric()
+        out = metric.compute()
+
+        for value in out.values():
+            assert torch.isnan(value)
+
+    def test_reset_clears_state(self):
+        metric = InBatchRetrievalMetric()
+        metric.update(torch.eye(3), torch.eye(3))
+
+        metric.reset()
+        out = metric.compute()
+
+        for value in out.values():
+            assert torch.isnan(value)
