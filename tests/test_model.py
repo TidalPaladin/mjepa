@@ -3,7 +3,16 @@ import torch
 import torch.nn.functional as F
 from vit import ViT, ViTConfig, ViTFeatures
 
-from mjepa.jepa import COSINE_JEPA_LOSS_KIND, MSE_JEPA_LOSS_KIND, CrossAttentionPredictor, JEPAConfig, JEPALossKind
+from mjepa.jepa import (
+    COSINE_JEPA_LOSS_KIND,
+    CROSS_ATTENTION_PREDICTOR_MODE,
+    MSE_JEPA_LOSS_KIND,
+    PREDICTOR_ATTENTION_MODES,
+    CrossAttentionPredictor,
+    JEPAConfig,
+    JEPALossKind,
+    PredictorAttentionMode,
+)
 from mjepa.model import MJEPA, MJEPALosses, MJEPAPredictions
 
 
@@ -45,13 +54,19 @@ def _make_test_model(
     num_cls_tokens: int,
     sigreg_loss_weight: float,
     jepa_loss_kind: JEPALossKind = MSE_JEPA_LOSS_KIND,
+    predictor_attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE,
 ) -> MJEPA:
     config = _make_jepa_config(
         sigreg_loss_weight=sigreg_loss_weight,
         jepa_loss_kind=jepa_loss_kind,
+        predictor_attention_mode=predictor_attention_mode,
     )
     backbone = _make_test_vit_config(num_cls_tokens=num_cls_tokens).instantiate()
-    predictor = CrossAttentionPredictor(backbone, depth=TEST_PREDICTOR_DEPTH)
+    predictor = CrossAttentionPredictor(
+        backbone,
+        depth=TEST_PREDICTOR_DEPTH,
+        attention_mode=config.predictor_attention_mode,
+    )
     return MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
 
 
@@ -69,6 +84,7 @@ def _make_jepa_config(**overrides: object) -> JEPAConfig:
         "scale": 2,
         "momentum": 0.98,
         "predictor_depth": 2,
+        "predictor_attention_mode": CROSS_ATTENTION_PREDICTOR_MODE,
         "scheduled": False,
         "use_gram_anchoring": False,
         "stem_jepa_loss_weight": 0.0,
@@ -382,6 +398,14 @@ class TestMJEPAInitialization:
 
         assert model.predictor.predictor_proj_shallow is not None
 
+    def test_initialization_rejects_predictor_attention_mode_mismatch(self, small_vit: ViT):
+        """Test that config and predictor attention modes must agree."""
+        config = JEPAConfig(predictor_attention_mode="decoder")
+        predictor = CrossAttentionPredictor(small_vit, depth=2, attention_mode=CROSS_ATTENTION_PREDICTOR_MODE)
+
+        with pytest.raises(ValueError, match="Predictor attention mode does not match JEPAConfig"):
+            MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
+
     def test_teacher_frozen(self, mjepa_model):
         """Test that teacher parameters are frozen."""
         for param in mjepa_model.teacher.parameters():
@@ -458,6 +482,26 @@ class TestMJEPAForwardPasses:
 
         assert isinstance(output, torch.Tensor)
         assert output.shape[0] == 2
+        assert output.dtype == torch.float32
+
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_forward_predictor_supports_all_attention_modes(self, attention_mode):
+        """Test direct predictor forwards across attention modes."""
+        model = _make_test_model(
+            num_cls_tokens=TEST_NUM_CLS_TOKENS,
+            sigreg_loss_weight=0.0,
+            predictor_attention_mode=attention_mode,
+        )
+        tokenized_size = (8, 8)
+        context = torch.randn(2, 32, 64)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :32] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+
+        output = model.forward_predictor(tokenized_size, context, context_mask, target_mask)
+
+        assert output.shape == (2, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE)
         assert output.dtype == torch.float32
 
     def test_forward_probe(self, mjepa_model: MJEPA, dummy_vit_features):
@@ -1195,6 +1239,24 @@ class TestMJEPAForward:
         assert predictions.pred_with_cls is None
         assert predictions.pred.shape[0] == dummy_batch.shape[0]
         assert predictions.student_output.num_cls_tokens == 0
+
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_forward_supports_all_attention_modes(self, dummy_batch, attention_mode):
+        """Test the full MJEPA forward path across predictor attention modes."""
+        model = _make_test_model(
+            num_cls_tokens=TEST_NUM_CLS_TOKENS,
+            sigreg_loss_weight=0.0,
+            predictor_attention_mode=attention_mode,
+        )
+        model.eval()
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        assert predictions.pred.shape == (TEST_BATCH_SIZE, TEST_TARGET_TOKENS, TEST_HIDDEN_SIZE)
+        assert predictions.pred.dtype == torch.float32
+        assert predictions.pred_with_cls is not None
+        assert predictions.pred_with_cls.shape == predictions.pred.shape
 
     def test_get_probe_tokens_falls_back_to_visual_tokens_without_cls(
         self, mjepa_model_no_gram: MJEPA, dummy_vit_features: ViTFeatures
