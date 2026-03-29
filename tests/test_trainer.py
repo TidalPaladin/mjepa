@@ -12,7 +12,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
 from vit import ViTConfig
 
-from mjepa.jepa import CrossAttentionPredictor
+from mjepa.jepa import CROSS_ATTENTION_PREDICTOR_MODE, DECODER_PREDICTOR_MODE, CrossAttentionPredictor
 from mjepa.trainer import (
     ResolutionConfig,
     TrainerConfig,
@@ -624,6 +624,47 @@ class TestPredictorCheckpointCompatibility:
             resume_scheduler = LinearLR(resume_optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
 
             with pytest.raises(ValueError, match="mode='fresh'"):
+                load_checkpoint(
+                    path,
+                    backbone=resume_backbone,
+                    predictor=resume_predictor,
+                    teacher=resume_teacher,
+                    optimizer=resume_optimizer,
+                    scheduler=resume_scheduler,
+                    mode="resume",
+                )
+
+    def test_resume_rejects_mismatched_attention_mode(self, vit_config):
+        backbone = vit_config.instantiate()
+        predictor = CrossAttentionPredictor(backbone, depth=2, attention_mode=CROSS_ATTENTION_PREDICTOR_MODE)
+        teacher = vit_config.instantiate()
+        optimizer = AdamW(backbone.parameters(), lr=1e-3)
+        scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.pt"
+            save_checkpoint(
+                path,
+                backbone=backbone,
+                predictor=predictor,
+                teacher=teacher,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=1,
+                epoch=1,
+            )
+
+            resume_backbone = vit_config.instantiate()
+            resume_predictor = CrossAttentionPredictor(
+                resume_backbone,
+                depth=2,
+                attention_mode=DECODER_PREDICTOR_MODE,
+            )
+            resume_teacher = vit_config.instantiate()
+            resume_optimizer = AdamW(resume_backbone.parameters(), lr=1e-3)
+            resume_scheduler = LinearLR(resume_optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+            with pytest.raises(ValueError, match="predictor attention-mode changes"):
                 load_checkpoint(
                     path,
                     backbone=resume_backbone,
