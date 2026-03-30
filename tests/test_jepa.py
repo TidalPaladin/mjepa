@@ -9,7 +9,11 @@ from vit import ViTConfig
 
 from mjepa.jepa import (
     COSINE_JEPA_LOSS_KIND,
+    CROSS_ATTENTION_PREDICTOR_MODE,
+    DECODER_PREDICTOR_MODE,
+    ENCODER_PREDICTOR_MODE,
     MSE_JEPA_LOSS_KIND,
+    PREDICTOR_ATTENTION_MODES,
     PREDICTOR_PROJ_INIT_STD,
     CrossAttentionPredictor,
     JEPAConfig,
@@ -133,6 +137,7 @@ class TestJEPAConfig:
         assert config.scale == 4
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
+        assert config.predictor_attention_mode == CROSS_ATTENTION_PREDICTOR_MODE
         assert config.disable_predictor_regularizers is False
         assert config.teacher_dtype is None
         assert config.use_gram_anchoring is False
@@ -147,6 +152,7 @@ class TestJEPAConfig:
             scale=8,
             momentum=0.95,
             predictor_depth=6,
+            predictor_attention_mode=DECODER_PREDICTOR_MODE,
             disable_predictor_regularizers=True,
             teacher_dtype=torch.bfloat16,
             stem_jepa_loss_weight=0.5,
@@ -157,6 +163,7 @@ class TestJEPAConfig:
         assert config.scale == 8
         assert config.momentum == 0.95
         assert config.predictor_depth == 6
+        assert config.predictor_attention_mode == DECODER_PREDICTOR_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
         assert config.stem_jepa_loss_weight == 0.5
@@ -193,6 +200,7 @@ class TestYAMLConfig:
             "scale": 16,
             "momentum": 0.98,
             "predictor_depth": 8,
+            "predictor_attention_mode": ENCODER_PREDICTOR_MODE,
             "disable_predictor_regularizers": True,
             "teacher_dtype": "bfloat16",
             "use_gram_anchoring": True,
@@ -213,6 +221,7 @@ class TestYAMLConfig:
         assert config.scale == 16
         assert config.momentum == 0.98
         assert config.predictor_depth == 8
+        assert config.predictor_attention_mode == ENCODER_PREDICTOR_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
         assert config.use_gram_anchoring is True
@@ -236,6 +245,7 @@ class TestYAMLConfig:
         scale: 12
         momentum: 0.97
         predictor_depth: 5
+        predictor_attention_mode: decoder
         disable_predictor_regularizers: true
         teacher_dtype: bfloat16
         use_gram_anchoring: true
@@ -255,6 +265,7 @@ class TestYAMLConfig:
         assert config.scale == 12
         assert config.momentum == 0.97
         assert config.predictor_depth == 5
+        assert config.predictor_attention_mode == DECODER_PREDICTOR_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
         assert config.use_gram_anchoring is True
@@ -276,6 +287,11 @@ class TestYAMLConfig:
         """Test invalid stem JEPA loss weight."""
         with pytest.raises(ValueError, match="stem_jepa_loss_weight"):
             JEPAConfig(stem_jepa_loss_weight=-0.1)
+
+    def test_invalid_predictor_attention_mode(self):
+        """Test invalid predictor attention mode."""
+        with pytest.raises(ValueError, match="predictor_attention_mode must be one of"):
+            JEPAConfig(predictor_attention_mode=cast(Any, "seq2seq"))
 
 
 class TestComputeSigREGLoss:
@@ -412,9 +428,24 @@ class TestCrossAttentionPredictor:
         for block in predictor.blocks:
             block = cast(Any, block)
             assert block.drop_path_rate == pytest.approx(drop_path_rate)
-            assert block.cross_attention.dropout.p == pytest.approx(hidden_dropout)
-            assert block.cross_attention.attention_dropout.p == pytest.approx(attention_dropout)
+            checked_attention = False
+            for attention_name in ("self_attention", "cross_attention"):
+                attention = getattr(block, attention_name, None)
+                if attention is None:
+                    continue
+                checked_attention = True
+                assert attention.dropout.p == pytest.approx(hidden_dropout)
+                assert attention.attention_dropout.p == pytest.approx(attention_dropout)
+            assert checked_attention
             assert block.mlp.dropout.p == pytest.approx(hidden_dropout)
+
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_predictor_initialization_records_attention_mode(self, attention_mode):
+        """Test predictor exposes the configured attention mode."""
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(backbone, depth=2, attention_mode=attention_mode)
+
+        assert predictor.attention_mode == attention_mode
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
     def test_predictor_initialization_cpu_dtype(self, dtype):
@@ -488,7 +519,8 @@ class TestCrossAttentionPredictor:
         expected_out_dim = out_dim if out_dim is not None else hidden_size
         assert predictor.predictor_proj.out_features == expected_out_dim
 
-    def test_predictor_regularizers_follow_backbone_by_default(self):
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_predictor_regularizers_follow_backbone_by_default(self, attention_mode):
         """Test predictor regularizer values are inherited from the backbone by default."""
         hidden_dropout = 0.2
         attention_dropout = 0.3
@@ -498,11 +530,17 @@ class TestCrossAttentionPredictor:
             attention_dropout=attention_dropout,
             drop_path_rate=drop_path_rate,
         )
-        predictor = CrossAttentionPredictor(backbone, depth=2, disable_predictor_regularizers=False)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            disable_predictor_regularizers=False,
+            attention_mode=attention_mode,
+        )
 
         self._assert_predictor_regularizers(predictor, hidden_dropout, attention_dropout, drop_path_rate)
 
-    def test_predictor_regularizers_can_be_disabled(self):
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_predictor_regularizers_can_be_disabled(self, attention_mode):
         """Test predictor regularizers are set to zero when override is enabled."""
         hidden_dropout = 0.2
         attention_dropout = 0.3
@@ -512,11 +550,17 @@ class TestCrossAttentionPredictor:
             attention_dropout=attention_dropout,
             drop_path_rate=drop_path_rate,
         )
-        predictor = CrossAttentionPredictor(backbone, depth=2, disable_predictor_regularizers=True)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            disable_predictor_regularizers=True,
+            attention_mode=attention_mode,
+        )
 
         self._assert_predictor_regularizers(predictor, 0.0, 0.0, 0.0)
 
-    def test_predictor_positional_device_arg_is_backwards_compatible(self):
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_predictor_positional_device_arg_is_backwards_compatible(self, attention_mode):
         """Test positional device argument does not toggle regularizer override."""
         hidden_dropout = 0.2
         attention_dropout = 0.3
@@ -528,11 +572,12 @@ class TestCrossAttentionPredictor:
         )
         device = torch.device("cpu")
 
-        predictor = CrossAttentionPredictor(backbone, 2, None, device)
+        predictor = CrossAttentionPredictor(backbone, 2, None, device, attention_mode=attention_mode)
 
         self._assert_predictor_regularizers(predictor, hidden_dropout, attention_dropout, drop_path_rate)
 
-    def test_predictor_forward_promotes_output_to_float32(self):
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_predictor_forward_promotes_output_to_float32(self, attention_mode):
         """Test predictor outputs are promoted to float32."""
         vit_config = ViTConfig(
             in_channels=3,
@@ -548,7 +593,7 @@ class TestCrossAttentionPredictor:
             dtype=torch.bfloat16,
         )
         backbone = vit_config.instantiate()
-        predictor = CrossAttentionPredictor(backbone, depth=2)
+        predictor = CrossAttentionPredictor(backbone, depth=2, attention_mode=attention_mode)
         context = torch.randn(2, 32, 64, dtype=torch.bfloat16)
         context_mask = torch.zeros(2, 64, dtype=torch.bool)
         context_mask[:, :32] = True
@@ -559,10 +604,11 @@ class TestCrossAttentionPredictor:
 
         assert output.dtype == torch.float32
 
-    def test_predictor_forward_heads_disable_outer_autocast_for_fp32_projections(self):
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_predictor_forward_heads_disable_outer_autocast_for_fp32_projections(self, attention_mode):
         """Test projection heads do not inherit a lower-precision outer autocast context."""
         backbone = self._instantiate_backbone(torch.float32)
-        predictor = CrossAttentionPredictor(backbone, depth=2)
+        predictor = CrossAttentionPredictor(backbone, depth=2, attention_mode=attention_mode)
         predictor.enable_shallow_head()
 
         context = torch.randn(2, 32, 64)
@@ -585,10 +631,11 @@ class TestCrossAttentionPredictor:
 
         assert autocast_enabled == [False]
 
-    def test_predictor_can_enable_and_emit_shallow_head(self):
+    @pytest.mark.parametrize("attention_mode", PREDICTOR_ATTENTION_MODES)
+    def test_predictor_can_enable_and_emit_shallow_head(self, attention_mode):
         """Test predictor can emit both deep and shallow targets from the shared trunk."""
         backbone = self._instantiate_backbone(torch.float32)
-        predictor = CrossAttentionPredictor(backbone, depth=2)
+        predictor = CrossAttentionPredictor(backbone, depth=2, attention_mode=attention_mode)
         predictor.enable_shallow_head()
 
         context = torch.randn(2, 32, 64)
@@ -603,6 +650,40 @@ class TestCrossAttentionPredictor:
         assert shallow_output is not None
         assert shallow_output.dtype == torch.float32
         assert shallow_output.shape == deep_output.shape
+
+    def test_encoder_mode_supports_context_free_cls_pass(self):
+        """Test encoder mode can process CLS-conditioned predictor calls without a context mask."""
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(backbone, depth=2, attention_mode=ENCODER_PREDICTOR_MODE)
+
+        cls_context = torch.randn(2, 4, 64)
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+
+        output = predictor((8, 8), cls_context, None, target_mask)
+
+        assert output.shape == (2, 16, 64)
+        assert output.dtype == torch.float32
+
+    def test_encoder_mode_preserves_target_rope_without_context_mask(self):
+        """Test encoder mode keeps target-token RoPE and uses identity RoPE for non-spatial context."""
+        query = torch.randn(2, 16, 64)
+        cls_context = torch.randn(2, 4, 64)
+        rope_q = torch.randn(2, 2, 1, 16, 8)
+
+        combined, combined_rope, query_length = CrossAttentionPredictor._prepare_encoder_inputs(
+            query,
+            cls_context,
+            rope_q,
+            rope_k=None,
+        )
+
+        assert combined.shape == (2, 20, 64)
+        assert query_length == 16
+        assert combined_rope is not None
+        assert torch.equal(combined_rope[:, :, :, :16, :], rope_q)
+        assert torch.count_nonzero(combined_rope[0, :, :, 16:, :]) == 0
+        assert torch.equal(combined_rope[1, :, :, 16:, :], torch.ones_like(combined_rope[1, :, :, 16:, :]))
 
 
 class TestGenerateMasks:

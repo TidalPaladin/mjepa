@@ -28,6 +28,15 @@ MSE_JEPA_LOSS_KIND = "mse"
 COSINE_JEPA_LOSS_KIND = "cosine"
 JEPALossKind: TypeAlias = Literal["mse", "cosine"]
 JEPA_LOSS_KINDS: tuple[JEPALossKind, ...] = (MSE_JEPA_LOSS_KIND, COSINE_JEPA_LOSS_KIND)
+CROSS_ATTENTION_PREDICTOR_MODE = "cross_attention"
+DECODER_PREDICTOR_MODE = "decoder"
+ENCODER_PREDICTOR_MODE = "encoder"
+PredictorAttentionMode: TypeAlias = Literal["cross_attention", "decoder", "encoder"]
+PREDICTOR_ATTENTION_MODES: tuple[PredictorAttentionMode, ...] = (
+    CROSS_ATTENTION_PREDICTOR_MODE,
+    DECODER_PREDICTOR_MODE,
+    ENCODER_PREDICTOR_MODE,
+)
 
 
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
@@ -65,7 +74,7 @@ class CrossAttentionPredictor(nn.Module):
 
     The predictor consists of the following components:
         - Separate learnable position encodings for both context and target embeddings
-        - A series of cross-attention layers between the target queries and the context.
+        - A configurable series of predictor blocks operating in cross-attention, decoder, or encoder mode.
         - A linear projection head to create the final output.
 
     Args:
@@ -76,6 +85,9 @@ class CrossAttentionPredictor(nn.Module):
         device: Device to place the predictor on.
         disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
             and attention dropout to ``0.0``.
+        attention_mode: Predictor attention mode. ``"cross_attention"`` keeps the current behavior,
+            ``"decoder"`` adds self-attention over target queries before cross-attention, and
+            ``"encoder"`` runs self-attention over the concatenated query/context sequence.
     """
 
     def __init__(
@@ -85,17 +97,21 @@ class CrossAttentionPredictor(nn.Module):
         out_dim: int | None = None,
         device: torch.device | None = None,
         disable_predictor_regularizers: bool = False,
+        attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE,
     ):
         super().__init__()
+        if attention_mode not in PREDICTOR_ATTENTION_MODES:
+            raise ValueError(f"attention_mode must be one of {list(PREDICTOR_ATTENTION_MODES)}")
         factory_kwargs = {"device": device, "dtype": backbone.config.dtype}
         self.hidden_size = backbone.config.hidden_size
         self.out_dim = out_dim or backbone.config.hidden_size
+        self.attention_mode = attention_mode
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size, **factory_kwargs)
         self.rope = backbone.rope
 
         # Predictor blocks and output projection
-        self.blocks = nn.ModuleList([self._create_block(backbone, device) for _ in range(depth)])
+        self.blocks = nn.ModuleList([self._create_block(backbone, device, attention_mode) for _ in range(depth)])
         if disable_predictor_regularizers:
             self._disable_predictor_regularizers()
 
@@ -107,8 +123,18 @@ class CrossAttentionPredictor(nn.Module):
         return self.predictor_proj.weight.dtype
 
     @staticmethod
-    def _create_block(backbone: ViT, device: torch.device | None) -> nn.Module:
-        return backbone.create_cross_attention_layer(device=device, dtype=backbone.config.dtype)
+    def _create_block(
+        backbone: ViT,
+        device: torch.device | None,
+        attention_mode: PredictorAttentionMode,
+    ) -> nn.Module:
+        if attention_mode == CROSS_ATTENTION_PREDICTOR_MODE:
+            return backbone.create_cross_attention_layer(device=device, dtype=backbone.config.dtype)
+        if attention_mode == DECODER_PREDICTOR_MODE:
+            return backbone.create_decoder_layer(device=device, dtype=backbone.config.dtype)
+        if attention_mode == ENCODER_PREDICTOR_MODE:
+            return backbone.create_encoder_layer(device=device, dtype=backbone.config.dtype)
+        raise ValueError(f"Unsupported predictor attention mode: {attention_mode!r}")
 
     @staticmethod
     def _reset_projection_parameters(projection: nn.Linear) -> None:
@@ -145,11 +171,70 @@ class CrossAttentionPredictor(nn.Module):
         # Force predictor regularizers to zero without changing the backbone configuration.
         no_regularization = 0.0
         for block in self.blocks:
-            block = cast(Any, block)
-            block.drop_path_rate = no_regularization
-            block.cross_attention.dropout.p = no_regularization
-            block.cross_attention.attention_dropout.p = no_regularization
-            block.mlp.dropout.p = no_regularization
+            typed_block = cast(Any, block)
+            typed_block.drop_path_rate = no_regularization
+            for attention in self._attention_modules(block):
+                attention.dropout.p = no_regularization
+                attention.attention_dropout.p = no_regularization
+            typed_block.mlp.dropout.p = no_regularization
+
+    @staticmethod
+    def _attention_modules(block: nn.Module) -> tuple[Any, ...]:
+        typed_block = cast(Any, block)
+        return tuple(
+            attention
+            for attention_name in ("self_attention", "cross_attention")
+            if (attention := getattr(typed_block, attention_name, None)) is not None
+        )
+
+    @staticmethod
+    def _append_identity_rope(rope: Tensor, suffix_length: int) -> Tensor:
+        if suffix_length == 0:
+            return rope
+
+        sin, cos = rope
+        suffix_shape = (*sin.shape[:-2], suffix_length, sin.shape[-1])
+        sin_suffix = sin.new_zeros(suffix_shape)
+        cos_suffix = cos.new_ones(suffix_shape)
+        return torch.stack([torch.cat([sin, sin_suffix], dim=-2), torch.cat([cos, cos_suffix], dim=-2)], dim=0)
+
+    @staticmethod
+    def _prepare_encoder_inputs(
+        query: Tensor,
+        context: Tensor,
+        rope_q: Tensor | None,
+        rope_k: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None, int]:
+        query_length = query.shape[1]
+        combined = torch.cat([query, context], dim=1)
+        if rope_q is None:
+            return combined, None, query_length
+        if rope_k is None:
+            return combined, CrossAttentionPredictor._append_identity_rope(rope_q, context.shape[1]), query_length
+        return combined, torch.cat([rope_q, rope_k], dim=3), query_length
+
+    def _forward_encoder_blocks(
+        self,
+        query: Tensor,
+        context: Tensor,
+        rope_q: Tensor | None,
+        rope_k: Tensor | None,
+    ) -> Tensor:
+        combined, combined_rope, query_length = self._prepare_encoder_inputs(query, context, rope_q, rope_k)
+        for block in self.blocks:
+            combined = cast(Any, block)(combined, rope=combined_rope)
+        return combined[:, :query_length]
+
+    def _forward_cross_or_decoder_blocks(
+        self,
+        query: Tensor,
+        context: Tensor,
+        rope_q: Tensor | None,
+        rope_k: Tensor | None,
+    ) -> Tensor:
+        for block in self.blocks:
+            query = cast(Any, block)(query, context, rope_q=rope_q, rope_k=rope_k)
+        return query
 
     def forward_features(
         self,
@@ -170,10 +255,9 @@ class CrossAttentionPredictor(nn.Module):
             rope_q, rope_k = self.prepare_rope(tokenized_size, context_mask, target_mask, rope_seed=rope_seed)
 
             # Run query and context through predictor
-            for block in self.blocks:
-                query = block(query, context, rope_q=rope_q, rope_k=rope_k)
-
-            return query
+            if self.attention_mode == ENCODER_PREDICTOR_MODE:
+                return self._forward_encoder_blocks(query, context, rope_q, rope_k)
+            return self._forward_cross_or_decoder_blocks(query, context, rope_q, rope_k)
 
     def forward_heads(
         self,
@@ -551,6 +635,7 @@ class JEPAConfig:
             from this value to 1.0 over the course of training if scheduled is ``True``.
         scheduled: Whether to schedule the momentum.
         predictor_depth: Depth of the predictor network.
+        predictor_attention_mode: Predictor block attention mode.
         disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
             and attention dropout to ``0.0``.
         teacher_dtype: Optional dtype override for the teacher and Gram teacher weights.
@@ -573,6 +658,7 @@ class JEPAConfig:
     momentum: float = 0.99
     scheduled: bool = False
     predictor_depth: int = 4
+    predictor_attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE
     disable_predictor_regularizers: bool = False
     teacher_dtype: torch.dtype | str | None = None
     use_gram_anchoring: bool = False
@@ -592,6 +678,8 @@ class JEPAConfig:
             raise ValueError("context_ratio must be in the range (0, 1]")
         if not 0 < self.target_ratio <= 1:
             raise ValueError("target_ratio must be in the range (0, 1]")
+        if self.predictor_attention_mode not in PREDICTOR_ATTENTION_MODES:
+            raise ValueError(f"predictor_attention_mode must be one of {list(PREDICTOR_ATTENTION_MODES)}")
         if self.use_gram_anchoring and self.gram_start_epoch is None:
             raise ValueError("gram_start_epoch must be set when use_gram_anchoring is enabled")
         if self.gram_teacher_epoch <= 0:

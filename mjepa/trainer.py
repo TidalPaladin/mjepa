@@ -21,7 +21,13 @@ from tqdm import tqdm
 from vit import ViT
 from vit.pos_enc import LearnablePosition
 
-from .jepa import CrossAttentionPredictor
+from .jepa import (
+    CROSS_ATTENTION_PREDICTOR_MODE,
+    DECODER_PREDICTOR_MODE,
+    ENCODER_PREDICTOR_MODE,
+    CrossAttentionPredictor,
+    PredictorAttentionMode,
+)
 from .optimizer import (
     OptimizerLike,
     SchedulerLike,
@@ -256,6 +262,27 @@ def _predictor_shallow_head_mismatch(predictor: CrossAttentionPredictor, predict
     return (predictor.predictor_proj_shallow is not None) != _predictor_checkpoint_has_shallow_head(predictor_state)
 
 
+def _infer_predictor_checkpoint_attention_mode(
+    predictor_state: Mapping[str, Any],
+) -> PredictorAttentionMode | None:
+    has_self_attention = any(".self_attention." in key for key in predictor_state)
+    has_cross_attention = any(".cross_attention." in key for key in predictor_state)
+    if has_self_attention and has_cross_attention:
+        return DECODER_PREDICTOR_MODE
+    if has_self_attention:
+        return ENCODER_PREDICTOR_MODE
+    if has_cross_attention:
+        return CROSS_ATTENTION_PREDICTOR_MODE
+    return None
+
+
+def _predictor_attention_mode_mismatch(
+    predictor: CrossAttentionPredictor,
+    checkpoint_mode: PredictorAttentionMode | None,
+) -> bool:
+    return checkpoint_mode is not None and predictor.attention_mode != checkpoint_mode
+
+
 def load_checkpoint(
     path: os.PathLike,
     backbone: ViT,
@@ -294,11 +321,22 @@ def load_checkpoint(
     new_tokenized_size = backbone.stem.tokenized_size(backbone.config.img_size)
     step = int(data["step"])
     epoch = int(data["epoch"])
+    predictor_checkpoint_mode = (
+        _infer_predictor_checkpoint_attention_mode(data["predictor"])
+        if predictor is not None and data["predictor"] is not None
+        else None
+    )
 
     if mode == "resume" and predictor and _predictor_shallow_head_mismatch(predictor, data["predictor"]):
         raise ValueError(
             "Cannot resume across predictor shallow-head configuration changes; "
             "load with mode='fresh' or match stem-target settings."
+        )
+    if mode == "resume" and predictor and _predictor_attention_mode_mismatch(predictor, predictor_checkpoint_mode):
+        raise ValueError(
+            "Cannot resume across predictor attention-mode changes; "
+            f"checkpoint uses {predictor_checkpoint_mode!r} but current predictor uses {predictor.attention_mode!r}. "
+            "Load with mode='fresh' or match predictor_attention_mode."
         )
 
     # Validate image size

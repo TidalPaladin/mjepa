@@ -75,6 +75,11 @@ class MJEPA(nn.Module):
         self.config = config
         self.student = backbone
         teacher_dtype = config.teacher_dtype
+        if predictor.attention_mode != config.predictor_attention_mode:
+            raise ValueError(
+                "Predictor attention mode does not match JEPAConfig: "
+                f"{predictor.attention_mode!r} != {config.predictor_attention_mode!r}"
+            )
         self.teacher = setup_teacher(backbone, dtype=teacher_dtype)
         self.predictor = predictor
         if self._use_stem_targets():
