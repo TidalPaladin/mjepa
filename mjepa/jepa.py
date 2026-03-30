@@ -188,6 +188,17 @@ class CrossAttentionPredictor(nn.Module):
         )
 
     @staticmethod
+    def _append_identity_rope(rope: Tensor, suffix_length: int) -> Tensor:
+        if suffix_length == 0:
+            return rope
+
+        sin, cos = rope
+        suffix_shape = (*sin.shape[:-2], suffix_length, sin.shape[-1])
+        sin_suffix = sin.new_zeros(suffix_shape)
+        cos_suffix = cos.new_ones(suffix_shape)
+        return torch.stack([torch.cat([sin, sin_suffix], dim=-2), torch.cat([cos, cos_suffix], dim=-2)], dim=0)
+
+    @staticmethod
     def _prepare_encoder_inputs(
         query: Tensor,
         context: Tensor,
@@ -196,8 +207,10 @@ class CrossAttentionPredictor(nn.Module):
     ) -> tuple[Tensor, Tensor | None, int]:
         query_length = query.shape[1]
         combined = torch.cat([query, context], dim=1)
-        if rope_q is None or rope_k is None:
+        if rope_q is None:
             return combined, None, query_length
+        if rope_k is None:
+            return combined, CrossAttentionPredictor._append_identity_rope(rope_q, context.shape[1]), query_length
         return combined, torch.cat([rope_q, rope_k], dim=3), query_length
 
     def _forward_encoder_blocks(

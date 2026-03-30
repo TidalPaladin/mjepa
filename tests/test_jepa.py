@@ -665,6 +665,26 @@ class TestCrossAttentionPredictor:
         assert output.shape == (2, 16, 64)
         assert output.dtype == torch.float32
 
+    def test_encoder_mode_preserves_target_rope_without_context_mask(self):
+        """Test encoder mode keeps target-token RoPE and uses identity RoPE for non-spatial context."""
+        query = torch.randn(2, 16, 64)
+        cls_context = torch.randn(2, 4, 64)
+        rope_q = torch.randn(2, 2, 1, 16, 8)
+
+        combined, combined_rope, query_length = CrossAttentionPredictor._prepare_encoder_inputs(
+            query,
+            cls_context,
+            rope_q,
+            rope_k=None,
+        )
+
+        assert combined.shape == (2, 20, 64)
+        assert query_length == 16
+        assert combined_rope is not None
+        assert torch.equal(combined_rope[:, :, :, :16, :], rope_q)
+        assert torch.count_nonzero(combined_rope[0, :, :, 16:, :]) == 0
+        assert torch.equal(combined_rope[1, :, :, 16:, :], torch.ones_like(combined_rope[1, :, :, 16:, :]))
+
 
 class TestGenerateMasks:
     """Test generate_masks function."""
