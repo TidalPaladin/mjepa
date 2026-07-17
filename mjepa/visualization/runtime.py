@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt  # type: ignore[import]
 import numpy as np
 import torch
 import yaml
+from matplotlib.figure import Figure  # type: ignore[import]
 from vit import ViT, ViTConfig
 
 from mjepa.jepa import register_constructors
@@ -21,7 +22,7 @@ NUM_WARMUP_RUNS: Final = 3
 register_constructors()
 
 
-def plot_times(times: dict[Sequence[int], list[float]], device: torch.device, batch_size: int) -> plt.Figure:
+def plot_times(times: dict[Sequence[int], list[float]], device: torch.device, batch_size: int) -> Figure:
     """Create a box plot comparing inference times for different input sizes."""
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -60,7 +61,7 @@ def plot_times(times: dict[Sequence[int], list[float]], device: torch.device, ba
 
     # Add legend
     lines = [latency_line, throughput_line]
-    labels = [line.get_label() for line in lines]
+    labels = [str(line.get_label()) for line in lines]
     ax.legend(lines, labels, loc="center left")
 
     plt.tight_layout()
@@ -104,13 +105,13 @@ class RuntimeVisualizer:
         return times
 
     @torch.inference_mode()
-    def __call__(self) -> plt.Figure:
+    def __call__(self) -> Figure:
         assert not self.model.training, "Model must be in evaluation mode"
         times = {size: self._get_runtime(size) for size in self.sizes}
         return plot_times(times, self.device, self.batch_size)
 
     @torch.inference_mode()
-    def save(self, fig: plt.Figure, output: Path) -> None:
+    def save(self, fig: Figure, output: Path) -> None:
         fig.savefig(output, dpi=300, bbox_inches="tight")
 
     @classmethod

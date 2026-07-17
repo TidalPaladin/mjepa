@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
+from matplotlib.figure import Figure  # type: ignore[import]
 from torch import Tensor
 from vit import ViT, ViTConfig
 
@@ -21,7 +22,7 @@ from .pca import ExpandImagePathsAction, existing_file_type, output_path_type, t
 register_constructors()
 
 
-def create_norm_histogram(features: Tensor, register_tokens: Tensor) -> plt.Figure:
+def create_norm_histogram(features: Tensor, register_tokens: Tensor) -> Figure:
     # Compute L2 norms along the feature dimension
     feature_norms = torch.norm(features, p=2, dim=-1)  # Shape: (n, num_tokens)
     register_norms = torch.norm(register_tokens, p=2, dim=-1)  # Shape: (n, num_register_tokens)
@@ -78,7 +79,7 @@ class NormVisualizer:
         return features
 
     @torch.inference_mode()
-    def __call__(self, img: Tensor) -> plt.Figure:
+    def __call__(self, img: Tensor) -> Figure:
         assert not self.model.training, "Model must be in evaluation mode"
         img = img.to(self.device)
         img = F.interpolate(img, size=self.size, mode="bilinear", align_corners=False)
@@ -88,7 +89,7 @@ class NormVisualizer:
         return create_norm_histogram(features, register_tokens)
 
     @torch.inference_mode()
-    def save(self, fig: plt.Figure, output: Path) -> None:
+    def save(self, fig: Figure, output: Path) -> None:
         fig.savefig(output, dpi=300, bbox_inches="tight")
 
     @classmethod
