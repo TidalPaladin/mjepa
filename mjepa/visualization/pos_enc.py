@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt  # type: ignore[import]
 import safetensors.torch as st
 import torch
 import yaml
+from matplotlib.figure import Figure  # type: ignore[import]
 from torch import Tensor
 from vit import ViT, ViTConfig
 
@@ -19,7 +20,7 @@ from .pca import existing_file_type, output_path_type, torch_dtype_type
 register_constructors()
 
 
-def create_pos_enc_maps(positions: Tensor) -> plt.Figure:
+def create_pos_enc_maps(positions: Tensor) -> Figure:
     # Get shape and flatten leading dimensions
     *spatial, dim = positions.shape
     flat = positions.reshape(-1, dim)
@@ -86,13 +87,13 @@ class PositionVisualizer:
         return positions.view(*size, -1).float()
 
     @torch.inference_mode()
-    def __call__(self) -> plt.Figure:
+    def __call__(self) -> Figure:
         assert not self.model.training, "Model must be in evaluation mode"
         positions = self._get_positions()
         return create_pos_enc_maps(positions)
 
     @torch.inference_mode()
-    def save(self, fig: plt.Figure, output: Path) -> None:
+    def save(self, fig: Figure, output: Path) -> None:
         fig.savefig(output, dpi=300, bbox_inches="tight")
 
     @classmethod

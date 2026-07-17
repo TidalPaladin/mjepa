@@ -390,7 +390,8 @@ def update_teacher(student: nn.Module, teacher: nn.Module, momentum: float = 0.0
         for teacher_param, student_param in zip(teacher_params, student_params)
     )
     if matching_dtypes:
-        torch._foreach_lerp_(teacher_params, student_params, weight)
+        # PyTorch documents foreach operations as beta, but its type stubs do not export this symbol.
+        torch._foreach_lerp_(teacher_params, student_params, weight)  # pyright: ignore[reportPrivateImportUsage]
         return
 
     for teacher_param, student_param in zip(teacher_params, student_params):

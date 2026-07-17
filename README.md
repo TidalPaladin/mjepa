@@ -1,34 +1,49 @@
 # MJEPA
 
-Library implementing MJEPA, a JEPA-based architecture for self supervised pre-training of vision transformer models.
+MJEPA is a Python library implementing a JEPA-based architecture for self-supervised pre-training of vision
+transformers.
 
-## Usage
+## Requirements
 
-1. Rename [project](./project) to the desired project name
-2. Update the `$PROJECT` variable in [Makefile](./Makefile) to match step 1
-3. Run `pdm init` to configure [pyproject.toml](./pyproject.toml)
-4. Add source code to the renamed `project` folder
-5. Run `make init` to install the project to a `pdm` virtual environment
-6. You can execute commands from the `pdm` environment with `pdm run`
+- CPython 3.11 through 3.14.
+- `uv>=0.11.28,<0.12`.
+- CUDA is optional; CUDA-marked tests run only when a compatible device is available.
 
-## Recipes
-* `make style` - Runs code style formatting
-* `make quality` - Tests that code complies with quality standards
-* `make types` - Run static type checking with [pyright](https://github.com/microsoft/pyright)
-* `make test` - Run unit tests
-* `make test-pdb-*` - Run unit tests matching pattern `*` with fallback to [`pdb`](https://docs.python.org/3/library/pdb.html)
-  for debugging.
-* `make deploy` - Install dependencies from `pdm` lockfile
+The package supports Python 3.11–3.14, while CircleCI validates Python 3.14.6.
 
-## Optional steps
-* Setup CI - a template CircleCI config is provided in `.circeci/config.yml`
-* Create `config.mk` - secrets or per-user configuration can go here.
-  Template `config.mk.example` is under version control, but `config.mk`
-  is in `.gitignore`. Add `$(CONFIG_FILE)` as a make dependencies for recipes that
-  need vars from `config.mk`.
+## Installation
 
-## Misc
+Set up a contributor environment with every development group and optional feature:
 
-* Run `make help` to get a partial list of available make recipes
-* A pytest mark, `ci_skip`, is provided to mark tests that should be skipped 
-  during CI pipelines
+```bash
+make init
+```
+
+For a runtime-only environment, use `uv sync`. Optional features can be installed independently:
+
+```bash
+uv sync --extra visualization
+uv sync --extra dicom
+```
+
+The `visualization` extra provides Matplotlib-based analysis tools. The `dicom` extra provides TIFF/DICOM loading
+through `dicom-preprocessing`.
+
+## Configuration
+
+[`config.yaml`](./config.yaml) contains a runnable CIFAR-10 ViT-S/4 example using the library's YAML constructors.
+It defines the trainer, ViT backbone and heads, JEPA behavior, and optimizer settings.
+
+## Development Commands
+
+- `make check` formats the source, then runs lint, formatting, type, and test gates.
+- `make style` applies Ruff lint fixes and formatting.
+- `make quality` checks Ruff lint and formatting without rewriting source files.
+- `make types` runs basedpyright over `mjepa/` and `tests/`.
+- `make test` runs the full pytest suite with terminal coverage.
+- `make test-ci` forces CPU execution, excludes `ci_skip` tests, and writes `coverage.xml`.
+- `make test-<pattern>` runs tests matching a pytest expression, such as `make test-model`.
+- `make test-pdb-<pattern>` runs a matching subset with PDB fallback.
+
+CircleCI runs quality checks and the CPU test/type gates on Python 3.14.6. CUDA-marked tests should also be run
+locally before changes that affect model execution or device/dtype behavior.

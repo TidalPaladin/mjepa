@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from einops import rearrange, reduce
+from matplotlib.colors import Colormap  # type: ignore[import]
 from torch import Tensor
 from torchvision.transforms.v2.functional import to_pil_image
 from torchvision.utils import make_grid, save_image
@@ -38,6 +39,8 @@ def pca_topk(features: Tensor, offset: int = 0, k: int = 3, normalize: Sequence[
     Returns:
         Top k principal components
     """
+    features = features.float()
+
     # Center the features
     features_mean = reduce(features, "n ht wt d -> d", "mean")
     features = features - features_mean
@@ -184,7 +187,8 @@ class PCAVisualizer:
         return features
 
     def _apply_colormap(self, x: Tensor) -> Tensor:
-        x = torch.from_numpy(plt.cm.inferno(x.squeeze().cpu())[..., :3]).float()
+        colormap: Colormap = plt.get_cmap("inferno")
+        x = torch.from_numpy(colormap(x.squeeze().cpu().numpy())[..., :3]).float()
         x = rearrange(x, "... h w c -> ... c h w").to(self.device)
         return x
 

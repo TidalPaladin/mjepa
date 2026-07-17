@@ -24,8 +24,7 @@ clean-env: ## remove the virtual environment directory
 
 init: ## pulls submodules and initializes virtual environment
 	git submodule update --init --recursive
-	which uv || pip install --user uv
-	uv sync --all-groups
+	uv sync --all-groups --all-extras
 
 quality:
 	$(MAKE) clean

@@ -11,6 +11,7 @@ matplotlib = pytest.importorskip("matplotlib")
 matplotlib.use("Agg")  # Use non-interactive backend for testing
 
 import matplotlib.pyplot as plt  # type: ignore[import]  # noqa: E402
+from matplotlib.figure import Figure  # type: ignore[import]  # noqa: E402
 
 from mjepa.visualization.cosine import cosine_similarity_heatmap, load_image as cosine_load_image  # noqa: E402
 from mjepa.visualization.norm import create_norm_histogram  # noqa: E402
@@ -22,6 +23,7 @@ from mjepa.visualization.runtime import plot_times  # noqa: E402
 TEST_IMAGE_SIZE = (8, 8)
 TEST_IMAGE_PATH = Path("missing-image.tiff")
 MISSING_DICOM_IMPORT_HINT = "pip install mjepa\\[dicom\\]"
+EXPECTED_POSITION_MAP_COUNT = 5
 
 
 class TestPCATopK:
@@ -181,7 +183,7 @@ class TestCreateNormHistogram:
 
         fig = create_norm_histogram(features, register_tokens)
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_different_input_shapes(self):
@@ -191,7 +193,7 @@ class TestCreateNormHistogram:
 
         fig = create_norm_histogram(features, register_tokens)
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_single_batch(self):
@@ -201,7 +203,7 @@ class TestCreateNormHistogram:
 
         fig = create_norm_histogram(features, register_tokens)
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_figure_has_axes(self):
@@ -224,7 +226,7 @@ class TestCreatePosEncMaps:
 
         fig = create_pos_enc_maps(positions)
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_different_spatial_sizes(self):
@@ -233,7 +235,7 @@ class TestCreatePosEncMaps:
 
         fig = create_pos_enc_maps(positions)
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_small_spatial_size(self):
@@ -242,7 +244,7 @@ class TestCreatePosEncMaps:
 
         fig = create_pos_enc_maps(positions)
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_figure_has_five_subplots(self):
@@ -251,8 +253,8 @@ class TestCreatePosEncMaps:
 
         fig = create_pos_enc_maps(positions)
 
-        # Should have 5 subplots: 4 corners + center
-        assert len(fig.axes) == 5
+        plot_axes = [axis for axis in fig.axes if axis.get_label() != "<colorbar>"]
+        assert len(plot_axes) == EXPECTED_POSITION_MAP_COUNT
         plt.close(fig)
 
     def test_non_square_spatial_size(self):
@@ -261,7 +263,7 @@ class TestCreatePosEncMaps:
 
         fig = create_pos_enc_maps(positions)
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
 
@@ -279,7 +281,7 @@ class TestPlotTimes:
 
         fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_single_size(self):
@@ -291,7 +293,7 @@ class TestPlotTimes:
 
         fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_times_in_milliseconds(self):
@@ -304,7 +306,7 @@ class TestPlotTimes:
 
         fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_times_in_seconds(self):
@@ -317,7 +319,7 @@ class TestPlotTimes:
 
         fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_different_batch_sizes(self):
@@ -329,7 +331,7 @@ class TestPlotTimes:
 
         fig = plot_times(times, device, batch_size=8)  # type: ignore[arg-type]
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
     def test_figure_has_axes(self):
@@ -355,7 +357,7 @@ class TestPlotTimes:
 
         fig = plot_times(times, device, batch_size=1)  # type: ignore[arg-type]
 
-        assert isinstance(fig, plt.Figure)
+        assert isinstance(fig, Figure)
         plt.close(fig)
 
 
