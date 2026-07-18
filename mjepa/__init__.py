@@ -3,7 +3,7 @@ import importlib.metadata
 from .jepa import CrossAttentionPredictor, JEPAConfig, PredictorAttentionMode
 from .metrics import CLSPatchAlignmentMetric, SimilarityDistanceCouplingMetric
 from .optimizer import OptimizerConfig
-from .trainer import ResolutionConfig, TrainerConfig
+from .trainer import CheckpointMetadata, ResolutionConfig, TrainerConfig, load_checkpoint_metadata
 
 
 __version__ = importlib.metadata.version("mjepa")
@@ -16,4 +16,6 @@ __all__ = [
     "ResolutionConfig",
     "CLSPatchAlignmentMetric",
     "SimilarityDistanceCouplingMetric",
+    "CheckpointMetadata",
+    "load_checkpoint_metadata",
 ]

@@ -14,6 +14,7 @@ from vit import ViTConfig
 
 from mjepa.jepa import CROSS_ATTENTION_PREDICTOR_MODE, DECODER_PREDICTOR_MODE, CrossAttentionPredictor
 from mjepa.trainer import (
+    CheckpointMetadata,
     ResolutionConfig,
     TrainerConfig,
     _normalize_predictor_checkpoint_state,
@@ -24,6 +25,7 @@ from mjepa.trainer import (
     format_pbar_description,
     is_rank_zero,
     load_checkpoint,
+    load_checkpoint_metadata,
     rank_zero_only,
     save_checkpoint,
     seed_everything,
@@ -455,6 +457,65 @@ class TestSaveCheckpoint:
             assert checkpoint["step"] == 100
             assert checkpoint["epoch"] == 5
 
+    def test_save_checkpoint_records_elapsed_seconds(self, checkpoint_components, tmp_path: Path):
+        backbone, predictor, teacher, optimizer, scheduler = checkpoint_components
+        path = tmp_path / "checkpoint.pt"
+
+        save_checkpoint(
+            path,
+            backbone=backbone,
+            predictor=predictor,
+            teacher=teacher,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step=100,
+            epoch=5,
+            elapsed_seconds=123.5,
+        )
+
+        checkpoint = torch.load(path, weights_only=False)
+        assert checkpoint["elapsed_seconds"] == 123.5
+
+    def test_save_checkpoint_records_wandb_run_id(self, checkpoint_components, tmp_path: Path):
+        backbone, predictor, teacher, optimizer, scheduler = checkpoint_components
+        checkpoint_path = tmp_path / "checkpoint.pt"
+
+        save_checkpoint(
+            checkpoint_path,
+            backbone,
+            predictor,
+            teacher,
+            optimizer,
+            scheduler,
+            step=1,
+            epoch=0,
+            wandb_run_id="wandb-123",
+        )
+
+        assert load_checkpoint_metadata(checkpoint_path).wandb_run_id == "wandb-123"
+
+    def test_save_checkpoint_writes_temporary_file_before_replace(self, checkpoint_components, tmp_path: Path):
+        backbone, predictor, teacher, optimizer, scheduler = checkpoint_components
+        path = tmp_path / "checkpoint.pt"
+
+        with patch("mjepa.trainer.torch.save", wraps=torch.save) as torch_save:
+            save_checkpoint(
+                path,
+                backbone=backbone,
+                predictor=predictor,
+                teacher=teacher,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=100,
+                epoch=5,
+            )
+
+        temporary_path = Path(torch_save.call_args.args[1])
+        assert temporary_path != path
+        assert temporary_path.parent == path.parent
+        assert not temporary_path.exists()
+        assert path.is_file()
+
     def test_save_checkpoint_invalid_directory(self, checkpoint_components):
         """Test save_checkpoint raises error for invalid directory."""
         backbone, predictor, teacher, optimizer, scheduler = checkpoint_components
@@ -554,6 +615,79 @@ class TestCheckpointStateCompatibility:
 
         with pytest.raises(ValueError, match="scheduler kind"):
             _validate_checkpoint_optimizer_and_scheduler_kinds(checkpoint, optimizer, scheduler)
+
+
+def test_resume_uses_checkpoint_image_size(tmp_path: Path):
+    config = ViTConfig(
+        in_channels=3,
+        hidden_size=64,
+        patch_size=[4, 4],
+        img_size=[32, 32],
+        depth=2,
+        num_attention_heads=4,
+        ffn_hidden_size=128,
+        pos_enc="rope",
+        dtype=torch.float32,
+    )
+    backbone = config.instantiate()
+    predictor = CrossAttentionPredictor(backbone, depth=2)
+    teacher = config.instantiate()
+    optimizer = AdamW(backbone.parameters(), lr=1e-3)
+    scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+    path = tmp_path / "checkpoint.pt"
+    save_checkpoint(path, backbone, predictor, teacher, optimizer, scheduler, step=7, epoch=3)
+
+    resumed_backbone = config.instantiate()
+    resumed_predictor = CrossAttentionPredictor(resumed_backbone, depth=2)
+    resumed_teacher = config.instantiate()
+    resumed_optimizer = AdamW(resumed_backbone.parameters(), lr=1e-3)
+    resumed_scheduler = LinearLR(resumed_optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+    step, epoch = load_checkpoint(
+        path,
+        resumed_backbone,
+        resumed_predictor,
+        resumed_teacher,
+        resumed_optimizer,
+        resumed_scheduler,
+    )
+
+    assert (step, epoch) == (7, 3)
+
+
+def test_checkpoint_metadata_recovers_resume_provenance(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "step": 17,
+            "epoch": 4,
+            "img_size": [32, 32],
+            "elapsed_seconds": 91.25,
+            "wandb_run_id": "wandb-123",
+        },
+        checkpoint_path,
+    )
+
+    metadata = load_checkpoint_metadata(checkpoint_path)
+
+    assert metadata == CheckpointMetadata(
+        step=17,
+        epoch=4,
+        img_size=(32, 32),
+        elapsed_seconds=91.25,
+        wandb_run_id="wandb-123",
+    )
+
+
+def test_checkpoint_metadata_defaults_legacy_fields(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save({"step": 2, "epoch": 0}, checkpoint_path)
+
+    metadata = load_checkpoint_metadata(checkpoint_path)
+
+    assert metadata.elapsed_seconds == 0.0
+    assert metadata.wandb_run_id is None
+    assert metadata.img_size is None
 
 
 class TestPredictorCheckpointCompatibility:
