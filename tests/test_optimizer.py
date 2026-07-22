@@ -74,6 +74,7 @@ class TestOptimizerConfigInit:
         assert config.foreach is None
         assert config.eps == 1e-8
         assert config.adamw_lr is None
+        assert config.adamw_weight_decay is None
         assert config.muon_momentum == 0.95
         assert config.muon_nesterov is True
         assert config.muon_ns_coefficients == (3.4445, -4.7750, 2.0315)
@@ -102,6 +103,7 @@ class TestOptimizerConfigInit:
             foreach=True,
             eps=1e-6,
             adamw_lr=1e-4,
+            adamw_weight_decay=0.02,
             muon_momentum=0.9,
             muon_nesterov=False,
             muon_ns_coefficients=(3.0, -4.0, 2.0),
@@ -127,6 +129,7 @@ class TestOptimizerConfigInit:
         assert config.foreach is True
         assert config.eps == 1e-6
         assert config.adamw_lr == 1e-4
+        assert config.adamw_weight_decay == 0.02
         assert config.muon_momentum == 0.9
         assert config.muon_nesterov is False
         assert config.muon_ns_coefficients == (3.0, -4.0, 2.0)
@@ -460,6 +463,27 @@ class TestOptimizerConfigInstantiate:
         assert isinstance(optimizer, CompositeOptimizer)
         assert optimizer.optimizers[MUON_COMPONENT_NAME].defaults["lr"] == muon_lr
         assert optimizer.optimizers[ADAMW_COMPONENT_NAME].defaults["lr"] == adamw_lr
+
+    @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
+    def test_instantiate_hybrid_muon_with_explicit_adamw_weight_decay(self, simple_model):
+        """Test hybrid mode can isolate Muon weight decay from its AdamW branch."""
+        muon_weight_decay = 0.1
+        adamw_weight_decay = 0.2
+        config = OptimizerConfig(
+            lr=1e-3,
+            weight_decay=muon_weight_decay,
+            adamw_weight_decay=adamw_weight_decay,
+            betas=(0.9, 0.999),
+            kind=HYBRID_MUON_OPTIMIZER_KIND,
+            scheduled=False,
+            fused=False,
+        )
+
+        optimizer, _ = config.instantiate(simple_model, total_steps=1000)
+
+        assert isinstance(optimizer, CompositeOptimizer)
+        assert optimizer.optimizers[MUON_COMPONENT_NAME].defaults["weight_decay"] == muon_weight_decay
+        assert optimizer.optimizers[ADAMW_COMPONENT_NAME].defaults["weight_decay"] == adamw_weight_decay
 
     @pytest.mark.skipif(not hasattr(torch.optim, "Muon"), reason="torch.optim.Muon unavailable")
     def test_hybrid_muon_preserves_skip_weight_decay_on_1d(self, simple_model):
