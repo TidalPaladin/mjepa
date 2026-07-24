@@ -26,6 +26,8 @@ from .jepa import (
     CROSS_ATTENTION_PREDICTOR_MODE,
     DECODER_PREDICTOR_MODE,
     ENCODER_PREDICTOR_MODE,
+    LEGACY_CLS_PREDICTION_MODE,
+    CLSPredictionMode,
     CrossAttentionPredictor,
     PredictorAttentionMode,
 )
@@ -51,6 +53,7 @@ class CheckpointMetadata:
     img_size: tuple[int, int] | None
     elapsed_seconds: float
     wandb_run_id: str | None
+    cls_prediction_mode: CLSPredictionMode = LEGACY_CLS_PREDICTION_MODE
 
 
 def seed_everything(seed: int) -> None:
@@ -208,6 +211,7 @@ def save_checkpoint(
         img_size=backbone.config.img_size if hasattr(backbone.config, "img_size") else None,
         elapsed_seconds=elapsed_seconds,
         wandb_run_id=wandb_run_id,
+        cls_prediction_mode=(predictor.cls_prediction_mode if predictor is not None else LEGACY_CLS_PREDICTION_MODE),
     )
     temporary_path: Path | None = None
     try:
@@ -238,6 +242,7 @@ def load_checkpoint_metadata(path: os.PathLike) -> CheckpointMetadata:
         img_size=img_size,
         elapsed_seconds=float(data.get("elapsed_seconds", 0.0)),
         wandb_run_id=data.get("wandb_run_id"),
+        cls_prediction_mode=data.get("cls_prediction_mode", LEGACY_CLS_PREDICTION_MODE),
     )
 
 
@@ -329,6 +334,13 @@ def _predictor_attention_mode_mismatch(
     return checkpoint_mode is not None and predictor.attention_mode != checkpoint_mode
 
 
+def _predictor_cls_prediction_mode_mismatch(
+    predictor: CrossAttentionPredictor,
+    checkpoint_mode: CLSPredictionMode,
+) -> bool:
+    return predictor.cls_prediction_mode != checkpoint_mode
+
+
 def load_checkpoint(
     path: os.PathLike,
     backbone: ViT,
@@ -374,6 +386,7 @@ def load_checkpoint(
         if predictor is not None and data["predictor"] is not None
         else None
     )
+    checkpoint_cls_prediction_mode = data.get("cls_prediction_mode", LEGACY_CLS_PREDICTION_MODE)
 
     if mode == "resume" and predictor and _predictor_shallow_head_mismatch(predictor, data["predictor"]):
         raise ValueError(
@@ -385,6 +398,16 @@ def load_checkpoint(
             "Cannot resume across predictor attention-mode changes; "
             f"checkpoint uses {predictor_checkpoint_mode!r} but current predictor uses {predictor.attention_mode!r}. "
             "Load with mode='fresh' or match predictor_attention_mode."
+        )
+    if (
+        mode == "resume"
+        and predictor
+        and _predictor_cls_prediction_mode_mismatch(predictor, checkpoint_cls_prediction_mode)
+    ):
+        raise ValueError(
+            "Cannot resume across predictor CLS-prediction-mode changes; "
+            f"checkpoint uses {checkpoint_cls_prediction_mode!r} but current predictor uses "
+            f"{predictor.cls_prediction_mode!r}. Load with mode='fresh' or match cls_prediction_mode."
         )
 
     # Validate image size

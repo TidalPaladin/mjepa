@@ -8,6 +8,9 @@ from vit import ViT, ViTFeatures
 from vit.tokens import apply_mask
 
 from .jepa import (
+    ADALN_BLIND_CLS_PREDICTION_MODE,
+    ADALN_CLS_PREDICTION_MODES,
+    ADALN_SHARED_CLS_PREDICTION_MODE,
     CrossAttentionPredictor,
     JEPAConfig,
     autocast_context,
@@ -80,6 +83,15 @@ class MJEPA(nn.Module):
                 "Predictor attention mode does not match JEPAConfig: "
                 f"{predictor.attention_mode!r} != {config.predictor_attention_mode!r}"
             )
+        if predictor.cls_prediction_mode != config.cls_prediction_mode:
+            raise ValueError(
+                "Predictor CLS prediction mode does not match JEPAConfig: "
+                f"{predictor.cls_prediction_mode!r} != {config.cls_prediction_mode!r}"
+            )
+        if config.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES and backbone.config.num_cls_tokens != 1:
+            raise ValueError(
+                f"AdaLN CLS prediction requires exactly one CLS token, got {backbone.config.num_cls_tokens}"
+            )
         self.teacher = setup_teacher(backbone, dtype=teacher_dtype)
         self.predictor = predictor
         if self._use_stem_targets():
@@ -118,9 +130,17 @@ class MJEPA(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        conditioning: Tensor | None = None,
     ) -> Tensor:
         with autocast_context(context.device.type, self.autocast_dtype):
-            return self.predictor(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+            return self.predictor(
+                tokenized_size,
+                context,
+                context_mask,
+                target_mask,
+                rope_seed=rope_seed,
+                conditioning=conditioning,
+            )
 
     def forward_predictor_heads(
         self,
@@ -129,9 +149,26 @@ class MJEPA(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        conditioning: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         with autocast_context(context.device.type, self.autocast_dtype):
-            return self.predictor.forward_heads(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+            return self.predictor.forward_heads(
+                tokenized_size,
+                context,
+                context_mask,
+                target_mask,
+                rope_seed=rope_seed,
+                conditioning=conditioning,
+            )
+
+    def forward_blind_cls_predictor(
+        self,
+        tokenized_size: tuple[int, int],
+        conditioning: Tensor,
+        target_mask: Tensor,
+    ) -> Tensor:
+        with autocast_context(conditioning.device.type, self.autocast_dtype):
+            return self.predictor.forward_blind(tokenized_size, conditioning, target_mask)
 
     @staticmethod
     def _has_cls_tokens(features: ViTFeatures) -> bool:
@@ -267,14 +304,31 @@ class MJEPA(nn.Module):
 
         student_output = self.forward_student(x, context_mask, rope_seed=rope_seed)
         student_has_cls_tokens = self._has_cls_tokens(student_output)
+        cls_conditioning = student_output.cls_tokens[:, 0] if student_has_cls_tokens else None
+        main_conditioning = None
+        if self.config.cls_prediction_mode == ADALN_BLIND_CLS_PREDICTION_MODE:
+            assert cls_conditioning is not None
+            main_conditioning = torch.zeros_like(cls_conditioning)
+        elif self.config.cls_prediction_mode == ADALN_SHARED_CLS_PREDICTION_MODE:
+            assert cls_conditioning is not None
+            main_conditioning = cls_conditioning
         pred, stem_pred = self.forward_predictor_heads(
-            (Ht, Wt), student_output.visual_tokens, context_mask, target_mask, rope_seed=rope_seed
+            (Ht, Wt),
+            student_output.visual_tokens,
+            context_mask,
+            target_mask,
+            rope_seed=rope_seed,
+            conditioning=main_conditioning,
         )
-        pred_with_cls = (
-            self.forward_predictor((Ht, Wt), student_output.cls_tokens, None, target_mask, rope_seed=rope_seed)
-            if student_has_cls_tokens
-            else None
-        )
+        if self.config.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES:
+            assert cls_conditioning is not None
+            pred_with_cls = self.forward_blind_cls_predictor((Ht, Wt), cls_conditioning, target_mask)
+        else:
+            pred_with_cls = (
+                self.forward_predictor((Ht, Wt), student_output.cls_tokens, None, target_mask, rope_seed=rope_seed)
+                if student_has_cls_tokens
+                else None
+            )
 
         with autocast_context(pred.device.type, self.autocast_dtype):
             probes = self.forward_probe(teacher_output)

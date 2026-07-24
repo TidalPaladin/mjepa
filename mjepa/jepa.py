@@ -12,6 +12,7 @@ from torch import Tensor
 from vit import ViT
 from vit.pos_enc import LearnablePosition
 from vit.tokens import apply_mask, generate_non_overlapping_mask
+from vit.transformer import CrossAttentionTransformer
 
 
 torch._dynamo.config.cache_size_limit = 1024 * 1024 * 1024 * 1024
@@ -37,6 +38,16 @@ PREDICTOR_ATTENTION_MODES: tuple[PredictorAttentionMode, ...] = (
     DECODER_PREDICTOR_MODE,
     ENCODER_PREDICTOR_MODE,
 )
+LEGACY_CLS_PREDICTION_MODE = "legacy_cross_attention"
+ADALN_BLIND_CLS_PREDICTION_MODE = "adaln_blind"
+ADALN_SHARED_CLS_PREDICTION_MODE = "adaln_shared"
+CLSPredictionMode: TypeAlias = Literal["legacy_cross_attention", "adaln_blind", "adaln_shared"]
+CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
+    LEGACY_CLS_PREDICTION_MODE,
+    ADALN_BLIND_CLS_PREDICTION_MODE,
+    ADALN_SHARED_CLS_PREDICTION_MODE,
+)
+ADALN_CLS_PREDICTION_MODES = (ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE)
 
 
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
@@ -88,6 +99,8 @@ class CrossAttentionPredictor(nn.Module):
         attention_mode: Predictor attention mode. ``"cross_attention"`` keeps the current behavior,
             ``"decoder"`` adds self-attention over target queries before cross-attention, and
             ``"encoder"`` runs self-attention over the concatenated query/context sequence.
+        cls_prediction_mode: CLS auxiliary-prediction path. AdaLN modes condition the shared
+            predictor MLPs and expose a visually blinded MLP-only prediction path.
     """
 
     def __init__(
@@ -98,20 +111,28 @@ class CrossAttentionPredictor(nn.Module):
         device: torch.device | None = None,
         disable_predictor_regularizers: bool = False,
         attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE,
+        cls_prediction_mode: CLSPredictionMode = LEGACY_CLS_PREDICTION_MODE,
     ):
         super().__init__()
         if attention_mode not in PREDICTOR_ATTENTION_MODES:
             raise ValueError(f"attention_mode must be one of {list(PREDICTOR_ATTENTION_MODES)}")
+        if cls_prediction_mode not in CLS_PREDICTION_MODES:
+            raise ValueError(f"cls_prediction_mode must be one of {list(CLS_PREDICTION_MODES)}")
+        if cls_prediction_mode in ADALN_CLS_PREDICTION_MODES and attention_mode != CROSS_ATTENTION_PREDICTOR_MODE:
+            raise ValueError("AdaLN CLS prediction requires attention_mode='cross_attention'")
         factory_kwargs = {"device": device, "dtype": backbone.config.dtype}
         self.hidden_size = backbone.config.hidden_size
         self.out_dim = out_dim or backbone.config.hidden_size
         self.attention_mode = attention_mode
+        self.cls_prediction_mode = cls_prediction_mode
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size, **factory_kwargs)
         self.rope = backbone.rope
 
         # Predictor blocks and output projection
-        self.blocks = nn.ModuleList([self._create_block(backbone, device, attention_mode) for _ in range(depth)])
+        self.blocks = nn.ModuleList(
+            [self._create_block(backbone, device, attention_mode, cls_prediction_mode) for _ in range(depth)]
+        )
         if disable_predictor_regularizers:
             self._disable_predictor_regularizers()
 
@@ -127,8 +148,30 @@ class CrossAttentionPredictor(nn.Module):
         backbone: ViT,
         device: torch.device | None,
         attention_mode: PredictorAttentionMode,
+        cls_prediction_mode: CLSPredictionMode,
     ) -> nn.Module:
         if attention_mode == CROSS_ATTENTION_PREDICTOR_MODE:
+            if cls_prediction_mode in ADALN_CLS_PREDICTION_MODES:
+                return CrossAttentionTransformer(
+                    hidden_size=backbone.config.hidden_size,
+                    ffn_hidden_size=backbone.config.ffn_hidden_size,
+                    num_attention_heads=backbone.config.num_attention_heads,
+                    hidden_dropout=backbone.config.hidden_dropout,
+                    attention_dropout=backbone.config.attention_dropout,
+                    attention_bias=backbone.config.attention_bias,
+                    mlp_bias=backbone.config.mlp_bias,
+                    activation=backbone.config.activation,
+                    norm_type=backbone.config.norm_type,
+                    qk_normalization=backbone.config.qk_normalization,
+                    drop_path_rate=backbone.config.drop_path_rate,
+                    layer_scale=backbone.config.layer_scale,
+                    glu_limit=backbone.config.glu_limit,
+                    glu_extra_bias=backbone.config.glu_extra_bias,
+                    device=device,
+                    dtype=backbone.config.dtype,
+                    conditioning_size=backbone.config.hidden_size,
+                    adaln_gate_init=0.0,
+                )
             return backbone.create_cross_attention_layer(device=device, dtype=backbone.config.dtype)
         if attention_mode == DECODER_PREDICTOR_MODE:
             return backbone.create_decoder_layer(device=device, dtype=backbone.config.dtype)
@@ -231,10 +274,37 @@ class CrossAttentionPredictor(nn.Module):
         context: Tensor,
         rope_q: Tensor | None,
         rope_k: Tensor | None,
+        conditioning: Tensor | None = None,
     ) -> Tensor:
         for block in self.blocks:
-            query = cast(Any, block)(query, context, rope_q=rope_q, rope_k=rope_k)
+            if self.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES:
+                query = cast(Any, block)(
+                    query,
+                    context,
+                    rope_q=rope_q,
+                    rope_k=rope_k,
+                    conditioning=conditioning,
+                )
+            else:
+                query = cast(Any, block)(query, context, rope_q=rope_q, rope_k=rope_k)
         return query
+
+    def _target_queries(self, tokenized_size: tuple[int, int], target_mask: Tensor) -> Tensor:
+        batch_size, _ = target_mask.shape
+        positions = self.pos_enc_target(tokenized_size).expand(batch_size, -1, -1)
+        return apply_mask(target_mask, positions).to(dtype=self.predictor_dtype)
+
+    def _prepare_conditioning(self, conditioning: Tensor | None, batch_size: int) -> Tensor | None:
+        if self.cls_prediction_mode not in ADALN_CLS_PREDICTION_MODES:
+            if conditioning is not None:
+                raise ValueError("conditioning is only supported by AdaLN CLS prediction modes")
+            return None
+        if conditioning is None:
+            raise ValueError("conditioning is required for AdaLN CLS prediction")
+        expected_shape = (batch_size, self.hidden_size)
+        if conditioning.ndim != 2 or tuple(conditioning.shape) != expected_shape:
+            raise ValueError(f"conditioning must have shape {expected_shape}, got {tuple(conditioning.shape)}")
+        return conditioning.to(dtype=self.predictor_dtype)
 
     def forward_features(
         self,
@@ -243,21 +313,19 @@ class CrossAttentionPredictor(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        conditioning: Tensor | None = None,
     ) -> Tensor:
         with autocast_context(context.device.type, self.predictor_dtype):
-            # Create positional encodings
-            B, _ = target_mask.shape
-            pos_target = apply_mask(target_mask, self.pos_enc_target(tokenized_size).expand(B, -1, -1))
-
             # Prepare inputs
-            query = pos_target.to(dtype=self.predictor_dtype)
+            query = self._target_queries(tokenized_size, target_mask)
             context = context.to(dtype=self.predictor_dtype)
+            conditioning = self._prepare_conditioning(conditioning, target_mask.shape[0])
             rope_q, rope_k = self.prepare_rope(tokenized_size, context_mask, target_mask, rope_seed=rope_seed)
 
             # Run query and context through predictor
             if self.attention_mode == ENCODER_PREDICTOR_MODE:
                 return self._forward_encoder_blocks(query, context, rope_q, rope_k)
-            return self._forward_cross_or_decoder_blocks(query, context, rope_q, rope_k)
+            return self._forward_cross_or_decoder_blocks(query, context, rope_q, rope_k, conditioning)
 
     def forward_heads(
         self,
@@ -266,8 +334,16 @@ class CrossAttentionPredictor(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        conditioning: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
-        query = self.forward_features(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+        query = self.forward_features(
+            tokenized_size,
+            context,
+            context_mask,
+            target_mask,
+            rope_seed=rope_seed,
+            conditioning=conditioning,
+        )
         with autocast_context(query.device.type, self.predictor_dtype):
             deep_output = self.predictor_proj(query).float()
             shallow_output = self._project(query, self.predictor_proj_shallow)
@@ -280,9 +356,35 @@ class CrossAttentionPredictor(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        conditioning: Tensor | None = None,
     ) -> Tensor:
-        deep_output, _ = self.forward_heads(tokenized_size, context, context_mask, target_mask, rope_seed=rope_seed)
+        deep_output, _ = self.forward_heads(
+            tokenized_size,
+            context,
+            context_mask,
+            target_mask,
+            rope_seed=rope_seed,
+            conditioning=conditioning,
+        )
         return deep_output
+
+    def forward_blind(
+        self,
+        tokenized_size: tuple[int, int],
+        conditioning: Tensor,
+        target_mask: Tensor,
+    ) -> Tensor:
+        """Predict masked targets from one conditioning embedding without attention or visual tokens."""
+        if self.cls_prediction_mode not in ADALN_CLS_PREDICTION_MODES:
+            raise ValueError("forward_blind requires an AdaLN CLS prediction mode")
+        with autocast_context(conditioning.device.type, self.predictor_dtype):
+            query = self._target_queries(tokenized_size, target_mask)
+            prepared_conditioning = self._prepare_conditioning(conditioning, target_mask.shape[0])
+            assert prepared_conditioning is not None
+            for block in self.blocks:
+                typed_block = cast(Any, block)
+                query = query + typed_block.layer_scale_mlp(typed_block.mlp(query, conditioning=prepared_conditioning))
+            return self.predictor_proj(query).float()
 
     def forward_shallow(
         self,
@@ -306,8 +408,9 @@ class CrossAttentionPredictor(nn.Module):
             context_mask: Tensor | None,
             target_mask: Tensor,
             rope_seed: int | None = None,
+            conditioning: Tensor | None = None,
         ) -> Tensor:
-            return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed)
+            return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed, conditioning)
 
     def prepare_rope(
         self,
@@ -637,6 +740,7 @@ class JEPAConfig:
         scheduled: Whether to schedule the momentum.
         predictor_depth: Depth of the predictor network.
         predictor_attention_mode: Predictor block attention mode.
+        cls_prediction_mode: CLS auxiliary prediction path.
         disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
             and attention dropout to ``0.0``.
         teacher_dtype: Optional dtype override for the teacher and Gram teacher weights.
@@ -660,6 +764,7 @@ class JEPAConfig:
     scheduled: bool = False
     predictor_depth: int = 4
     predictor_attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE
+    cls_prediction_mode: CLSPredictionMode = LEGACY_CLS_PREDICTION_MODE
     disable_predictor_regularizers: bool = False
     teacher_dtype: torch.dtype | str | None = None
     use_gram_anchoring: bool = False
@@ -681,6 +786,13 @@ class JEPAConfig:
             raise ValueError("target_ratio must be in the range (0, 1]")
         if self.predictor_attention_mode not in PREDICTOR_ATTENTION_MODES:
             raise ValueError(f"predictor_attention_mode must be one of {list(PREDICTOR_ATTENTION_MODES)}")
+        if self.cls_prediction_mode not in CLS_PREDICTION_MODES:
+            raise ValueError(f"cls_prediction_mode must be one of {list(CLS_PREDICTION_MODES)}")
+        if (
+            self.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES
+            and self.predictor_attention_mode != CROSS_ATTENTION_PREDICTOR_MODE
+        ):
+            raise ValueError("AdaLN CLS prediction requires predictor_attention_mode='cross_attention'")
         if self.use_gram_anchoring and self.gram_start_epoch is None:
             raise ValueError("gram_start_epoch must be set when use_gram_anchoring is enabled")
         if self.gram_teacher_epoch <= 0:

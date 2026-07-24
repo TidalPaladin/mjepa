@@ -12,7 +12,13 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
 from vit import ViTConfig
 
-from mjepa.jepa import CROSS_ATTENTION_PREDICTOR_MODE, DECODER_PREDICTOR_MODE, CrossAttentionPredictor
+from mjepa.jepa import (
+    ADALN_BLIND_CLS_PREDICTION_MODE,
+    CROSS_ATTENTION_PREDICTOR_MODE,
+    DECODER_PREDICTOR_MODE,
+    LEGACY_CLS_PREDICTION_MODE,
+    CrossAttentionPredictor,
+)
 from mjepa.trainer import (
     CheckpointMetadata,
     ResolutionConfig,
@@ -477,6 +483,7 @@ class TestSaveCheckpoint:
         metadata = load_checkpoint_metadata(path)
         assert metadata.elapsed_seconds == 123.5
         assert metadata.wandb_run_id == "wandb-123"
+        assert metadata.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
 
     def test_save_checkpoint_writes_temporary_file_before_replace(self, checkpoint_components, tmp_path: Path):
         backbone, predictor, teacher, optimizer, scheduler = checkpoint_components
@@ -622,6 +629,7 @@ def test_checkpoint_metadata_recovers_resume_provenance(tmp_path: Path):
         img_size=(32, 32),
         elapsed_seconds=91.25,
         wandb_run_id="wandb-123",
+        cls_prediction_mode=LEGACY_CLS_PREDICTION_MODE,
     )
 
 
@@ -734,6 +742,47 @@ class TestPredictorCheckpointCompatibility:
             resume_scheduler = LinearLR(resume_optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
 
             with pytest.raises(ValueError, match="predictor attention-mode changes"):
+                load_checkpoint(
+                    path,
+                    backbone=resume_backbone,
+                    predictor=resume_predictor,
+                    teacher=resume_teacher,
+                    optimizer=resume_optimizer,
+                    scheduler=resume_scheduler,
+                    mode="resume",
+                )
+
+    def test_resume_rejects_mismatched_cls_prediction_mode(self, vit_config):
+        backbone = vit_config.instantiate()
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        teacher = vit_config.instantiate()
+        optimizer = AdamW(backbone.parameters(), lr=1e-3)
+        scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "checkpoint.pt"
+            save_checkpoint(
+                path,
+                backbone=backbone,
+                predictor=predictor,
+                teacher=teacher,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=1,
+                epoch=1,
+            )
+
+            resume_backbone = vit_config.instantiate()
+            resume_predictor = CrossAttentionPredictor(
+                resume_backbone,
+                depth=2,
+                cls_prediction_mode=ADALN_BLIND_CLS_PREDICTION_MODE,
+            )
+            resume_teacher = vit_config.instantiate()
+            resume_optimizer = AdamW(resume_backbone.parameters(), lr=1e-3)
+            resume_scheduler = LinearLR(resume_optimizer, start_factor=0.1, end_factor=1.0, total_iters=100)
+
+            with pytest.raises(ValueError, match="CLS-prediction-mode changes"):
                 load_checkpoint(
                     path,
                     backbone=resume_backbone,

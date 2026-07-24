@@ -1,6 +1,6 @@
 import importlib.metadata
 
-from .jepa import CrossAttentionPredictor, JEPAConfig, PredictorAttentionMode
+from .jepa import CLSPredictionMode, CrossAttentionPredictor, JEPAConfig, PredictorAttentionMode
 from .metrics import CLSPatchAlignmentMetric, SimilarityDistanceCouplingMetric
 from .optimizer import OptimizerConfig
 from .trainer import CheckpointMetadata, ResolutionConfig, TrainerConfig, load_checkpoint_metadata
@@ -11,6 +11,7 @@ __all__ = [
     "TrainerConfig",
     "JEPAConfig",
     "PredictorAttentionMode",
+    "CLSPredictionMode",
     "OptimizerConfig",
     "CrossAttentionPredictor",
     "ResolutionConfig",

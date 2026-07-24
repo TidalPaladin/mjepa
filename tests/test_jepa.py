@@ -8,10 +8,14 @@ import yaml
 from vit import ViTConfig
 
 from mjepa.jepa import (
+    ADALN_BLIND_CLS_PREDICTION_MODE,
+    ADALN_SHARED_CLS_PREDICTION_MODE,
+    CLS_PREDICTION_MODES,
     COSINE_JEPA_LOSS_KIND,
     CROSS_ATTENTION_PREDICTOR_MODE,
     DECODER_PREDICTOR_MODE,
     ENCODER_PREDICTOR_MODE,
+    LEGACY_CLS_PREDICTION_MODE,
     MSE_JEPA_LOSS_KIND,
     PREDICTOR_ATTENTION_MODES,
     PREDICTOR_PROJ_INIT_STD,
@@ -138,6 +142,7 @@ class TestJEPAConfig:
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
         assert config.predictor_attention_mode == CROSS_ATTENTION_PREDICTOR_MODE
+        assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
         assert config.disable_predictor_regularizers is False
         assert config.teacher_dtype is None
         assert config.use_gram_anchoring is False
@@ -153,6 +158,7 @@ class TestJEPAConfig:
             momentum=0.95,
             predictor_depth=6,
             predictor_attention_mode=DECODER_PREDICTOR_MODE,
+            cls_prediction_mode=LEGACY_CLS_PREDICTION_MODE,
             disable_predictor_regularizers=True,
             teacher_dtype=torch.bfloat16,
             stem_jepa_loss_weight=0.5,
@@ -164,6 +170,7 @@ class TestJEPAConfig:
         assert config.momentum == 0.95
         assert config.predictor_depth == 6
         assert config.predictor_attention_mode == DECODER_PREDICTOR_MODE
+        assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
         assert config.stem_jepa_loss_weight == 0.5
@@ -185,6 +192,23 @@ class TestJEPAConfig:
         with pytest.raises(ValueError):
             JEPAConfig(target_ratio=1.1)
 
+    @pytest.mark.parametrize("cls_prediction_mode", CLS_PREDICTION_MODES)
+    def test_valid_cls_prediction_modes(self, cls_prediction_mode):
+        config = JEPAConfig(cls_prediction_mode=cls_prediction_mode)
+
+        assert config.cls_prediction_mode == cls_prediction_mode
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
+    )
+    def test_adaln_cls_prediction_requires_cross_attention(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="requires predictor_attention_mode='cross_attention'"):
+            JEPAConfig(
+                predictor_attention_mode=DECODER_PREDICTOR_MODE,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
 
 class TestYAMLConfig:
     def test_config_constructor(self, mocker):
@@ -201,6 +225,7 @@ class TestYAMLConfig:
             "momentum": 0.98,
             "predictor_depth": 8,
             "predictor_attention_mode": ENCODER_PREDICTOR_MODE,
+            "cls_prediction_mode": LEGACY_CLS_PREDICTION_MODE,
             "disable_predictor_regularizers": True,
             "teacher_dtype": "bfloat16",
             "use_gram_anchoring": True,
@@ -222,6 +247,7 @@ class TestYAMLConfig:
         assert config.momentum == 0.98
         assert config.predictor_depth == 8
         assert config.predictor_attention_mode == ENCODER_PREDICTOR_MODE
+        assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
         assert config.use_gram_anchoring is True
@@ -246,6 +272,7 @@ class TestYAMLConfig:
         momentum: 0.97
         predictor_depth: 5
         predictor_attention_mode: decoder
+        cls_prediction_mode: legacy_cross_attention
         disable_predictor_regularizers: true
         teacher_dtype: bfloat16
         use_gram_anchoring: true
@@ -266,6 +293,7 @@ class TestYAMLConfig:
         assert config.momentum == 0.97
         assert config.predictor_depth == 5
         assert config.predictor_attention_mode == DECODER_PREDICTOR_MODE
+        assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
         assert config.use_gram_anchoring is True
@@ -446,6 +474,80 @@ class TestCrossAttentionPredictor:
         predictor = CrossAttentionPredictor(backbone, depth=2, attention_mode=attention_mode)
 
         assert predictor.attention_mode == attention_mode
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
+    )
+    def test_adaln_predictor_uses_zero_initialized_conditioned_mlps(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+
+        assert predictor.cls_prediction_mode == cls_prediction_mode
+        for block in predictor.blocks:
+            modulation = cast(Any, block).mlp.modulation
+            assert torch.count_nonzero(modulation.weight) == 0
+            assert torch.count_nonzero(modulation.bias) == 0
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
+    )
+    def test_blind_forward_skips_attention_and_reuses_output_projection(self, mocker, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+        cls_conditioning = torch.randn(2, 64)
+        for block in predictor.blocks:
+            mocker.patch.object(
+                cast(Any, block).cross_attention, "forward", side_effect=AssertionError("attention used")
+            )
+        projection = mocker.spy(predictor.predictor_proj, "forward")
+
+        output = predictor.forward_blind((8, 8), cls_conditioning, target_mask)
+
+        assert output.shape == (2, 16, 64)
+        projection.assert_called_once()
+
+    def test_blind_forward_backpropagates_to_single_cls_conditioning(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=ADALN_BLIND_CLS_PREDICTION_MODE,
+        )
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+        cls_conditioning = torch.randn(2, 64, requires_grad=True)
+
+        predictor.forward_blind((8, 8), cls_conditioning, target_mask).square().mean().backward()
+
+        assert cls_conditioning.grad is not None
+
+    def test_adaln_main_forward_requires_conditioning(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=ADALN_SHARED_CLS_PREDICTION_MODE,
+        )
+        context = torch.randn(2, 32, 64)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :32] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+
+        with pytest.raises(ValueError, match="conditioning is required"):
+            predictor((8, 8), context, context_mask, target_mask)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
     def test_predictor_initialization_cpu_dtype(self, dtype):

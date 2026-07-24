@@ -4,10 +4,13 @@ import torch.nn.functional as F
 from vit import ViT, ViTConfig, ViTFeatures
 
 from mjepa.jepa import (
+    ADALN_BLIND_CLS_PREDICTION_MODE,
+    ADALN_SHARED_CLS_PREDICTION_MODE,
     COSINE_JEPA_LOSS_KIND,
     CROSS_ATTENTION_PREDICTOR_MODE,
     MSE_JEPA_LOSS_KIND,
     PREDICTOR_ATTENTION_MODES,
+    CLSPredictionMode,
     CrossAttentionPredictor,
     JEPAConfig,
     JEPALossKind,
@@ -55,17 +58,20 @@ def _make_test_model(
     sigreg_loss_weight: float,
     jepa_loss_kind: JEPALossKind = MSE_JEPA_LOSS_KIND,
     predictor_attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE,
+    cls_prediction_mode: CLSPredictionMode = "legacy_cross_attention",
 ) -> MJEPA:
     config = _make_jepa_config(
         sigreg_loss_weight=sigreg_loss_weight,
         jepa_loss_kind=jepa_loss_kind,
         predictor_attention_mode=predictor_attention_mode,
+        cls_prediction_mode=cls_prediction_mode,
     )
     backbone = _make_test_vit_config(num_cls_tokens=num_cls_tokens).instantiate()
     predictor = CrossAttentionPredictor(
         backbone,
         depth=TEST_PREDICTOR_DEPTH,
         attention_mode=config.predictor_attention_mode,
+        cls_prediction_mode=config.cls_prediction_mode,
     )
     return MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
 
@@ -1257,6 +1263,50 @@ class TestMJEPAForward:
         assert predictions.pred.dtype == torch.float32
         assert predictions.pred_with_cls is not None
         assert predictions.pred_with_cls.shape == predictions.pred.shape
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
+    )
+    def test_adaln_cls_prediction_requires_exactly_one_cls_token(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            _make_test_model(
+                num_cls_tokens=TEST_NUM_CLS_TOKENS,
+                sigreg_loss_weight=0.0,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    def test_adaln_blind_uses_null_main_conditioning(self, dummy_batch, mocker):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=ADALN_BLIND_CLS_PREDICTION_MODE,
+        )
+        model.eval()
+        forward_heads = mocker.spy(model.predictor, "forward_heads")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        conditioning = forward_heads.call_args.kwargs["conditioning"]
+        assert torch.count_nonzero(conditioning) == 0
+        assert predictions.pred_with_cls is not None
+
+    def test_adaln_shared_uses_student_cls_as_main_conditioning(self, dummy_batch, mocker):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=ADALN_SHARED_CLS_PREDICTION_MODE,
+        )
+        model.eval()
+        forward_heads = mocker.spy(model.predictor, "forward_heads")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        conditioning = forward_heads.call_args.kwargs["conditioning"]
+        assert torch.equal(conditioning, predictions.student_output.cls_tokens[:, 0])
+        assert predictions.pred_with_cls is not None
 
     def test_get_probe_tokens_falls_back_to_visual_tokens_without_cls(
         self, mjepa_model_no_gram: MJEPA, dummy_vit_features: ViTFeatures
