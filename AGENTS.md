@@ -38,3 +38,7 @@ This guide summarizes how to work effectively in this repository: where code liv
 ## Configuration & Secrets
 - Use `config.mk` for local secrets; keep it untracked (see `config.mk.example`).
 - Keep secrets out of `config.yaml` and out of commits.
+
+## CLS Predictor Modes
+- Keep `projected_cross_attention` limited to a one-token backbone CLS input and the standard cross-attention predictor.
+- The predictor owns its learned one-to-four CLS context projection so optimizer, checkpoint, resume, and parameter accounting include it automatically.

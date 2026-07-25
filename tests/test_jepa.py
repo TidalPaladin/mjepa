@@ -19,6 +19,8 @@ from mjepa.jepa import (
     MSE_JEPA_LOSS_KIND,
     PREDICTOR_ATTENTION_MODES,
     PREDICTOR_PROJ_INIT_STD,
+    PROJECTED_CLS_CONTEXT_TOKENS,
+    PROJECTED_CLS_PREDICTION_MODE,
     CrossAttentionPredictor,
     JEPAConfig,
     autocast_context,
@@ -207,6 +209,13 @@ class TestJEPAConfig:
             JEPAConfig(
                 predictor_attention_mode=DECODER_PREDICTOR_MODE,
                 cls_prediction_mode=cls_prediction_mode,
+            )
+
+    def test_projected_cls_prediction_requires_cross_attention(self):
+        with pytest.raises(ValueError, match="requires predictor_attention_mode='cross_attention'"):
+            JEPAConfig(
+                predictor_attention_mode=DECODER_PREDICTOR_MODE,
+                cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
             )
 
 
@@ -493,6 +502,17 @@ class TestCrossAttentionPredictor:
             assert torch.count_nonzero(modulation.weight) == 0
             assert torch.count_nonzero(modulation.bias) == 0
 
+    def test_projected_cls_predictor_requires_cross_attention(self):
+        backbone = self._instantiate_backbone(torch.float32)
+
+        with pytest.raises(ValueError, match="requires attention_mode='cross_attention'"):
+            CrossAttentionPredictor(
+                backbone,
+                depth=2,
+                attention_mode=DECODER_PREDICTOR_MODE,
+                cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+            )
+
     @pytest.mark.parametrize(
         "cls_prediction_mode",
         [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
@@ -532,6 +552,34 @@ class TestCrossAttentionPredictor:
         predictor.forward_blind((8, 8), cls_conditioning, target_mask).square().mean().backward()
 
         assert cls_conditioning.grad is not None
+
+    def test_projected_cls_context_expands_one_token_and_backpropagates(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+        )
+        cls_context = torch.randn(2, 1, 64, requires_grad=True)
+
+        projected_context = predictor.project_cls_context(cls_context)
+        projected_context.square().mean().backward()
+
+        assert projected_context.shape == (2, PROJECTED_CLS_CONTEXT_TOKENS, 64)
+        assert predictor.cls_context_projection is not None
+        assert predictor.cls_context_projection.weight.grad is not None
+        assert cls_context.grad is not None
+
+    def test_projected_cls_context_rejects_multiple_input_tokens(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+        )
+
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            predictor.project_cls_context(torch.randn(2, 2, 64))
 
     def test_adaln_main_forward_requires_conditioning(self):
         backbone = self._instantiate_backbone(torch.float32)

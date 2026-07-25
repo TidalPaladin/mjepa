@@ -11,6 +11,8 @@ from .jepa import (
     ADALN_BLIND_CLS_PREDICTION_MODE,
     ADALN_CLS_PREDICTION_MODES,
     ADALN_SHARED_CLS_PREDICTION_MODE,
+    PROJECTED_CLS_PREDICTION_MODE,
+    SINGLE_CLS_PREDICTION_MODES,
     CrossAttentionPredictor,
     JEPAConfig,
     autocast_context,
@@ -88,9 +90,10 @@ class MJEPA(nn.Module):
                 "Predictor CLS prediction mode does not match JEPAConfig: "
                 f"{predictor.cls_prediction_mode!r} != {config.cls_prediction_mode!r}"
             )
-        if config.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES and backbone.config.num_cls_tokens != 1:
+        if config.cls_prediction_mode in SINGLE_CLS_PREDICTION_MODES and backbone.config.num_cls_tokens != 1:
             raise ValueError(
-                f"AdaLN CLS prediction requires exactly one CLS token, got {backbone.config.num_cls_tokens}"
+                f"{config.cls_prediction_mode} CLS prediction requires exactly one CLS token, "
+                f"got {backbone.config.num_cls_tokens}"
             )
         self.teacher = setup_teacher(backbone, dtype=teacher_dtype)
         self.predictor = predictor
@@ -320,7 +323,16 @@ class MJEPA(nn.Module):
             rope_seed=rope_seed,
             conditioning=main_conditioning,
         )
-        if self.config.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES:
+        if self.config.cls_prediction_mode == PROJECTED_CLS_PREDICTION_MODE:
+            projected_cls_context = self.predictor.project_cls_context(student_output.cls_tokens)
+            pred_with_cls = self.forward_predictor(
+                (Ht, Wt),
+                projected_cls_context,
+                None,
+                target_mask,
+                rope_seed=rope_seed,
+            )
+        elif self.config.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES:
             assert cls_conditioning is not None
             pred_with_cls = self.forward_blind_cls_predictor((Ht, Wt), cls_conditioning, target_mask)
         else:

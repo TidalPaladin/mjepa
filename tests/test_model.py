@@ -10,6 +10,8 @@ from mjepa.jepa import (
     CROSS_ATTENTION_PREDICTOR_MODE,
     MSE_JEPA_LOSS_KIND,
     PREDICTOR_ATTENTION_MODES,
+    PROJECTED_CLS_CONTEXT_TOKENS,
+    PROJECTED_CLS_PREDICTION_MODE,
     CLSPredictionMode,
     CrossAttentionPredictor,
     JEPAConfig,
@@ -1275,6 +1277,32 @@ class TestMJEPAForward:
                 sigreg_loss_weight=0.0,
                 cls_prediction_mode=cls_prediction_mode,
             )
+
+    def test_projected_cls_prediction_requires_exactly_one_cls_token(self):
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            _make_test_model(
+                num_cls_tokens=TEST_NUM_CLS_TOKENS,
+                sigreg_loss_weight=0.0,
+                cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+            )
+
+    def test_projected_cls_prediction_uses_four_token_auxiliary_context(self, dummy_batch, mocker):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+        )
+        model.eval()
+        forward_predictor = mocker.spy(model, "forward_predictor")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        projected_context = forward_predictor.call_args.args[1]
+        expected_context = model.predictor.project_cls_context(predictions.student_output.cls_tokens)
+        assert projected_context.shape == (TEST_BATCH_SIZE, PROJECTED_CLS_CONTEXT_TOKENS, TEST_HIDDEN_SIZE)
+        assert torch.equal(projected_context, expected_context)
+        assert predictions.pred_with_cls is not None
 
     def test_adaln_blind_uses_null_main_conditioning(self, dummy_batch, mocker):
         model = _make_test_model(
