@@ -11,7 +11,7 @@ from .jepa import (
     ADALN_BLIND_CLS_PREDICTION_MODE,
     ADALN_CLS_PREDICTION_MODES,
     ADALN_SHARED_CLS_PREDICTION_MODE,
-    PROJECTED_CLS_PREDICTION_MODE,
+    EXPANDED_CLS_PREDICTION_MODES,
     SINGLE_CLS_PREDICTION_MODES,
     CrossAttentionPredictor,
     JEPAConfig,
@@ -173,6 +173,20 @@ class MJEPA(nn.Module):
         with autocast_context(conditioning.device.type, self.autocast_dtype):
             return self.predictor.forward_blind(tokenized_size, conditioning, target_mask)
 
+    def forward_cls_predictor(
+        self,
+        tokenized_size: tuple[int, int],
+        cls_tokens: Tensor,
+        target_mask: Tensor,
+        rope_seed: int | None = None,
+    ) -> Tensor:
+        """Run the configured visually blinded auxiliary predictor from CLS tokens."""
+        if self.config.cls_prediction_mode in EXPANDED_CLS_PREDICTION_MODES:
+            cls_tokens = self.predictor.expand_cls_context(cls_tokens)
+        elif self.config.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES:
+            return self.forward_blind_cls_predictor(tokenized_size, cls_tokens[:, 0], target_mask)
+        return self.forward_predictor(tokenized_size, cls_tokens, None, target_mask, rope_seed=rope_seed)
+
     @staticmethod
     def _has_cls_tokens(features: ViTFeatures) -> bool:
         return features.num_cls_tokens > 0
@@ -323,24 +337,11 @@ class MJEPA(nn.Module):
             rope_seed=rope_seed,
             conditioning=main_conditioning,
         )
-        if self.config.cls_prediction_mode == PROJECTED_CLS_PREDICTION_MODE:
-            projected_cls_context = self.predictor.project_cls_context(student_output.cls_tokens)
-            pred_with_cls = self.forward_predictor(
-                (Ht, Wt),
-                projected_cls_context,
-                None,
-                target_mask,
-                rope_seed=rope_seed,
-            )
-        elif self.config.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES:
-            assert cls_conditioning is not None
-            pred_with_cls = self.forward_blind_cls_predictor((Ht, Wt), cls_conditioning, target_mask)
-        else:
-            pred_with_cls = (
-                self.forward_predictor((Ht, Wt), student_output.cls_tokens, None, target_mask, rope_seed=rope_seed)
-                if student_has_cls_tokens
-                else None
-            )
+        pred_with_cls = (
+            self.forward_cls_predictor((Ht, Wt), student_output.cls_tokens, target_mask, rope_seed=rope_seed)
+            if student_has_cls_tokens
+            else None
+        )
 
         with autocast_context(pred.device.type, self.autocast_dtype):
             probes = self.forward_probe(teacher_output)

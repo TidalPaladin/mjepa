@@ -42,21 +42,26 @@ LEGACY_CLS_PREDICTION_MODE = "legacy_cross_attention"
 ADALN_BLIND_CLS_PREDICTION_MODE = "adaln_blind"
 ADALN_SHARED_CLS_PREDICTION_MODE = "adaln_shared"
 PROJECTED_CLS_PREDICTION_MODE = "projected_cross_attention"
-PROJECTED_CLS_CONTEXT_TOKENS = 4
+SLOT_BIAS_CLS_PREDICTION_MODE = "slot_bias_cross_attention"
+CLS_CONTEXT_TOKENS = 4
+PROJECTED_CLS_CONTEXT_TOKENS = CLS_CONTEXT_TOKENS
 CLSPredictionMode: TypeAlias = Literal[
     "legacy_cross_attention",
     "adaln_blind",
     "adaln_shared",
     "projected_cross_attention",
+    "slot_bias_cross_attention",
 ]
 CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     LEGACY_CLS_PREDICTION_MODE,
     ADALN_BLIND_CLS_PREDICTION_MODE,
     ADALN_SHARED_CLS_PREDICTION_MODE,
     PROJECTED_CLS_PREDICTION_MODE,
+    SLOT_BIAS_CLS_PREDICTION_MODE,
 )
 ADALN_CLS_PREDICTION_MODES = (ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE)
-SINGLE_CLS_PREDICTION_MODES = (*ADALN_CLS_PREDICTION_MODES, PROJECTED_CLS_PREDICTION_MODE)
+EXPANDED_CLS_PREDICTION_MODES = (PROJECTED_CLS_PREDICTION_MODE, SLOT_BIAS_CLS_PREDICTION_MODE)
+SINGLE_CLS_PREDICTION_MODES = (*ADALN_CLS_PREDICTION_MODES, *EXPANDED_CLS_PREDICTION_MODES)
 
 
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
@@ -129,8 +134,8 @@ class CrossAttentionPredictor(nn.Module):
             raise ValueError(f"cls_prediction_mode must be one of {list(CLS_PREDICTION_MODES)}")
         if cls_prediction_mode in ADALN_CLS_PREDICTION_MODES and attention_mode != CROSS_ATTENTION_PREDICTOR_MODE:
             raise ValueError("AdaLN CLS prediction requires attention_mode='cross_attention'")
-        if cls_prediction_mode == PROJECTED_CLS_PREDICTION_MODE and attention_mode != CROSS_ATTENTION_PREDICTOR_MODE:
-            raise ValueError("Projected CLS prediction requires attention_mode='cross_attention'")
+        if cls_prediction_mode in EXPANDED_CLS_PREDICTION_MODES and attention_mode != CROSS_ATTENTION_PREDICTOR_MODE:
+            raise ValueError("Expanded CLS prediction requires attention_mode='cross_attention'")
         factory_kwargs = {"device": device, "dtype": backbone.config.dtype}
         self.hidden_size = backbone.config.hidden_size
         self.out_dim = out_dim or backbone.config.hidden_size
@@ -152,6 +157,11 @@ class CrossAttentionPredictor(nn.Module):
         self.cls_context_projection = (
             self._create_cls_context_projection(device=device, dtype=backbone.config.dtype)
             if cls_prediction_mode == PROJECTED_CLS_PREDICTION_MODE
+            else None
+        )
+        self.cls_context_slot_bias = (
+            self._create_cls_context_slot_bias(device=device, dtype=backbone.config.dtype)
+            if cls_prediction_mode == SLOT_BIAS_CLS_PREDICTION_MODE
             else None
         )
 
@@ -220,12 +230,21 @@ class CrossAttentionPredictor(nn.Module):
     ) -> nn.Linear:
         projection = nn.Linear(
             self.hidden_size,
-            PROJECTED_CLS_CONTEXT_TOKENS * self.hidden_size,
+            CLS_CONTEXT_TOKENS * self.hidden_size,
             device=device,
             dtype=dtype,
         )
         self._reset_projection_parameters(projection)
         return projection
+
+    def _create_cls_context_slot_bias(
+        self,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> nn.Parameter:
+        slot_bias = nn.Parameter(torch.empty(1, CLS_CONTEXT_TOKENS, self.hidden_size, device=device, dtype=dtype))
+        nn.init.trunc_normal_(slot_bias, std=PREDICTOR_PROJ_INIT_STD)
+        return slot_bias
 
     def enable_shallow_head(self) -> None:
         if self.predictor_proj_shallow is not None:
@@ -416,19 +435,33 @@ class CrossAttentionPredictor(nn.Module):
                 query = query + typed_block.layer_scale_mlp(typed_block.mlp(query, conditioning=prepared_conditioning))
             return self.predictor_proj(query).float()
 
-    def project_cls_context(self, cls_context: Tensor) -> Tensor:
-        """Expand one CLS embedding into four learned views for the legacy predictor path."""
-        projection = self.cls_context_projection
-        if self.cls_prediction_mode != PROJECTED_CLS_PREDICTION_MODE or projection is None:
-            raise ValueError("project_cls_context requires projected_cross_attention CLS prediction")
+    def _validate_single_cls_context(self, cls_context: Tensor) -> None:
         if cls_context.ndim != 3:
             raise ValueError("cls_context must have shape [batch, 1, hidden_size]")
         expected_shape = (cls_context.shape[0], 1, self.hidden_size)
         if tuple(cls_context.shape) != expected_shape:
             raise ValueError(f"cls_context must contain exactly one CLS token with shape {expected_shape}")
+
+    def project_cls_context(self, cls_context: Tensor) -> Tensor:
+        """Expand one CLS embedding into four learned views for the legacy predictor path."""
+        projection = self.cls_context_projection
+        if self.cls_prediction_mode != PROJECTED_CLS_PREDICTION_MODE or projection is None:
+            raise ValueError("project_cls_context requires projected_cross_attention CLS prediction")
+        self._validate_single_cls_context(cls_context)
         with autocast_context(cls_context.device.type, self.predictor_dtype):
             projected = projection(cls_context[:, 0].to(dtype=self.predictor_dtype))
-        return projected.reshape(cls_context.shape[0], PROJECTED_CLS_CONTEXT_TOKENS, self.hidden_size)
+        return projected.reshape(cls_context.shape[0], CLS_CONTEXT_TOKENS, self.hidden_size)
+
+    def expand_cls_context(self, cls_context: Tensor) -> Tensor:
+        """Expand one CLS embedding into four contexts for a configured legacy predictor replay."""
+        if self.cls_prediction_mode == PROJECTED_CLS_PREDICTION_MODE:
+            return self.project_cls_context(cls_context)
+        if self.cls_prediction_mode != SLOT_BIAS_CLS_PREDICTION_MODE or self.cls_context_slot_bias is None:
+            raise ValueError("expand_cls_context requires an expanded CLS prediction mode")
+        self._validate_single_cls_context(cls_context)
+        with autocast_context(cls_context.device.type, self.predictor_dtype):
+            context = cls_context.to(dtype=self.predictor_dtype)
+            return context.expand(-1, CLS_CONTEXT_TOKENS, -1) + self.cls_context_slot_bias
 
     def forward_shallow(
         self,
@@ -838,10 +871,10 @@ class JEPAConfig:
         ):
             raise ValueError("AdaLN CLS prediction requires predictor_attention_mode='cross_attention'")
         if (
-            self.cls_prediction_mode == PROJECTED_CLS_PREDICTION_MODE
+            self.cls_prediction_mode in EXPANDED_CLS_PREDICTION_MODES
             and self.predictor_attention_mode != CROSS_ATTENTION_PREDICTOR_MODE
         ):
-            raise ValueError("Projected CLS prediction requires predictor_attention_mode='cross_attention'")
+            raise ValueError("Expanded CLS prediction requires predictor_attention_mode='cross_attention'")
         if self.use_gram_anchoring and self.gram_start_epoch is None:
             raise ValueError("gram_start_epoch must be set when use_gram_anchoring is enabled")
         if self.gram_teacher_epoch <= 0:

@@ -21,6 +21,7 @@ from mjepa.jepa import (
     PREDICTOR_PROJ_INIT_STD,
     PROJECTED_CLS_CONTEXT_TOKENS,
     PROJECTED_CLS_PREDICTION_MODE,
+    SLOT_BIAS_CLS_PREDICTION_MODE,
     CrossAttentionPredictor,
     JEPAConfig,
     autocast_context,
@@ -211,11 +212,15 @@ class TestJEPAConfig:
                 cls_prediction_mode=cls_prediction_mode,
             )
 
-    def test_projected_cls_prediction_requires_cross_attention(self):
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [PROJECTED_CLS_PREDICTION_MODE, SLOT_BIAS_CLS_PREDICTION_MODE],
+    )
+    def test_expanded_cls_prediction_requires_cross_attention(self, cls_prediction_mode):
         with pytest.raises(ValueError, match="requires predictor_attention_mode='cross_attention'"):
             JEPAConfig(
                 predictor_attention_mode=DECODER_PREDICTOR_MODE,
-                cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+                cls_prediction_mode=cls_prediction_mode,
             )
 
 
@@ -502,7 +507,11 @@ class TestCrossAttentionPredictor:
             assert torch.count_nonzero(modulation.weight) == 0
             assert torch.count_nonzero(modulation.bias) == 0
 
-    def test_projected_cls_predictor_requires_cross_attention(self):
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [PROJECTED_CLS_PREDICTION_MODE, SLOT_BIAS_CLS_PREDICTION_MODE],
+    )
+    def test_expanded_cls_predictor_requires_cross_attention(self, cls_prediction_mode):
         backbone = self._instantiate_backbone(torch.float32)
 
         with pytest.raises(ValueError, match="requires attention_mode='cross_attention'"):
@@ -510,7 +519,7 @@ class TestCrossAttentionPredictor:
                 backbone,
                 depth=2,
                 attention_mode=DECODER_PREDICTOR_MODE,
-                cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+                cls_prediction_mode=cls_prediction_mode,
             )
 
     @pytest.mark.parametrize(
@@ -580,6 +589,38 @@ class TestCrossAttentionPredictor:
 
         with pytest.raises(ValueError, match="exactly one CLS token"):
             predictor.project_cls_context(torch.randn(2, 2, 64))
+
+    def test_slot_bias_cls_context_adds_learned_slot_identities_and_backpropagates(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=SLOT_BIAS_CLS_PREDICTION_MODE,
+        )
+        cls_context = torch.randn(2, 1, 64, requires_grad=True)
+
+        expanded_context = predictor.expand_cls_context(cls_context)
+        expanded_context.square().mean().backward()
+
+        assert expanded_context.shape == (2, PROJECTED_CLS_CONTEXT_TOKENS, 64)
+        assert predictor.cls_context_slot_bias is not None
+        assert torch.equal(
+            expanded_context,
+            cls_context.expand(-1, PROJECTED_CLS_CONTEXT_TOKENS, -1) + predictor.cls_context_slot_bias,
+        )
+        assert predictor.cls_context_slot_bias.grad is not None
+        assert cls_context.grad is not None
+
+    def test_slot_bias_cls_context_rejects_multiple_input_tokens(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=SLOT_BIAS_CLS_PREDICTION_MODE,
+        )
+
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            predictor.expand_cls_context(torch.randn(2, 2, 64))
 
     def test_adaln_main_forward_requires_conditioning(self):
         backbone = self._instantiate_backbone(torch.float32)
