@@ -47,8 +47,15 @@ RESIDUAL_PROJECTED_CLS_PREDICTION_MODE = "residual_projected_cross_attention"
 RESIDUAL_MLP_CLS_PREDICTION_MODE = "residual_mlp_cross_attention"
 PARTITIONED_SHARED_CLS_PREDICTION_MODE = "partitioned_shared_cross_attention"
 PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE = "partitioned_independent_cross_attention"
+JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context"
+SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_sample_routed"
+TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_token_routed"
 CLS_CONTEXT_TOKENS = 4
 PROJECTED_CLS_CONTEXT_TOKENS = CLS_CONTEXT_TOKENS
+JOINT_CONTEXT_ROUTE_PATTERN = (0, 0, 1, 2)
+JOINT_CONTEXT_JOINT_ROUTE = 0
+JOINT_CONTEXT_CLS_ONLY_ROUTE = 1
+JOINT_CONTEXT_VISUAL_ONLY_ROUTE = 2
 CLSPredictionMode: TypeAlias = Literal[
     "legacy_cross_attention",
     "adaln_blind",
@@ -59,6 +66,9 @@ CLSPredictionMode: TypeAlias = Literal[
     "residual_mlp_cross_attention",
     "partitioned_shared_cross_attention",
     "partitioned_independent_cross_attention",
+    "joint_context",
+    "joint_context_sample_routed",
+    "joint_context_token_routed",
 ]
 CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     LEGACY_CLS_PREDICTION_MODE,
@@ -70,6 +80,9 @@ CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     RESIDUAL_MLP_CLS_PREDICTION_MODE,
     PARTITIONED_SHARED_CLS_PREDICTION_MODE,
     PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+    JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
 )
 ADALN_CLS_PREDICTION_MODES = (ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE)
 PROJECTED_CLS_PREDICTION_MODES = (
@@ -86,7 +99,20 @@ EXPANDED_CLS_PREDICTION_MODES = (
     SLOT_BIAS_CLS_PREDICTION_MODE,
     RESIDUAL_MLP_CLS_PREDICTION_MODE,
 )
-SINGLE_CLS_PREDICTION_MODES = (*ADALN_CLS_PREDICTION_MODES, *EXPANDED_CLS_PREDICTION_MODES)
+JOINT_CONTEXT_CLS_PREDICTION_MODES = (
+    JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+)
+ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES = (
+    SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+)
+SINGLE_CLS_PREDICTION_MODES = (
+    *ADALN_CLS_PREDICTION_MODES,
+    *EXPANDED_CLS_PREDICTION_MODES,
+    *JOINT_CONTEXT_CLS_PREDICTION_MODES,
+)
 
 
 def _validate_cls_context_tokens(cls_prediction_mode: CLSPredictionMode, cls_context_tokens: int) -> None:
@@ -94,6 +120,50 @@ def _validate_cls_context_tokens(cls_prediction_mode: CLSPredictionMode, cls_con
         raise ValueError("cls_context_tokens must be a positive integer")
     if cls_prediction_mode not in PARTITIONED_CLS_PREDICTION_MODES and cls_context_tokens != CLS_CONTEXT_TOKENS:
         raise ValueError("cls_context_tokens is only configurable for partitioned CLS prediction modes")
+
+
+def _balanced_joint_context_routes(route_count: int, device: torch.device) -> Tensor:
+    pattern = torch.tensor(JOINT_CONTEXT_ROUTE_PATTERN, device=device)
+    repeats = math.ceil(route_count / len(JOINT_CONTEXT_ROUTE_PATTERN))
+    routes = pattern.repeat(repeats)[:route_count]
+    return routes[torch.randperm(route_count, device=device)]
+
+
+def create_joint_context_attention_mask(
+    cls_prediction_mode: CLSPredictionMode,
+    batch_size: int,
+    target_tokens: int,
+    visual_context_tokens: int,
+    *,
+    device: torch.device,
+) -> Tensor | None:
+    """Create balanced key-visibility masks for one visual-context plus CLS predictor pass."""
+    if cls_prediction_mode == JOINT_CONTEXT_CLS_PREDICTION_MODE:
+        return None
+    if cls_prediction_mode not in ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES:
+        raise ValueError("joint context attention masks require a routed joint-context CLS prediction mode")
+    if batch_size <= 0 or target_tokens <= 0 or visual_context_tokens <= 0:
+        raise ValueError("joint context attention mask dimensions must be positive")
+
+    if cls_prediction_mode == SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE:
+        routes = _balanced_joint_context_routes(batch_size, device)
+        routes = routes[:, None].expand(-1, target_tokens)
+    else:
+        routes = _balanced_joint_context_routes(batch_size * target_tokens, device)
+        routes = routes.reshape(batch_size, target_tokens)
+
+    attention_mask = torch.ones(
+        batch_size,
+        target_tokens,
+        visual_context_tokens + 1,
+        dtype=torch.bool,
+        device=device,
+    )
+    cls_only = routes == JOINT_CONTEXT_CLS_ONLY_ROUTE
+    visual_only = routes == JOINT_CONTEXT_VISUAL_ONLY_ROUTE
+    attention_mask[..., :-1].masked_fill_(cls_only[..., None], False)
+    attention_mask[..., -1].masked_fill_(visual_only, False)
+    return attention_mask[:, None]
 
 
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
@@ -217,6 +287,11 @@ class CrossAttentionPredictor(nn.Module):
             raise ValueError("AdaLN CLS prediction requires attention_mode='cross_attention'")
         if cls_prediction_mode in EXPANDED_CLS_PREDICTION_MODES and attention_mode != CROSS_ATTENTION_PREDICTOR_MODE:
             raise ValueError("Expanded CLS prediction requires attention_mode='cross_attention'")
+        if (
+            cls_prediction_mode in JOINT_CONTEXT_CLS_PREDICTION_MODES
+            and attention_mode != CROSS_ATTENTION_PREDICTOR_MODE
+        ):
+            raise ValueError("Joint-context CLS prediction requires attention_mode='cross_attention'")
         factory_kwargs = {"device": device, "dtype": backbone.config.dtype}
         self.hidden_size = backbone.config.hidden_size
         self.out_dim = out_dim or backbone.config.hidden_size
@@ -451,7 +526,10 @@ class CrossAttentionPredictor(nn.Module):
         rope_q: Tensor | None,
         rope_k: Tensor | None,
         conditioning: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor:
+        if context_attention_mask is not None and self.attention_mode != CROSS_ATTENTION_PREDICTOR_MODE:
+            raise ValueError("context attention masks require attention_mode='cross_attention'")
         for block in self.blocks:
             if self.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES:
                 query = cast(Any, block)(
@@ -460,6 +538,15 @@ class CrossAttentionPredictor(nn.Module):
                     rope_q=rope_q,
                     rope_k=rope_k,
                     conditioning=conditioning,
+                    attn_mask=context_attention_mask,
+                )
+            elif self.attention_mode == CROSS_ATTENTION_PREDICTOR_MODE:
+                query = cast(Any, block)(
+                    query,
+                    context,
+                    rope_q=rope_q,
+                    rope_k=rope_k,
+                    attn_mask=context_attention_mask,
                 )
             else:
                 query = cast(Any, block)(query, context, rope_q=rope_q, rope_k=rope_k)
@@ -490,18 +577,40 @@ class CrossAttentionPredictor(nn.Module):
         target_mask: Tensor,
         rope_seed: int | None = None,
         conditioning: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor:
         with autocast_context(context.device.type, self.predictor_dtype):
             # Prepare inputs
             query = self._target_queries(tokenized_size, target_mask)
             context = context.to(dtype=self.predictor_dtype)
             conditioning = self._prepare_conditioning(conditioning, target_mask.shape[0])
-            rope_q, rope_k = self.prepare_rope(tokenized_size, context_mask, target_mask, rope_seed=rope_seed)
+            if context_attention_mask is None and self.cls_prediction_mode in ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES:
+                context_attention_mask = create_joint_context_attention_mask(
+                    self.cls_prediction_mode,
+                    query.shape[0],
+                    query.shape[1],
+                    context.shape[1] - 1,
+                    device=context.device,
+                )
+            rope_q, rope_k = self.prepare_rope(
+                tokenized_size,
+                context_mask,
+                target_mask,
+                rope_seed=rope_seed,
+                context_length=context.shape[1],
+            )
 
             # Run query and context through predictor
             if self.attention_mode == ENCODER_PREDICTOR_MODE:
                 return self._forward_encoder_blocks(query, context, rope_q, rope_k)
-            return self._forward_cross_or_decoder_blocks(query, context, rope_q, rope_k, conditioning)
+            return self._forward_cross_or_decoder_blocks(
+                query,
+                context,
+                rope_q,
+                rope_k,
+                conditioning,
+                context_attention_mask,
+            )
 
     def forward_heads(
         self,
@@ -511,6 +620,7 @@ class CrossAttentionPredictor(nn.Module):
         target_mask: Tensor,
         rope_seed: int | None = None,
         conditioning: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         query = self.forward_features(
             tokenized_size,
@@ -519,6 +629,7 @@ class CrossAttentionPredictor(nn.Module):
             target_mask,
             rope_seed=rope_seed,
             conditioning=conditioning,
+            context_attention_mask=context_attention_mask,
         )
         with autocast_context(query.device.type, self.predictor_dtype):
             deep_output = self.predictor_proj(query).float()
@@ -533,6 +644,7 @@ class CrossAttentionPredictor(nn.Module):
         target_mask: Tensor,
         rope_seed: int | None = None,
         conditioning: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor:
         deep_output, _ = self.forward_heads(
             tokenized_size,
@@ -541,6 +653,7 @@ class CrossAttentionPredictor(nn.Module):
             target_mask,
             rope_seed=rope_seed,
             conditioning=conditioning,
+            context_attention_mask=context_attention_mask,
         )
         return deep_output
 
@@ -637,8 +750,17 @@ class CrossAttentionPredictor(nn.Module):
             target_mask: Tensor,
             rope_seed: int | None = None,
             conditioning: Tensor | None = None,
+            context_attention_mask: Tensor | None = None,
         ) -> Tensor:
-            return self.forward(tokenized_size, context, context_mask, target_mask, rope_seed, conditioning)
+            return self.forward(
+                tokenized_size,
+                context,
+                context_mask,
+                target_mask,
+                rope_seed,
+                conditioning,
+                context_attention_mask,
+            )
 
     def prepare_rope(
         self,
@@ -646,6 +768,7 @@ class CrossAttentionPredictor(nn.Module):
         context_mask: Tensor | None,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        context_length: int | None = None,
     ) -> tuple[Tensor | None, Tensor | None]:
         if self.rope is None:
             return None, None
@@ -663,6 +786,11 @@ class CrossAttentionPredictor(nn.Module):
             sin_k = apply_mask(context_mask, sin[None].expand(B, -1, -1))
             cos_k = apply_mask(context_mask, cos[None].expand(B, -1, -1))
             rope_k = torch.stack([sin_k[:, None, ...], cos_k[:, None, ...]], dim=0)
+            if context_length is not None:
+                identity_suffix_length = context_length - sin_k.shape[-2]
+                if identity_suffix_length < 0:
+                    raise ValueError("context length cannot be smaller than the positioned context")
+                rope_k = self._append_identity_rope(rope_k, identity_suffix_length)
         else:
             rope_k = None
         return rope_q, rope_k
@@ -982,6 +1110,7 @@ class JEPAConfig:
         gram_remove_neg: Whether to remove negative values from the Gram matrix.
         gram_loss_weight: The coefficient of the Gram loss.
         sigreg_loss_weight: The coefficient of the SigREG loss.
+        jepa_loss_weight: The coefficient of the primary JEPA prediction loss.
         stem_jepa_loss_weight: The coefficient of the stem-target JEPA loss.
         jepa_loss_kind: Reconstruction loss kind applied to both JEPA prediction losses.
     """
@@ -1005,6 +1134,7 @@ class JEPAConfig:
     gram_remove_neg: bool = False
     gram_loss_weight: float = 1.0
     sigreg_loss_weight: float = 1e-4
+    jepa_loss_weight: float = 1.0
     stem_jepa_loss_weight: float = 0.0
     jepa_loss_kind: JEPALossKind = MSE_JEPA_LOSS_KIND
 
@@ -1029,6 +1159,11 @@ class JEPAConfig:
             and self.predictor_attention_mode != CROSS_ATTENTION_PREDICTOR_MODE
         ):
             raise ValueError("Expanded CLS prediction requires predictor_attention_mode='cross_attention'")
+        if (
+            self.cls_prediction_mode in JOINT_CONTEXT_CLS_PREDICTION_MODES
+            and self.predictor_attention_mode != CROSS_ATTENTION_PREDICTOR_MODE
+        ):
+            raise ValueError("Joint-context CLS prediction requires predictor_attention_mode='cross_attention'")
         if self.use_gram_anchoring and self.gram_start_epoch is None:
             raise ValueError("gram_start_epoch must be set when use_gram_anchoring is enabled")
         if self.gram_teacher_epoch <= 0:
@@ -1045,6 +1180,8 @@ class JEPAConfig:
             raise ValueError("gram_loss_weight must be a positive float")
         if self.sigreg_loss_weight < 0:
             raise ValueError("sigreg_loss_weight must be a non-negative float")
+        if self.jepa_loss_weight < 0:
+            raise ValueError("jepa_loss_weight must be a non-negative float")
         if self.stem_jepa_loss_weight < 0:
             raise ValueError("stem_jepa_loss_weight must be a non-negative float")
         if self.jepa_loss_kind not in JEPA_LOSS_KINDS:

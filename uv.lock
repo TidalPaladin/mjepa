@@ -830,7 +830,7 @@ requires-dist = [
     { name = "torchmetrics", specifier = ">=1.9,<2" },
     { name = "torchvision", specifier = ">=0.28,<0.29" },
     { name = "tqdm", specifier = ">=4.68.4,<5" },
-    { name = "vit", git = "https://github.com/TidalPaladin/vit.git" },
+    { name = "vit", git = "https://github.com/TidalPaladin/vit.git?rev=bf15705454975f04912538cdc790d399eea69e67" },
     { name = "wandb", specifier = ">=0.28.1,<0.29" },
 ]
 provides-extras = ["dicom", "visualization"]
@@ -2041,8 +2041,8 @@ wheels = [
 
 [[package]]
 name = "vit"
-version = "0.1.2.dev7+gf8b40c753"
-source = { git = "https://github.com/TidalPaladin/vit.git#f8b40c753d7bea5b9d788b379bda1445af0748aa" }
+version = "0.1.2.dev10+gbf1570545"
+source = { git = "https://github.com/TidalPaladin/vit.git?rev=bf15705454975f04912538cdc790d399eea69e67#bf15705454975f04912538cdc790d399eea69e67" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },

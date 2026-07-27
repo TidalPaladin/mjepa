@@ -23,13 +23,16 @@ dependencies = [
     "pyarrow>=25,<26",
     "safetensors>=0.8,<0.9",
     "tqdm>=4.68.4,<5",
-    "vit @ git+https://github.com/TidalPaladin/vit.git",
+    "vit",
     "wandb>=0.28.1,<0.29",
 ]
 readme = "README.md"
 dynamic = [
     "version",
 ]
+
+[tool.uv.sources]
+vit = { git = "https://github.com/TidalPaladin/vit.git", rev = "bf15705454975f04912538cdc790d399eea69e67" }
 
 [project.optional-dependencies]
 dicom = [
