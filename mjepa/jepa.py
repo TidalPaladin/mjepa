@@ -45,6 +45,8 @@ PROJECTED_CLS_PREDICTION_MODE = "projected_cross_attention"
 SLOT_BIAS_CLS_PREDICTION_MODE = "slot_bias_cross_attention"
 RESIDUAL_PROJECTED_CLS_PREDICTION_MODE = "residual_projected_cross_attention"
 RESIDUAL_MLP_CLS_PREDICTION_MODE = "residual_mlp_cross_attention"
+PARTITIONED_SHARED_CLS_PREDICTION_MODE = "partitioned_shared_cross_attention"
+PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE = "partitioned_independent_cross_attention"
 CLS_CONTEXT_TOKENS = 4
 PROJECTED_CLS_CONTEXT_TOKENS = CLS_CONTEXT_TOKENS
 CLSPredictionMode: TypeAlias = Literal[
@@ -55,6 +57,8 @@ CLSPredictionMode: TypeAlias = Literal[
     "slot_bias_cross_attention",
     "residual_projected_cross_attention",
     "residual_mlp_cross_attention",
+    "partitioned_shared_cross_attention",
+    "partitioned_independent_cross_attention",
 ]
 CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     LEGACY_CLS_PREDICTION_MODE,
@@ -64,14 +68,21 @@ CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     SLOT_BIAS_CLS_PREDICTION_MODE,
     RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
     RESIDUAL_MLP_CLS_PREDICTION_MODE,
+    PARTITIONED_SHARED_CLS_PREDICTION_MODE,
+    PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
 )
 ADALN_CLS_PREDICTION_MODES = (ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE)
 PROJECTED_CLS_PREDICTION_MODES = (
     PROJECTED_CLS_PREDICTION_MODE,
     RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
 )
+PARTITIONED_CLS_PREDICTION_MODES = (
+    PARTITIONED_SHARED_CLS_PREDICTION_MODE,
+    PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+)
 EXPANDED_CLS_PREDICTION_MODES = (
     *PROJECTED_CLS_PREDICTION_MODES,
+    *PARTITIONED_CLS_PREDICTION_MODES,
     SLOT_BIAS_CLS_PREDICTION_MODE,
     RESIDUAL_MLP_CLS_PREDICTION_MODE,
 )
@@ -105,6 +116,48 @@ def _sync_module_config_dtype(model: nn.Module, dtype: torch.dtype) -> None:
 def autocast_context(device_type: str, dtype: torch.dtype):
     enabled = dtype in _AUTOCAST_DTYPES
     return torch.autocast(device_type=device_type, dtype=dtype, enabled=enabled)
+
+
+class PartitionedCLSProjection(nn.Module):
+    """Lift four disjoint channel groups from one CLS embedding into predictor context tokens."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        shared: bool,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        if hidden_size % CLS_CONTEXT_TOKENS != 0:
+            raise ValueError(f"hidden_size must be divisible by {CLS_CONTEXT_TOKENS}")
+        self.hidden_size = hidden_size
+        self.chunk_size = hidden_size // CLS_CONTEXT_TOKENS
+        self.shared = shared
+        projection_count = 1 if shared else CLS_CONTEXT_TOKENS
+        self.weight = nn.Parameter(
+            torch.empty(projection_count, hidden_size, self.chunk_size, device=device, dtype=dtype)
+        )
+        self.bias = nn.Parameter(torch.empty(CLS_CONTEXT_TOKENS, hidden_size, device=device, dtype=dtype))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.trunc_normal_(self.weight, std=PREDICTOR_PROJ_INIT_STD)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, cls_embedding: Tensor) -> Tensor:
+        if cls_embedding.ndim != 2:
+            raise ValueError("cls_embedding must have shape [batch, hidden_size]")
+        expected_shape = (cls_embedding.shape[0], self.hidden_size)
+        if tuple(cls_embedding.shape) != expected_shape:
+            raise ValueError(f"cls_embedding must have shape {expected_shape}")
+        chunks = cls_embedding.reshape(cls_embedding.shape[0], CLS_CONTEXT_TOKENS, self.chunk_size)
+        if self.shared:
+            output = F.linear(chunks, self.weight[0])
+        else:
+            output = torch.einsum("bsc,sdc->bsd", chunks, self.weight)
+        return output + self.bias
 
 
 class CrossAttentionPredictor(nn.Module):
@@ -181,6 +234,15 @@ class CrossAttentionPredictor(nn.Module):
         self.cls_context_slot_bias = (
             self._create_cls_context_slot_bias(device=device, dtype=backbone.config.dtype)
             if cls_prediction_mode == SLOT_BIAS_CLS_PREDICTION_MODE
+            else None
+        )
+        self.cls_context_partition_projection = (
+            self._create_cls_context_partition_projection(
+                shared=cls_prediction_mode == PARTITIONED_SHARED_CLS_PREDICTION_MODE,
+                device=device,
+                dtype=backbone.config.dtype,
+            )
+            if cls_prediction_mode in PARTITIONED_CLS_PREDICTION_MODES
             else None
         )
 
@@ -280,6 +342,15 @@ class CrossAttentionPredictor(nn.Module):
         slot_bias = nn.Parameter(torch.empty(1, CLS_CONTEXT_TOKENS, self.hidden_size, device=device, dtype=dtype))
         nn.init.trunc_normal_(slot_bias, std=PREDICTOR_PROJ_INIT_STD)
         return slot_bias
+
+    def _create_cls_context_partition_projection(
+        self,
+        *,
+        shared: bool,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> PartitionedCLSProjection:
+        return PartitionedCLSProjection(self.hidden_size, shared=shared, device=device, dtype=dtype)
 
     def enable_shallow_head(self) -> None:
         if self.predictor_proj_shallow is not None:
@@ -498,6 +569,12 @@ class CrossAttentionPredictor(nn.Module):
         """Expand one CLS embedding into four contexts for a configured legacy predictor replay."""
         if self.cls_prediction_mode in PROJECTED_CLS_PREDICTION_MODES:
             return self.project_cls_context(cls_context)
+        if self.cls_prediction_mode in PARTITIONED_CLS_PREDICTION_MODES:
+            self._validate_single_cls_context(cls_context)
+            assert self.cls_context_partition_projection is not None
+            with autocast_context(cls_context.device.type, self.predictor_dtype):
+                context = cls_context.to(dtype=self.predictor_dtype)
+                return self.cls_context_partition_projection(context[:, 0])
         if self.cls_prediction_mode == RESIDUAL_MLP_CLS_PREDICTION_MODE:
             self._validate_single_cls_context(cls_context)
             assert self.cls_context_mlp is not None

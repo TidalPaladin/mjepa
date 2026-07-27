@@ -9,6 +9,8 @@ from mjepa.jepa import (
     COSINE_JEPA_LOSS_KIND,
     CROSS_ATTENTION_PREDICTOR_MODE,
     MSE_JEPA_LOSS_KIND,
+    PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+    PARTITIONED_SHARED_CLS_PREDICTION_MODE,
     PREDICTOR_ATTENTION_MODES,
     PROJECTED_CLS_CONTEXT_TOKENS,
     PROJECTED_CLS_PREDICTION_MODE,
@@ -1288,6 +1290,8 @@ class TestMJEPAForward:
             SLOT_BIAS_CLS_PREDICTION_MODE,
             RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
             RESIDUAL_MLP_CLS_PREDICTION_MODE,
+            PARTITIONED_SHARED_CLS_PREDICTION_MODE,
+            PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
         ],
     )
     def test_expanded_cls_prediction_requires_exactly_one_cls_token(self, cls_prediction_mode):
@@ -1339,6 +1343,33 @@ class TestMJEPAForward:
         [RESIDUAL_PROJECTED_CLS_PREDICTION_MODE, RESIDUAL_MLP_CLS_PREDICTION_MODE],
     )
     def test_residual_cls_prediction_uses_four_token_auxiliary_context(
+        self,
+        dummy_batch,
+        mocker,
+        cls_prediction_mode,
+    ):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        model.eval()
+        forward_predictor = mocker.spy(model, "forward_predictor")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        expanded_context = forward_predictor.call_args.args[1]
+        expected_context = model.predictor.expand_cls_context(predictions.student_output.cls_tokens)
+        assert expanded_context.shape == (TEST_BATCH_SIZE, PROJECTED_CLS_CONTEXT_TOKENS, TEST_HIDDEN_SIZE)
+        assert torch.equal(expanded_context, expected_context)
+        assert predictions.pred_with_cls is not None
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [PARTITIONED_SHARED_CLS_PREDICTION_MODE, PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE],
+    )
+    def test_partitioned_cls_prediction_uses_four_token_auxiliary_context(
         self,
         dummy_batch,
         mocker,

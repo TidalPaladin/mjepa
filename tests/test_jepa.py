@@ -17,6 +17,8 @@ from mjepa.jepa import (
     ENCODER_PREDICTOR_MODE,
     LEGACY_CLS_PREDICTION_MODE,
     MSE_JEPA_LOSS_KIND,
+    PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+    PARTITIONED_SHARED_CLS_PREDICTION_MODE,
     PREDICTOR_ATTENTION_MODES,
     PREDICTOR_PROJ_INIT_STD,
     PROJECTED_CLS_CONTEXT_TOKENS,
@@ -216,7 +218,12 @@ class TestJEPAConfig:
 
     @pytest.mark.parametrize(
         "cls_prediction_mode",
-        [PROJECTED_CLS_PREDICTION_MODE, SLOT_BIAS_CLS_PREDICTION_MODE],
+        [
+            PROJECTED_CLS_PREDICTION_MODE,
+            SLOT_BIAS_CLS_PREDICTION_MODE,
+            PARTITIONED_SHARED_CLS_PREDICTION_MODE,
+            PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+        ],
     )
     def test_expanded_cls_prediction_requires_cross_attention(self, cls_prediction_mode):
         with pytest.raises(ValueError, match="requires predictor_attention_mode='cross_attention'"):
@@ -631,6 +638,63 @@ class TestCrossAttentionPredictor:
         [RESIDUAL_PROJECTED_CLS_PREDICTION_MODE, RESIDUAL_MLP_CLS_PREDICTION_MODE],
     )
     def test_residual_cls_context_rejects_multiple_input_tokens(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            predictor.expand_cls_context(torch.randn(2, 2, 64))
+
+    @pytest.mark.parametrize(
+        ("cls_prediction_mode", "projection_count"),
+        [
+            (PARTITIONED_SHARED_CLS_PREDICTION_MODE, 1),
+            (PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE, PROJECTED_CLS_CONTEXT_TOKENS),
+        ],
+    )
+    def test_partitioned_cls_context_isolates_input_chunks_and_backpropagates(
+        self,
+        cls_prediction_mode,
+        projection_count,
+    ):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        projection = predictor.cls_context_partition_projection
+        assert projection is not None
+        chunk_size = 64 // PROJECTED_CLS_CONTEXT_TOKENS
+        assert projection.weight.shape == (projection_count, 64, chunk_size)
+        with torch.no_grad():
+            projection.weight.fill_(1.0)
+            projection.bias.zero_()
+
+        cls_context = torch.zeros(2, 1, 64, requires_grad=True)
+        changed_context = cls_context.detach().clone()
+        changed_context[:, :, :chunk_size] = 1.0
+        base_output = predictor.expand_cls_context(cls_context)
+        changed_output = predictor.expand_cls_context(changed_context)
+        delta = changed_output - base_output
+
+        assert base_output.shape == (2, PROJECTED_CLS_CONTEXT_TOKENS, 64)
+        assert torch.count_nonzero(delta[:, 0]) > 0
+        assert torch.count_nonzero(delta[:, 1:]) == 0
+
+        base_output.square().mean().backward()
+        assert projection.weight.grad is not None
+        assert projection.bias.grad is not None
+        assert cls_context.grad is not None
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [PARTITIONED_SHARED_CLS_PREDICTION_MODE, PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE],
+    )
+    def test_partitioned_cls_context_rejects_multiple_input_tokens(self, cls_prediction_mode):
         backbone = self._instantiate_backbone(torch.float32)
         predictor = CrossAttentionPredictor(
             backbone,
