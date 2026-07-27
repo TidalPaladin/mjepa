@@ -150,6 +150,7 @@ class TestJEPAConfig:
         assert config.predictor_depth == 4
         assert config.predictor_attention_mode == CROSS_ATTENTION_PREDICTOR_MODE
         assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
+        assert config.cls_context_tokens == PROJECTED_CLS_CONTEXT_TOKENS
         assert config.disable_predictor_regularizers is False
         assert config.teacher_dtype is None
         assert config.use_gram_anchoring is False
@@ -231,6 +232,27 @@ class TestJEPAConfig:
                 predictor_attention_mode=DECODER_PREDICTOR_MODE,
                 cls_prediction_mode=cls_prediction_mode,
             )
+
+    @pytest.mark.parametrize("cls_context_tokens", [2, 4, 8])
+    def test_partitioned_cls_prediction_accepts_configurable_context_count(self, cls_context_tokens):
+        config = JEPAConfig(
+            cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+            cls_context_tokens=cls_context_tokens,
+        )
+
+        assert config.cls_context_tokens == cls_context_tokens
+
+    @pytest.mark.parametrize("cls_context_tokens", [0, -1, True])
+    def test_cls_context_count_must_be_a_positive_integer(self, cls_context_tokens):
+        with pytest.raises(ValueError, match="cls_context_tokens must be a positive integer"):
+            JEPAConfig(
+                cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+                cls_context_tokens=cls_context_tokens,
+            )
+
+    def test_nonpartitioned_cls_prediction_rejects_nondefault_context_count(self):
+        with pytest.raises(ValueError, match="only configurable for partitioned CLS prediction"):
+            JEPAConfig(cls_context_tokens=2)
 
 
 class TestYAMLConfig:
@@ -648,28 +670,33 @@ class TestCrossAttentionPredictor:
         with pytest.raises(ValueError, match="exactly one CLS token"):
             predictor.expand_cls_context(torch.randn(2, 2, 64))
 
+    @pytest.mark.parametrize("cls_context_tokens", [2, 4, 8])
     @pytest.mark.parametrize(
-        ("cls_prediction_mode", "projection_count"),
+        ("cls_prediction_mode", "shared"),
         [
-            (PARTITIONED_SHARED_CLS_PREDICTION_MODE, 1),
-            (PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE, PROJECTED_CLS_CONTEXT_TOKENS),
+            (PARTITIONED_SHARED_CLS_PREDICTION_MODE, True),
+            (PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE, False),
         ],
     )
     def test_partitioned_cls_context_isolates_input_chunks_and_backpropagates(
         self,
         cls_prediction_mode,
-        projection_count,
+        shared,
+        cls_context_tokens,
     ):
         backbone = self._instantiate_backbone(torch.float32)
         predictor = CrossAttentionPredictor(
             backbone,
             depth=2,
             cls_prediction_mode=cls_prediction_mode,
+            cls_context_tokens=cls_context_tokens,
         )
         projection = predictor.cls_context_partition_projection
         assert projection is not None
-        chunk_size = 64 // PROJECTED_CLS_CONTEXT_TOKENS
+        chunk_size = 64 // cls_context_tokens
+        projection_count = 1 if shared else cls_context_tokens
         assert projection.weight.shape == (projection_count, 64, chunk_size)
+        assert projection.bias.shape == (cls_context_tokens, 64)
         with torch.no_grad():
             projection.weight.fill_(1.0)
             projection.bias.zero_()
@@ -681,7 +708,7 @@ class TestCrossAttentionPredictor:
         changed_output = predictor.expand_cls_context(changed_context)
         delta = changed_output - base_output
 
-        assert base_output.shape == (2, PROJECTED_CLS_CONTEXT_TOKENS, 64)
+        assert base_output.shape == (2, cls_context_tokens, 64)
         assert torch.count_nonzero(delta[:, 0]) > 0
         assert torch.count_nonzero(delta[:, 1:]) == 0
 
@@ -689,6 +716,49 @@ class TestCrossAttentionPredictor:
         assert projection.weight.grad is not None
         assert projection.bias.grad is not None
         assert cls_context.grad is not None
+
+    @pytest.mark.parametrize("cls_context_tokens", [2, 4, 8])
+    def test_independent_partitioned_cls_context_has_constant_weight_capacity(self, cls_context_tokens):
+        hidden_size = 64
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+            cls_context_tokens=cls_context_tokens,
+        )
+        projection = predictor.cls_context_partition_projection
+        assert projection is not None
+
+        assert projection.weight.shape == (
+            cls_context_tokens,
+            hidden_size,
+            hidden_size // cls_context_tokens,
+        )
+        assert projection.bias.shape == (cls_context_tokens, hidden_size)
+        assert projection.weight.numel() == hidden_size**2
+        assert predictor.expand_cls_context(torch.randn(2, 1, hidden_size)).shape == (
+            2,
+            cls_context_tokens,
+            hidden_size,
+        )
+
+    def test_partitioned_cls_context_requires_divisible_hidden_size(self):
+        backbone = self._instantiate_backbone(torch.float32)
+
+        with pytest.raises(ValueError, match="hidden_size must be divisible by cls_context_tokens"):
+            CrossAttentionPredictor(
+                backbone,
+                depth=2,
+                cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+                cls_context_tokens=3,
+            )
+
+    def test_nonpartitioned_predictor_rejects_nondefault_context_count(self):
+        backbone = self._instantiate_backbone(torch.float32)
+
+        with pytest.raises(ValueError, match="only configurable for partitioned CLS prediction"):
+            CrossAttentionPredictor(backbone, depth=2, cls_context_tokens=2)
 
     @pytest.mark.parametrize(
         "cls_prediction_mode",

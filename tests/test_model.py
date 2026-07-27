@@ -419,6 +419,23 @@ class TestMJEPAInitialization:
         with pytest.raises(ValueError, match="Predictor attention mode does not match JEPAConfig"):
             MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
 
+    def test_initialization_rejects_cls_context_count_mismatch(self):
+        """Test that config and predictor partition counts must agree."""
+        config = JEPAConfig(
+            cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+            cls_context_tokens=2,
+        )
+        backbone = _make_test_vit_config(num_cls_tokens=1).instantiate()
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=TEST_PREDICTOR_DEPTH,
+            cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+            cls_context_tokens=8,
+        )
+
+        with pytest.raises(ValueError, match="Predictor CLS context count does not match JEPAConfig"):
+            MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
+
     def test_teacher_frozen(self, mjepa_model):
         """Test that teacher parameters are frozen."""
         for param in mjepa_model.teacher.parameters():

@@ -89,6 +89,13 @@ EXPANDED_CLS_PREDICTION_MODES = (
 SINGLE_CLS_PREDICTION_MODES = (*ADALN_CLS_PREDICTION_MODES, *EXPANDED_CLS_PREDICTION_MODES)
 
 
+def _validate_cls_context_tokens(cls_prediction_mode: CLSPredictionMode, cls_context_tokens: int) -> None:
+    if isinstance(cls_context_tokens, bool) or not isinstance(cls_context_tokens, int) or cls_context_tokens <= 0:
+        raise ValueError("cls_context_tokens must be a positive integer")
+    if cls_prediction_mode not in PARTITIONED_CLS_PREDICTION_MODES and cls_context_tokens != CLS_CONTEXT_TOKENS:
+        raise ValueError("cls_context_tokens is only configurable for partitioned CLS prediction modes")
+
+
 def _normalize_dtype(dtype: torch.dtype | str | None, field_name: str) -> torch.dtype | None:
     if dtype is None or isinstance(dtype, torch.dtype):
         return dtype
@@ -119,27 +126,31 @@ def autocast_context(device_type: str, dtype: torch.dtype):
 
 
 class PartitionedCLSProjection(nn.Module):
-    """Lift four disjoint channel groups from one CLS embedding into predictor context tokens."""
+    """Lift disjoint channel groups from one CLS embedding into predictor context tokens."""
 
     def __init__(
         self,
         hidden_size: int,
         *,
         shared: bool,
+        num_context_tokens: int = CLS_CONTEXT_TOKENS,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        if hidden_size % CLS_CONTEXT_TOKENS != 0:
-            raise ValueError(f"hidden_size must be divisible by {CLS_CONTEXT_TOKENS}")
+        if isinstance(num_context_tokens, bool) or not isinstance(num_context_tokens, int) or num_context_tokens <= 0:
+            raise ValueError("num_context_tokens must be a positive integer")
+        if hidden_size % num_context_tokens != 0:
+            raise ValueError("hidden_size must be divisible by cls_context_tokens")
         self.hidden_size = hidden_size
-        self.chunk_size = hidden_size // CLS_CONTEXT_TOKENS
+        self.num_context_tokens = num_context_tokens
+        self.chunk_size = hidden_size // num_context_tokens
         self.shared = shared
-        projection_count = 1 if shared else CLS_CONTEXT_TOKENS
+        projection_count = 1 if shared else num_context_tokens
         self.weight = nn.Parameter(
             torch.empty(projection_count, hidden_size, self.chunk_size, device=device, dtype=dtype)
         )
-        self.bias = nn.Parameter(torch.empty(CLS_CONTEXT_TOKENS, hidden_size, device=device, dtype=dtype))
+        self.bias = nn.Parameter(torch.empty(num_context_tokens, hidden_size, device=device, dtype=dtype))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -152,7 +163,7 @@ class PartitionedCLSProjection(nn.Module):
         expected_shape = (cls_embedding.shape[0], self.hidden_size)
         if tuple(cls_embedding.shape) != expected_shape:
             raise ValueError(f"cls_embedding must have shape {expected_shape}")
-        chunks = cls_embedding.reshape(cls_embedding.shape[0], CLS_CONTEXT_TOKENS, self.chunk_size)
+        chunks = cls_embedding.reshape(cls_embedding.shape[0], self.num_context_tokens, self.chunk_size)
         if self.shared:
             output = F.linear(chunks, self.weight[0])
         else:
@@ -182,6 +193,7 @@ class CrossAttentionPredictor(nn.Module):
             ``"encoder"`` runs self-attention over the concatenated query/context sequence.
         cls_prediction_mode: CLS auxiliary-prediction path. AdaLN modes condition the shared
             predictor MLPs and expose a visually blinded MLP-only prediction path.
+        cls_context_tokens: Number of predictor context tokens created by partitioned CLS modes.
     """
 
     def __init__(
@@ -193,12 +205,14 @@ class CrossAttentionPredictor(nn.Module):
         disable_predictor_regularizers: bool = False,
         attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE,
         cls_prediction_mode: CLSPredictionMode = LEGACY_CLS_PREDICTION_MODE,
+        cls_context_tokens: int = CLS_CONTEXT_TOKENS,
     ):
         super().__init__()
         if attention_mode not in PREDICTOR_ATTENTION_MODES:
             raise ValueError(f"attention_mode must be one of {list(PREDICTOR_ATTENTION_MODES)}")
         if cls_prediction_mode not in CLS_PREDICTION_MODES:
             raise ValueError(f"cls_prediction_mode must be one of {list(CLS_PREDICTION_MODES)}")
+        _validate_cls_context_tokens(cls_prediction_mode, cls_context_tokens)
         if cls_prediction_mode in ADALN_CLS_PREDICTION_MODES and attention_mode != CROSS_ATTENTION_PREDICTOR_MODE:
             raise ValueError("AdaLN CLS prediction requires attention_mode='cross_attention'")
         if cls_prediction_mode in EXPANDED_CLS_PREDICTION_MODES and attention_mode != CROSS_ATTENTION_PREDICTOR_MODE:
@@ -208,6 +222,7 @@ class CrossAttentionPredictor(nn.Module):
         self.out_dim = out_dim or backbone.config.hidden_size
         self.attention_mode = attention_mode
         self.cls_prediction_mode = cls_prediction_mode
+        self.cls_context_tokens = cls_context_tokens
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size, **factory_kwargs)
         self.rope = backbone.rope
@@ -350,7 +365,13 @@ class CrossAttentionPredictor(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> PartitionedCLSProjection:
-        return PartitionedCLSProjection(self.hidden_size, shared=shared, device=device, dtype=dtype)
+        return PartitionedCLSProjection(
+            self.hidden_size,
+            shared=shared,
+            num_context_tokens=self.cls_context_tokens,
+            device=device,
+            dtype=dtype,
+        )
 
     def enable_shallow_head(self) -> None:
         if self.predictor_proj_shallow is not None:
@@ -566,7 +587,7 @@ class CrossAttentionPredictor(nn.Module):
             return projected
 
     def expand_cls_context(self, cls_context: Tensor) -> Tensor:
-        """Expand one CLS embedding into four contexts for a configured legacy predictor replay."""
+        """Expand one CLS embedding into contexts for a configured legacy predictor replay."""
         if self.cls_prediction_mode in PROJECTED_CLS_PREDICTION_MODES:
             return self.project_cls_context(cls_context)
         if self.cls_prediction_mode in PARTITIONED_CLS_PREDICTION_MODES:
@@ -948,6 +969,7 @@ class JEPAConfig:
         predictor_depth: Depth of the predictor network.
         predictor_attention_mode: Predictor block attention mode.
         cls_prediction_mode: CLS auxiliary prediction path.
+        cls_context_tokens: Number of predictor contexts produced by partitioned CLS modes.
         disable_predictor_regularizers: Whether to force predictor stochastic depth, hidden dropout,
             and attention dropout to ``0.0``.
         teacher_dtype: Optional dtype override for the teacher and Gram teacher weights.
@@ -972,6 +994,7 @@ class JEPAConfig:
     predictor_depth: int = 4
     predictor_attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE
     cls_prediction_mode: CLSPredictionMode = LEGACY_CLS_PREDICTION_MODE
+    cls_context_tokens: int = CLS_CONTEXT_TOKENS
     disable_predictor_regularizers: bool = False
     teacher_dtype: torch.dtype | str | None = None
     use_gram_anchoring: bool = False
@@ -995,6 +1018,7 @@ class JEPAConfig:
             raise ValueError(f"predictor_attention_mode must be one of {list(PREDICTOR_ATTENTION_MODES)}")
         if self.cls_prediction_mode not in CLS_PREDICTION_MODES:
             raise ValueError(f"cls_prediction_mode must be one of {list(CLS_PREDICTION_MODES)}")
+        _validate_cls_context_tokens(self.cls_prediction_mode, self.cls_context_tokens)
         if (
             self.cls_prediction_mode in ADALN_CLS_PREDICTION_MODES
             and self.predictor_attention_mode != CROSS_ATTENTION_PREDICTOR_MODE

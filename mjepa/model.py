@@ -90,6 +90,11 @@ class MJEPA(nn.Module):
                 "Predictor CLS prediction mode does not match JEPAConfig: "
                 f"{predictor.cls_prediction_mode!r} != {config.cls_prediction_mode!r}"
             )
+        if predictor.cls_context_tokens != config.cls_context_tokens:
+            raise ValueError(
+                "Predictor CLS context count does not match JEPAConfig: "
+                f"{predictor.cls_context_tokens} != {config.cls_context_tokens}"
+            )
         if config.cls_prediction_mode in SINGLE_CLS_PREDICTION_MODES and backbone.config.num_cls_tokens != 1:
             raise ValueError(
                 f"{config.cls_prediction_mode} CLS prediction requires exactly one CLS token, "

@@ -23,6 +23,7 @@ from vit import ViT
 from vit.pos_enc import LearnablePosition
 
 from .jepa import (
+    CLS_CONTEXT_TOKENS,
     CROSS_ATTENTION_PREDICTOR_MODE,
     DECODER_PREDICTOR_MODE,
     ENCODER_PREDICTOR_MODE,
@@ -54,6 +55,7 @@ class CheckpointMetadata:
     elapsed_seconds: float
     wandb_run_id: str | None
     cls_prediction_mode: CLSPredictionMode = LEGACY_CLS_PREDICTION_MODE
+    cls_context_tokens: int = CLS_CONTEXT_TOKENS
 
 
 def seed_everything(seed: int) -> None:
@@ -212,6 +214,7 @@ def save_checkpoint(
         elapsed_seconds=elapsed_seconds,
         wandb_run_id=wandb_run_id,
         cls_prediction_mode=(predictor.cls_prediction_mode if predictor is not None else LEGACY_CLS_PREDICTION_MODE),
+        cls_context_tokens=(predictor.cls_context_tokens if predictor is not None else CLS_CONTEXT_TOKENS),
     )
     temporary_path: Path | None = None
     try:
@@ -243,6 +246,7 @@ def load_checkpoint_metadata(path: os.PathLike) -> CheckpointMetadata:
         elapsed_seconds=float(data.get("elapsed_seconds", 0.0)),
         wandb_run_id=data.get("wandb_run_id"),
         cls_prediction_mode=data.get("cls_prediction_mode", LEGACY_CLS_PREDICTION_MODE),
+        cls_context_tokens=int(data.get("cls_context_tokens", CLS_CONTEXT_TOKENS)),
     )
 
 
@@ -341,6 +345,13 @@ def _predictor_cls_prediction_mode_mismatch(
     return predictor.cls_prediction_mode != checkpoint_mode
 
 
+def _predictor_cls_context_tokens_mismatch(
+    predictor: CrossAttentionPredictor,
+    checkpoint_tokens: int,
+) -> bool:
+    return predictor.cls_context_tokens != checkpoint_tokens
+
+
 def load_checkpoint(
     path: os.PathLike,
     backbone: ViT,
@@ -387,6 +398,7 @@ def load_checkpoint(
         else None
     )
     checkpoint_cls_prediction_mode = data.get("cls_prediction_mode", LEGACY_CLS_PREDICTION_MODE)
+    checkpoint_cls_context_tokens = int(data.get("cls_context_tokens", CLS_CONTEXT_TOKENS))
 
     if mode == "resume" and predictor and _predictor_shallow_head_mismatch(predictor, data["predictor"]):
         raise ValueError(
@@ -408,6 +420,16 @@ def load_checkpoint(
             "Cannot resume across predictor CLS-prediction-mode changes; "
             f"checkpoint uses {checkpoint_cls_prediction_mode!r} but current predictor uses "
             f"{predictor.cls_prediction_mode!r}. Load with mode='fresh' or match cls_prediction_mode."
+        )
+    if (
+        mode == "resume"
+        and predictor
+        and _predictor_cls_context_tokens_mismatch(predictor, checkpoint_cls_context_tokens)
+    ):
+        raise ValueError(
+            "Cannot resume across predictor CLS-context-token count changes; "
+            f"checkpoint uses {checkpoint_cls_context_tokens} but current predictor uses "
+            f"{predictor.cls_context_tokens}. Load with mode='fresh' or match cls_context_tokens."
         )
 
     # Validate image size
