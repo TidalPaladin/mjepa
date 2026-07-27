@@ -149,8 +149,9 @@ def create_joint_context_attention_mask(
         routes = _balanced_joint_context_routes(batch_size, device)
         routes = routes[:, None].expand(-1, target_tokens)
     else:
-        routes = _balanced_joint_context_routes(batch_size * target_tokens, device)
-        routes = routes.reshape(batch_size, target_tokens)
+        base_routes = _balanced_joint_context_routes(target_tokens, device)
+        permutations = torch.rand(batch_size, target_tokens, device=device).argsort(dim=1)
+        routes = base_routes[None].expand(batch_size, -1).gather(1, permutations)
 
     attention_mask = torch.ones(
         batch_size,

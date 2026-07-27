@@ -558,7 +558,10 @@ class TestJointContextRouting:
         unique_patterns_per_example = [
             torch.unique(example_mask, dim=0).shape[0] for example_mask in attention_mask[:, 0]
         ]
-        assert max(unique_patterns_per_example) > 1
+        assert unique_patterns_per_example == [3] * self.BATCH_SIZE
+        assert [self._route_counts(example_mask[None, None]) for example_mask in attention_mask[:, 0]] == [
+            (2, 1, 1)
+        ] * self.BATCH_SIZE
 
 
 class TestCrossAttentionPredictor:
