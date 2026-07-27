@@ -43,6 +43,8 @@ ADALN_BLIND_CLS_PREDICTION_MODE = "adaln_blind"
 ADALN_SHARED_CLS_PREDICTION_MODE = "adaln_shared"
 PROJECTED_CLS_PREDICTION_MODE = "projected_cross_attention"
 SLOT_BIAS_CLS_PREDICTION_MODE = "slot_bias_cross_attention"
+RESIDUAL_PROJECTED_CLS_PREDICTION_MODE = "residual_projected_cross_attention"
+RESIDUAL_MLP_CLS_PREDICTION_MODE = "residual_mlp_cross_attention"
 CLS_CONTEXT_TOKENS = 4
 PROJECTED_CLS_CONTEXT_TOKENS = CLS_CONTEXT_TOKENS
 CLSPredictionMode: TypeAlias = Literal[
@@ -51,6 +53,8 @@ CLSPredictionMode: TypeAlias = Literal[
     "adaln_shared",
     "projected_cross_attention",
     "slot_bias_cross_attention",
+    "residual_projected_cross_attention",
+    "residual_mlp_cross_attention",
 ]
 CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     LEGACY_CLS_PREDICTION_MODE,
@@ -58,9 +62,19 @@ CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     ADALN_SHARED_CLS_PREDICTION_MODE,
     PROJECTED_CLS_PREDICTION_MODE,
     SLOT_BIAS_CLS_PREDICTION_MODE,
+    RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
+    RESIDUAL_MLP_CLS_PREDICTION_MODE,
 )
 ADALN_CLS_PREDICTION_MODES = (ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE)
-EXPANDED_CLS_PREDICTION_MODES = (PROJECTED_CLS_PREDICTION_MODE, SLOT_BIAS_CLS_PREDICTION_MODE)
+PROJECTED_CLS_PREDICTION_MODES = (
+    PROJECTED_CLS_PREDICTION_MODE,
+    RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
+)
+EXPANDED_CLS_PREDICTION_MODES = (
+    *PROJECTED_CLS_PREDICTION_MODES,
+    SLOT_BIAS_CLS_PREDICTION_MODE,
+    RESIDUAL_MLP_CLS_PREDICTION_MODE,
+)
 SINGLE_CLS_PREDICTION_MODES = (*ADALN_CLS_PREDICTION_MODES, *EXPANDED_CLS_PREDICTION_MODES)
 
 
@@ -156,7 +170,12 @@ class CrossAttentionPredictor(nn.Module):
         self.predictor_proj_shallow: nn.Linear | None = None
         self.cls_context_projection = (
             self._create_cls_context_projection(device=device, dtype=backbone.config.dtype)
-            if cls_prediction_mode == PROJECTED_CLS_PREDICTION_MODE
+            if cls_prediction_mode in PROJECTED_CLS_PREDICTION_MODES
+            else None
+        )
+        self.cls_context_mlp = (
+            self._create_cls_context_mlp(device=device, dtype=backbone.config.dtype)
+            if cls_prediction_mode == RESIDUAL_MLP_CLS_PREDICTION_MODE
             else None
         )
         self.cls_context_slot_bias = (
@@ -222,6 +241,22 @@ class CrossAttentionPredictor(nn.Module):
         )
         self._reset_projection_parameters(projection)
         return projection
+
+    def _create_cls_context_mlp(
+        self,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> nn.Sequential:
+        input_projection = nn.Linear(self.hidden_size, self.hidden_size, device=device, dtype=dtype)
+        output_projection = nn.Linear(
+            self.hidden_size,
+            CLS_CONTEXT_TOKENS * self.hidden_size,
+            device=device,
+            dtype=dtype,
+        )
+        self._reset_projection_parameters(input_projection)
+        self._reset_projection_parameters(output_projection)
+        return nn.Sequential(input_projection, nn.GELU(), output_projection)
 
     def _create_cls_context_projection(
         self,
@@ -443,19 +478,37 @@ class CrossAttentionPredictor(nn.Module):
             raise ValueError(f"cls_context must contain exactly one CLS token with shape {expected_shape}")
 
     def project_cls_context(self, cls_context: Tensor) -> Tensor:
-        """Expand one CLS embedding into four learned views for the legacy predictor path."""
+        """Expand one CLS embedding into four affine views for the legacy predictor path."""
         projection = self.cls_context_projection
-        if self.cls_prediction_mode != PROJECTED_CLS_PREDICTION_MODE or projection is None:
-            raise ValueError("project_cls_context requires projected_cross_attention CLS prediction")
+        if self.cls_prediction_mode not in PROJECTED_CLS_PREDICTION_MODES or projection is None:
+            raise ValueError("project_cls_context requires an affine projected CLS prediction mode")
         self._validate_single_cls_context(cls_context)
         with autocast_context(cls_context.device.type, self.predictor_dtype):
-            projected = projection(cls_context[:, 0].to(dtype=self.predictor_dtype))
-        return projected.reshape(cls_context.shape[0], CLS_CONTEXT_TOKENS, self.hidden_size)
+            context = cls_context.to(dtype=self.predictor_dtype)
+            projected = projection(context[:, 0]).reshape(
+                cls_context.shape[0],
+                CLS_CONTEXT_TOKENS,
+                self.hidden_size,
+            )
+            if self.cls_prediction_mode == RESIDUAL_PROJECTED_CLS_PREDICTION_MODE:
+                projected = projected + context.expand(-1, CLS_CONTEXT_TOKENS, -1)
+            return projected
 
     def expand_cls_context(self, cls_context: Tensor) -> Tensor:
         """Expand one CLS embedding into four contexts for a configured legacy predictor replay."""
-        if self.cls_prediction_mode == PROJECTED_CLS_PREDICTION_MODE:
+        if self.cls_prediction_mode in PROJECTED_CLS_PREDICTION_MODES:
             return self.project_cls_context(cls_context)
+        if self.cls_prediction_mode == RESIDUAL_MLP_CLS_PREDICTION_MODE:
+            self._validate_single_cls_context(cls_context)
+            assert self.cls_context_mlp is not None
+            with autocast_context(cls_context.device.type, self.predictor_dtype):
+                context = cls_context.to(dtype=self.predictor_dtype)
+                residual = self.cls_context_mlp(context[:, 0]).reshape(
+                    cls_context.shape[0],
+                    CLS_CONTEXT_TOKENS,
+                    self.hidden_size,
+                )
+                return context.expand(-1, CLS_CONTEXT_TOKENS, -1) + residual
         if self.cls_prediction_mode != SLOT_BIAS_CLS_PREDICTION_MODE or self.cls_context_slot_bias is None:
             raise ValueError("expand_cls_context requires an expanded CLS prediction mode")
         self._validate_single_cls_context(cls_context)

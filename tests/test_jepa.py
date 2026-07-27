@@ -21,6 +21,8 @@ from mjepa.jepa import (
     PREDICTOR_PROJ_INIT_STD,
     PROJECTED_CLS_CONTEXT_TOKENS,
     PROJECTED_CLS_PREDICTION_MODE,
+    RESIDUAL_MLP_CLS_PREDICTION_MODE,
+    RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
     SLOT_BIAS_CLS_PREDICTION_MODE,
     CrossAttentionPredictor,
     JEPAConfig,
@@ -589,6 +591,55 @@ class TestCrossAttentionPredictor:
 
         with pytest.raises(ValueError, match="exactly one CLS token"):
             predictor.project_cls_context(torch.randn(2, 2, 64))
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [RESIDUAL_PROJECTED_CLS_PREDICTION_MODE, RESIDUAL_MLP_CLS_PREDICTION_MODE],
+    )
+    def test_residual_cls_context_preserves_raw_embedding_at_zero_residual(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        cls_context = torch.randn(2, 1, 64, requires_grad=True)
+        residual_module: nn.Linear
+        if cls_prediction_mode == RESIDUAL_PROJECTED_CLS_PREDICTION_MODE:
+            assert isinstance(predictor.cls_context_projection, nn.Linear)
+            residual_module = predictor.cls_context_projection
+        else:
+            assert predictor.cls_context_mlp is not None
+            output_projection = predictor.cls_context_mlp[-1]
+            assert isinstance(output_projection, nn.Linear)
+            residual_module = output_projection
+        nn.init.zeros_(residual_module.weight)
+        nn.init.zeros_(residual_module.bias)
+
+        expanded_context = predictor.expand_cls_context(cls_context)
+        expanded_context.square().mean().backward()
+
+        assert torch.equal(
+            expanded_context,
+            cls_context.expand(-1, PROJECTED_CLS_CONTEXT_TOKENS, -1),
+        )
+        assert residual_module.weight.grad is not None
+        assert cls_context.grad is not None
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [RESIDUAL_PROJECTED_CLS_PREDICTION_MODE, RESIDUAL_MLP_CLS_PREDICTION_MODE],
+    )
+    def test_residual_cls_context_rejects_multiple_input_tokens(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            predictor.expand_cls_context(torch.randn(2, 2, 64))
 
     def test_slot_bias_cls_context_adds_learned_slot_identities_and_backpropagates(self):
         backbone = self._instantiate_backbone(torch.float32)
