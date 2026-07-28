@@ -8,8 +8,10 @@ from mjepa.jepa import (
     ADALN_SHARED_CLS_PREDICTION_MODE,
     COSINE_JEPA_LOSS_KIND,
     CROSS_ATTENTION_PREDICTOR_MODE,
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     JOINT_CONTEXT_CLS_PREDICTION_MODE,
     MSE_JEPA_LOSS_KIND,
+    PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
     PARTITIONED_SHARED_CLS_PREDICTION_MODE,
     PREDICTOR_ATTENTION_MODES,
@@ -19,12 +21,14 @@ from mjepa.jepa import (
     RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
     SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     SLOT_BIAS_CLS_PREDICTION_MODE,
+    SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     CLSPredictionMode,
     CrossAttentionPredictor,
     JEPAConfig,
     JEPALossKind,
     PredictorAttentionMode,
+    create_joint_context_attention_mask,
 )
 from mjepa.model import MJEPA, MJEPALosses, MJEPAPredictions
 
@@ -902,6 +906,57 @@ class TestMJEPAComputeLosses:
         assert losses.jepa_loss_weight == 2.0
         assert torch.isclose(losses.reduce(), expected)
 
+    @pytest.mark.parametrize(
+        ("cls_prediction_mode", "query_multiplier"),
+        [
+            (DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE, 1),
+            (PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE, 2),
+        ],
+    )
+    def test_dual_route_loss_normalizes_visual_and_cls_routes_separately(
+        self,
+        cls_prediction_mode,
+        query_multiplier,
+    ):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        predictions, _, _, teacher_output = self._make_predictions_for_loss_tests()
+        target = _masked_teacher_target(teacher_output, predictions.target_mask)
+        predictions.pred = torch.randn(
+            target.shape[0],
+            query_multiplier * target.shape[1],
+            target.shape[2],
+        )
+        predictions.pred_with_cls = None
+        predictions.context_attention_mask = create_joint_context_attention_mask(
+            cls_prediction_mode,
+            target.shape[0],
+            target.shape[1],
+            visual_context_tokens=3,
+            device=target.device,
+        )
+
+        losses = model.compute_losses(output=predictions, step=0, epoch=0)
+
+        assert predictions.context_attention_mask is not None
+        aligned_target = target.repeat(1, query_multiplier, 1)
+        flat_mask = predictions.context_attention_mask[:, 0]
+        visual_only = flat_mask[..., :-1].all(dim=-1) & ~flat_mask[..., -1]
+        cls_only = ~flat_mask[..., :-1].any(dim=-1) & flat_mask[..., -1]
+        assert torch.isclose(
+            losses.jepa_loss,
+            F.mse_loss(predictions.pred[visual_only], aligned_target[visual_only]),
+        )
+        assert isinstance(losses.jepa_loss_cls, torch.Tensor)
+        assert torch.isclose(
+            losses.jepa_loss_cls,
+            F.mse_loss(predictions.pred[cls_only], aligned_target[cls_only]),
+        )
+        assert torch.isclose(losses.reduce(), losses.jepa_loss + losses.jepa_loss_cls)
+
     def test_compute_losses_gram_flag_disabled_ignores_schedule(self, mjepa_model_gram_schedule_disabled: MJEPA):
         """Test that Gram loss stays disabled when the flag is off even if the schedule is present."""
         predictions, _, _, _ = self._make_predictions_for_loss_tests(gram_teacher_output=torch.randn(2, 64, 64))
@@ -1347,6 +1402,9 @@ class TestMJEPAForward:
             JOINT_CONTEXT_CLS_PREDICTION_MODE,
             SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
             TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
         ],
     )
     def test_joint_context_prediction_uses_one_predictor_forward(
@@ -1378,10 +1436,10 @@ class TestMJEPAForward:
             assert context_attention_mask is None
         else:
             assert context_attention_mask is not None
-            assert context_attention_mask.shape[-2:] == (
-                predictions.target_mask.sum(dim=1)[0].item(),
-                context.shape[1],
-            )
+            expected_queries = predictions.target_mask.sum(dim=1)[0].item()
+            if cls_prediction_mode == PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE:
+                expected_queries *= 2
+            assert context_attention_mask.shape[-2:] == (expected_queries, context.shape[1])
 
     @pytest.mark.parametrize(
         "cls_prediction_mode",
@@ -1389,6 +1447,9 @@ class TestMJEPAForward:
             JOINT_CONTEXT_CLS_PREDICTION_MODE,
             SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
             TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
         ],
     )
     def test_joint_context_prediction_requires_exactly_one_cls_token(self, cls_prediction_mode):

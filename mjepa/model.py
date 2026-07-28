@@ -11,6 +11,7 @@ from .jepa import (
     ADALN_BLIND_CLS_PREDICTION_MODE,
     ADALN_CLS_PREDICTION_MODES,
     ADALN_SHARED_CLS_PREDICTION_MODE,
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES,
     EXPANDED_CLS_PREDICTION_MODES,
     JOINT_CONTEXT_CLS_PREDICTION_MODES,
     SINGLE_CLS_PREDICTION_MODES,
@@ -20,6 +21,7 @@ from .jepa import (
     compute_gram_loss,
     compute_jepa_prediction_loss,
     compute_sigreg_loss,
+    create_joint_context_attention_mask,
     forward_gram_teacher,
     generate_masks,
     get_momentum,
@@ -68,6 +70,7 @@ class MJEPAPredictions:
     teacher_stem_output: Tensor | None = None
     gram_teacher_output: Tensor | None = None
     probes: dict[str, Tensor] = field(default_factory=dict)
+    context_attention_mask: Tensor | None = None
 
 
 class MJEPA(nn.Module):
@@ -206,6 +209,7 @@ class MJEPA(nn.Module):
         context_mask: Tensor,
         target_mask: Tensor,
         rope_seed: int | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         """Predict from visible visual tokens and one appended CLS token in a single forward pass."""
         if self.config.cls_prediction_mode not in JOINT_CONTEXT_CLS_PREDICTION_MODES:
@@ -220,6 +224,7 @@ class MJEPA(nn.Module):
             context_mask,
             target_mask,
             rope_seed=rope_seed,
+            context_attention_mask=context_attention_mask,
         )
 
     @staticmethod
@@ -294,21 +299,36 @@ class MJEPA(nn.Module):
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         student_output = output.student_output
         target = self._masked_target(output.target_mask, output.teacher_output.visual_tokens)
-        jepa_loss = compute_jepa_prediction_loss(output.pred, target, kind=self.config.jepa_loss_kind)
-        jepa_loss_cls = (
-            compute_jepa_prediction_loss(output.pred_with_cls, target, kind=self.config.jepa_loss_kind)
-            if output.pred_with_cls is not None
-            else 0.0
-        )
-        stem_jepa_loss = (
-            compute_jepa_prediction_loss(
-                output.stem_pred,
-                self._masked_target(output.target_mask, output.teacher_stem_output),
-                kind=self.config.jepa_loss_kind,
+        if self.config.cls_prediction_mode in DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES:
+            jepa_loss, jepa_loss_cls = self._compute_dual_route_losses(
+                output.pred,
+                target,
+                output.context_attention_mask,
             )
-            if output.stem_pred is not None and output.teacher_stem_output is not None
-            else 0.0
-        )
+        else:
+            jepa_loss = compute_jepa_prediction_loss(output.pred, target, kind=self.config.jepa_loss_kind)
+            jepa_loss_cls = (
+                compute_jepa_prediction_loss(output.pred_with_cls, target, kind=self.config.jepa_loss_kind)
+                if output.pred_with_cls is not None
+                else 0.0
+            )
+        if output.stem_pred is not None and output.teacher_stem_output is not None:
+            stem_target = self._masked_target(output.target_mask, output.teacher_stem_output)
+            if self.config.cls_prediction_mode in DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES:
+                stem_visual_loss, stem_cls_loss = self._compute_dual_route_losses(
+                    output.stem_pred,
+                    stem_target,
+                    output.context_attention_mask,
+                )
+                stem_jepa_loss = stem_visual_loss + stem_cls_loss
+            else:
+                stem_jepa_loss = compute_jepa_prediction_loss(
+                    output.stem_pred,
+                    stem_target,
+                    kind=self.config.jepa_loss_kind,
+                )
+        else:
+            stem_jepa_loss = 0.0
 
         sigreg_loss = (
             compute_sigreg_loss(student_output.cls_tokens.transpose(0, 1).float(), step, num_slices=256)
@@ -339,6 +359,38 @@ class MJEPA(nn.Module):
             sigreg_loss_weight=self.config.sigreg_loss_weight,
         )
 
+    def _compute_dual_route_losses(
+        self,
+        prediction: Tensor,
+        target: Tensor,
+        context_attention_mask: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        if context_attention_mask is None or context_attention_mask.dtype != torch.bool:
+            raise ValueError("dual-routed prediction requires its boolean context attention mask")
+        if prediction.shape[1] % target.shape[1] != 0:
+            raise ValueError("dual-routed prediction count must be a multiple of the teacher target count")
+        query_multiplier = prediction.shape[1] // target.shape[1]
+        aligned_target = target.repeat(1, query_multiplier, 1)
+        route_mask = context_attention_mask[:, 0]
+        if route_mask.shape[:2] != prediction.shape[:2]:
+            raise ValueError("dual-routed context attention mask must align with predictor queries")
+        visual_only = route_mask[..., :-1].all(dim=-1) & ~route_mask[..., -1]
+        cls_only = ~route_mask[..., :-1].any(dim=-1) & route_mask[..., -1]
+        if not visual_only.any() or not cls_only.any() or (visual_only & cls_only).any():
+            raise ValueError("dual-routed prediction requires non-overlapping visual-only and CLS-only queries")
+        return (
+            compute_jepa_prediction_loss(
+                prediction[visual_only],
+                aligned_target[visual_only],
+                kind=self.config.jepa_loss_kind,
+            ),
+            compute_jepa_prediction_loss(
+                prediction[cls_only],
+                aligned_target[cls_only],
+                kind=self.config.jepa_loss_kind,
+            ),
+        )
+
     def forward(self, x: Tensor, jepa_scale: int, epoch: int) -> MJEPAPredictions:
         # NOTE: For DDP to work, all components must execute in the forward pass when training
         context_mask, target_mask = generate_masks(
@@ -365,7 +417,22 @@ class MJEPA(nn.Module):
         elif self.config.cls_prediction_mode == ADALN_SHARED_CLS_PREDICTION_MODE:
             assert cls_conditioning is not None
             main_conditioning = cls_conditioning
+        context_attention_mask = None
         if self.config.cls_prediction_mode in JOINT_CONTEXT_CLS_PREDICTION_MODES:
+            target_tokens_per_example = target_mask.sum(dim=1)
+            if not torch.equal(
+                target_tokens_per_example,
+                target_tokens_per_example[:1].expand_as(target_tokens_per_example),
+            ):
+                raise ValueError("joint-context prediction requires the same target-token count in every example")
+            context_attention_mask = create_joint_context_attention_mask(
+                self.config.cls_prediction_mode,
+                target_mask.shape[0],
+                int(target_tokens_per_example[0].item()),
+                student_output.visual_tokens.shape[1],
+                device=student_output.visual_tokens.device,
+                dtype=student_output.visual_tokens.dtype,
+            )
             pred, stem_pred = self.forward_joint_context_predictor_heads(
                 (Ht, Wt),
                 student_output.visual_tokens,
@@ -373,6 +440,7 @@ class MJEPA(nn.Module):
                 context_mask,
                 target_mask,
                 rope_seed=rope_seed,
+                context_attention_mask=context_attention_mask,
             )
             pred_with_cls = None
         else:
@@ -404,6 +472,7 @@ class MJEPA(nn.Module):
             teacher_stem_output=teacher_stem_output,
             gram_teacher_output=gram_teacher_output,
             probes=probes,
+            context_attention_mask=context_attention_mask,
         )
 
     def update_teacher(self, step: int, total_steps: int) -> None:

@@ -14,10 +14,12 @@ from mjepa.jepa import (
     COSINE_JEPA_LOSS_KIND,
     CROSS_ATTENTION_PREDICTOR_MODE,
     DECODER_PREDICTOR_MODE,
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     ENCODER_PREDICTOR_MODE,
     JOINT_CONTEXT_CLS_PREDICTION_MODE,
     LEGACY_CLS_PREDICTION_MODE,
     MSE_JEPA_LOSS_KIND,
+    PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
     PARTITIONED_SHARED_CLS_PREDICTION_MODE,
     PREDICTOR_ATTENTION_MODES,
@@ -28,6 +30,7 @@ from mjepa.jepa import (
     RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
     SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     SLOT_BIAS_CLS_PREDICTION_MODE,
+    SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     CrossAttentionPredictor,
     JEPAConfig,
@@ -563,6 +566,70 @@ class TestJointContextRouting:
             (2, 1, 1)
         ] * self.BATCH_SIZE
 
+    def test_dual_routing_balances_cls_and_visual_without_joint_queries(self):
+        attention_mask = create_joint_context_attention_mask(
+            DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+        )
+
+        assert attention_mask is not None
+        assert attention_mask.dtype == torch.bool
+        assert self._route_counts(attention_mask) == (0, 16, 16)
+        assert [self._route_counts(example_mask[None, None]) for example_mask in attention_mask[:, 0]] == [
+            (0, 2, 2)
+        ] * self.BATCH_SIZE
+
+    def test_packed_dual_routing_pairs_every_target_with_both_sources(self):
+        attention_mask = create_joint_context_attention_mask(
+            PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+        )
+
+        assert attention_mask is not None
+        assert attention_mask.shape == (
+            self.BATCH_SIZE,
+            1,
+            2 * self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS + 1,
+        )
+        assert self._route_counts(attention_mask) == (0, 32, 32)
+        assert attention_mask[:, :, : self.TARGET_TOKENS, :-1].all()
+        assert not attention_mask[:, :, : self.TARGET_TOKENS, -1].any()
+        assert not attention_mask[:, :, self.TARGET_TOKENS :, :-1].any()
+        assert attention_mask[:, :, self.TARGET_TOKENS :, -1].all()
+
+    def test_source_balanced_token_routing_corrects_joint_cls_cardinality(self):
+        torch.manual_seed(0)
+        attention_mask = create_joint_context_attention_mask(
+            SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        assert attention_mask is not None
+        assert attention_mask.dtype == torch.float32
+        flat_mask = attention_mask[:, 0].reshape(-1, self.VISUAL_CONTEXT_TOKENS + 1)
+        joint = torch.isfinite(flat_mask).all(dim=-1) & (flat_mask[:, -1] > 0)
+        cls_only = torch.isneginf(flat_mask[:, :-1]).all(dim=-1) & (flat_mask[:, -1] == 0)
+        visual_only = (flat_mask[:, :-1] == 0).all(dim=-1) & torch.isneginf(flat_mask[:, -1])
+        assert int(joint.sum()) == 16
+        assert int(cls_only.sum()) == 8
+        assert int(visual_only.sum()) == 8
+        assert torch.equal(
+            flat_mask[joint, -1],
+            torch.full_like(flat_mask[joint, -1], math.log(self.VISUAL_CONTEXT_TOKENS)),
+        )
+        assert (flat_mask[joint, :-1] == 0).all()
+
 
 class TestCrossAttentionPredictor:
     """Test CrossAttentionPredictor initialization and device/dtype handling."""
@@ -716,6 +783,27 @@ class TestCrossAttentionPredictor:
         assert torch.equal(after_cls_perturbation[:, 1], baseline[:, 1])
         assert not torch.equal(after_visual_perturbation[:, 1], baseline[:, 1])
         assert not torch.equal(after_cls_perturbation[:, 0], baseline[:, 0])
+
+    def test_packed_dual_routing_duplicates_target_queries_in_one_forward(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+        )
+        predictor.eval()
+        batch_size = 2
+        visual_context_tokens = 3
+        target_tokens = 2
+        context = torch.randn(batch_size, visual_context_tokens + 1, 64)
+        context_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        context_mask[:, :visual_context_tokens] = True
+        target_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        target_mask[:, 8 : 8 + target_tokens] = True
+
+        output = predictor((8, 8), context, context_mask, target_mask, rope_seed=0)
+
+        assert output.shape == (batch_size, 2 * target_tokens, 64)
 
     @pytest.mark.parametrize(
         "cls_prediction_mode",

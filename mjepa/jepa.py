@@ -50,9 +50,13 @@ PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE = "partitioned_independent_cross_att
 JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context"
 SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_sample_routed"
 TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_token_routed"
+DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_dual_routed"
+PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_packed_dual_routed"
+SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_token_routed_source_balanced"
 CLS_CONTEXT_TOKENS = 4
 PROJECTED_CLS_CONTEXT_TOKENS = CLS_CONTEXT_TOKENS
 JOINT_CONTEXT_ROUTE_PATTERN = (0, 0, 1, 2)
+DUAL_ROUTE_PATTERN = (1, 2)
 JOINT_CONTEXT_JOINT_ROUTE = 0
 JOINT_CONTEXT_CLS_ONLY_ROUTE = 1
 JOINT_CONTEXT_VISUAL_ONLY_ROUTE = 2
@@ -69,6 +73,9 @@ CLSPredictionMode: TypeAlias = Literal[
     "joint_context",
     "joint_context_sample_routed",
     "joint_context_token_routed",
+    "joint_context_dual_routed",
+    "joint_context_packed_dual_routed",
+    "joint_context_token_routed_source_balanced",
 ]
 CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     LEGACY_CLS_PREDICTION_MODE,
@@ -83,6 +90,9 @@ CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     JOINT_CONTEXT_CLS_PREDICTION_MODE,
     SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
 )
 ADALN_CLS_PREDICTION_MODES = (ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE)
 PROJECTED_CLS_PREDICTION_MODES = (
@@ -103,10 +113,20 @@ JOINT_CONTEXT_CLS_PREDICTION_MODES = (
     JOINT_CONTEXT_CLS_PREDICTION_MODE,
     SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
 )
 ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES = (
     SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+)
+DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES = (
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
 )
 SINGLE_CLS_PREDICTION_MODES = (
     *ADALN_CLS_PREDICTION_MODES,
@@ -122,11 +142,16 @@ def _validate_cls_context_tokens(cls_prediction_mode: CLSPredictionMode, cls_con
         raise ValueError("cls_context_tokens is only configurable for partitioned CLS prediction modes")
 
 
-def _balanced_joint_context_routes(route_count: int, device: torch.device) -> Tensor:
-    pattern = torch.tensor(JOINT_CONTEXT_ROUTE_PATTERN, device=device)
-    repeats = math.ceil(route_count / len(JOINT_CONTEXT_ROUTE_PATTERN))
+def _balanced_routes(route_count: int, pattern_values: tuple[int, ...], device: torch.device) -> Tensor:
+    pattern = torch.tensor(pattern_values, device=device)
+    repeats = math.ceil(route_count / len(pattern_values))
     routes = pattern.repeat(repeats)[:route_count]
     return routes[torch.randperm(route_count, device=device)]
+
+
+def joint_context_query_multiplier(cls_prediction_mode: CLSPredictionMode) -> int:
+    """Return the number of predictor queries executed per spatial target query."""
+    return 2 if cls_prediction_mode == PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE else 1
 
 
 def create_joint_context_attention_mask(
@@ -136,6 +161,7 @@ def create_joint_context_attention_mask(
     visual_context_tokens: int,
     *,
     device: torch.device,
+    dtype: torch.dtype | None = None,
 ) -> Tensor | None:
     """Create balanced key-visibility masks for one visual-context plus CLS predictor pass."""
     if cls_prediction_mode == JOINT_CONTEXT_CLS_PREDICTION_MODE:
@@ -146,16 +172,49 @@ def create_joint_context_attention_mask(
         raise ValueError("joint context attention mask dimensions must be positive")
 
     if cls_prediction_mode == SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE:
-        routes = _balanced_joint_context_routes(batch_size, device)
+        routes = _balanced_routes(batch_size, JOINT_CONTEXT_ROUTE_PATTERN, device)
         routes = routes[:, None].expand(-1, target_tokens)
+    elif cls_prediction_mode == PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE:
+        visual_routes = torch.full(
+            (batch_size, target_tokens),
+            JOINT_CONTEXT_VISUAL_ONLY_ROUTE,
+            device=device,
+        )
+        cls_routes = torch.full(
+            (batch_size, target_tokens),
+            JOINT_CONTEXT_CLS_ONLY_ROUTE,
+            device=device,
+        )
+        routes = torch.cat([visual_routes, cls_routes], dim=1)
     else:
-        base_routes = _balanced_joint_context_routes(target_tokens, device)
+        route_pattern = (
+            DUAL_ROUTE_PATTERN
+            if cls_prediction_mode == DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE
+            else JOINT_CONTEXT_ROUTE_PATTERN
+        )
+        base_routes = _balanced_routes(target_tokens, route_pattern, device)
         permutations = torch.rand(batch_size, target_tokens, device=device).argsort(dim=1)
         routes = base_routes[None].expand(batch_size, -1).gather(1, permutations)
 
+    if cls_prediction_mode == SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE:
+        attention_bias = torch.zeros(
+            batch_size,
+            routes.shape[1],
+            visual_context_tokens + 1,
+            dtype=dtype or torch.float32,
+            device=device,
+        )
+        cls_only = routes == JOINT_CONTEXT_CLS_ONLY_ROUTE
+        visual_only = routes == JOINT_CONTEXT_VISUAL_ONLY_ROUTE
+        joint = routes == JOINT_CONTEXT_JOINT_ROUTE
+        attention_bias[..., :-1].masked_fill_(cls_only[..., None], -torch.inf)
+        attention_bias[..., -1].masked_fill_(visual_only, -torch.inf)
+        attention_bias[..., -1].masked_fill_(joint, math.log(visual_context_tokens))
+        return attention_bias[:, None]
+
     attention_mask = torch.ones(
         batch_size,
-        target_tokens,
+        routes.shape[1],
         visual_context_tokens + 1,
         dtype=torch.bool,
         device=device,
@@ -297,7 +356,7 @@ class CrossAttentionPredictor(nn.Module):
         self.hidden_size = backbone.config.hidden_size
         self.out_dim = out_dim or backbone.config.hidden_size
         self.attention_mode = attention_mode
-        self.cls_prediction_mode = cls_prediction_mode
+        self.cls_prediction_mode: CLSPredictionMode = cls_prediction_mode
         self.cls_context_tokens = cls_context_tokens
         spatial_size = backbone.stem.tokenized_size(backbone.config.img_size)
         self.pos_enc_target = LearnablePosition(backbone.config.hidden_size, spatial_size, **factory_kwargs)
@@ -583,15 +642,17 @@ class CrossAttentionPredictor(nn.Module):
         with autocast_context(context.device.type, self.predictor_dtype):
             # Prepare inputs
             query = self._target_queries(tokenized_size, target_mask)
+            base_target_tokens = query.shape[1]
             context = context.to(dtype=self.predictor_dtype)
             conditioning = self._prepare_conditioning(conditioning, target_mask.shape[0])
             if context_attention_mask is None and self.cls_prediction_mode in ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES:
                 context_attention_mask = create_joint_context_attention_mask(
                     self.cls_prediction_mode,
                     query.shape[0],
-                    query.shape[1],
+                    base_target_tokens,
                     context.shape[1] - 1,
                     device=context.device,
+                    dtype=query.dtype,
                 )
             rope_q, rope_k = self.prepare_rope(
                 tokenized_size,
@@ -600,6 +661,10 @@ class CrossAttentionPredictor(nn.Module):
                 rope_seed=rope_seed,
                 context_length=context.shape[1],
             )
+            if joint_context_query_multiplier(self.cls_prediction_mode) == 2:
+                query = torch.cat([query, query], dim=1)
+                if rope_q is not None:
+                    rope_q = torch.cat([rope_q, rope_q], dim=-2)
 
             # Run query and context through predictor
             if self.attention_mode == ENCODER_PREDICTOR_MODE:
