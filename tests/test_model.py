@@ -11,6 +11,7 @@ from mjepa.jepa import (
     DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     JOINT_CONTEXT_CLS_PREDICTION_MODE,
     MSE_JEPA_LOSS_KIND,
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
     PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
     PARTITIONED_SHARED_CLS_PREDICTION_MODE,
@@ -1453,6 +1454,42 @@ class TestMJEPAForward:
         ],
     )
     def test_joint_context_prediction_requires_exactly_one_cls_token(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            _make_test_model(
+                num_cls_tokens=TEST_NUM_CLS_TOKENS,
+                sigreg_loss_weight=0.0,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    @pytest.mark.parametrize("cls_prediction_mode", PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES)
+    def test_packed_adaln_hard_blind_uses_one_visual_context_predictor_forward(
+        self,
+        dummy_batch,
+        mocker,
+        cls_prediction_mode,
+    ):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        model.eval()
+        forward_heads = mocker.spy(model.predictor, "forward_heads")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        forward_heads.assert_called_once()
+        context = forward_heads.call_args.args[1]
+        conditioning = forward_heads.call_args.kwargs["conditioning"]
+        assert torch.equal(context, predictions.student_output.visual_tokens)
+        assert torch.equal(conditioning, predictions.student_output.cls_tokens[:, 0])
+        assert predictions.pred.shape[1] == 2 * predictions.target_mask.sum(dim=1)[0].item()
+        assert predictions.pred_with_cls is None
+        assert predictions.context_attention_mask is not None
+
+    @pytest.mark.parametrize("cls_prediction_mode", PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES)
+    def test_packed_adaln_hard_blind_requires_exactly_one_cls_token(self, cls_prediction_mode):
         with pytest.raises(ValueError, match="exactly one CLS token"):
             _make_test_model(
                 num_cls_tokens=TEST_NUM_CLS_TOKENS,

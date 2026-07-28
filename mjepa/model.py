@@ -14,6 +14,7 @@ from .jepa import (
     DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES,
     EXPANDED_CLS_PREDICTION_MODES,
     JOINT_CONTEXT_CLS_PREDICTION_MODES,
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
     SINGLE_CLS_PREDICTION_MODES,
     CrossAttentionPredictor,
     JEPAConfig,
@@ -22,6 +23,7 @@ from .jepa import (
     compute_jepa_prediction_loss,
     compute_sigreg_loss,
     create_joint_context_attention_mask,
+    create_packed_dual_route_mask,
     forward_gram_teacher,
     generate_masks,
     get_momentum,
@@ -227,6 +229,29 @@ class MJEPA(nn.Module):
             context_attention_mask=context_attention_mask,
         )
 
+    def forward_packed_adaln_hard_blind_predictor_heads(
+        self,
+        tokenized_size: tuple[int, int],
+        visual_context: Tensor,
+        cls_tokens: Tensor,
+        context_mask: Tensor,
+        target_mask: Tensor,
+        rope_seed: int | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Predict visual and hard-blind target copies in one configured predictor forward."""
+        if self.config.cls_prediction_mode not in PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES:
+            raise ValueError("packed AdaLN prediction requires a packed hard-blind CLS prediction mode")
+        if cls_tokens.ndim != 3 or cls_tokens.shape[1] != 1:
+            raise ValueError("packed AdaLN prediction requires exactly one CLS token")
+        return self.forward_predictor_heads(
+            tokenized_size,
+            visual_context,
+            context_mask,
+            target_mask,
+            rope_seed=rope_seed,
+            conditioning=cls_tokens[:, 0],
+        )
+
     @staticmethod
     def _has_cls_tokens(features: ViTFeatures) -> bool:
         return features.num_cls_tokens > 0
@@ -418,7 +443,29 @@ class MJEPA(nn.Module):
             assert cls_conditioning is not None
             main_conditioning = cls_conditioning
         context_attention_mask = None
-        if self.config.cls_prediction_mode in JOINT_CONTEXT_CLS_PREDICTION_MODES:
+        if self.config.cls_prediction_mode in PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES:
+            target_tokens_per_example = target_mask.sum(dim=1)
+            if not torch.equal(
+                target_tokens_per_example,
+                target_tokens_per_example[:1].expand_as(target_tokens_per_example),
+            ):
+                raise ValueError("packed AdaLN prediction requires the same target-token count in every example")
+            context_attention_mask = create_packed_dual_route_mask(
+                target_mask.shape[0],
+                int(target_tokens_per_example[0].item()),
+                student_output.visual_tokens.shape[1],
+                device=student_output.visual_tokens.device,
+            )
+            pred, stem_pred = self.forward_packed_adaln_hard_blind_predictor_heads(
+                (Ht, Wt),
+                student_output.visual_tokens,
+                student_output.cls_tokens,
+                context_mask,
+                target_mask,
+                rope_seed=rope_seed,
+            )
+            pred_with_cls = None
+        elif self.config.cls_prediction_mode in JOINT_CONTEXT_CLS_PREDICTION_MODES:
             target_tokens_per_example = target_mask.sum(dim=1)
             if not torch.equal(
                 target_tokens_per_example,

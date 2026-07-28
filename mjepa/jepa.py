@@ -53,8 +53,15 @@ TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_token_routed"
 DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_dual_routed"
 PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_packed_dual_routed"
 SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE = "joint_context_token_routed_source_balanced"
+PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE = "packed_adaln_hard_blind"
+PACKED_ADALN_HARD_BLIND_ADAPTER_CLS_PREDICTION_MODE = "packed_adaln_hard_blind_adapter"
+PACKED_ADALN_HARD_BLIND_MIXER_CLS_PREDICTION_MODE = "packed_adaln_hard_blind_mixer"
 CLS_CONTEXT_TOKENS = 4
 PROJECTED_CLS_CONTEXT_TOKENS = CLS_CONTEXT_TOKENS
+BLIND_ROUTE_ADAPTER_REDUCTION = 4
+BLIND_TOKEN_MIXER_DEPTH = 1
+PACKED_ADALN_GATE_INIT = 1.0
+PACKED_ADALN_MODULATION_INIT_STD = 1e-3
 JOINT_CONTEXT_ROUTE_PATTERN = (0, 0, 1, 2)
 DUAL_ROUTE_PATTERN = (1, 2)
 JOINT_CONTEXT_JOINT_ROUTE = 0
@@ -76,6 +83,9 @@ CLSPredictionMode: TypeAlias = Literal[
     "joint_context_dual_routed",
     "joint_context_packed_dual_routed",
     "joint_context_token_routed_source_balanced",
+    "packed_adaln_hard_blind",
+    "packed_adaln_hard_blind_adapter",
+    "packed_adaln_hard_blind_mixer",
 ]
 CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     LEGACY_CLS_PREDICTION_MODE,
@@ -93,8 +103,20 @@ CLS_PREDICTION_MODES: tuple[CLSPredictionMode, ...] = (
     DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_ADAPTER_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_MIXER_CLS_PREDICTION_MODE,
 )
-ADALN_CLS_PREDICTION_MODES = (ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE)
+PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES = (
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_ADAPTER_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_MIXER_CLS_PREDICTION_MODE,
+)
+ADALN_CLS_PREDICTION_MODES = (
+    ADALN_BLIND_CLS_PREDICTION_MODE,
+    ADALN_SHARED_CLS_PREDICTION_MODE,
+    *PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
+)
 PROJECTED_CLS_PREDICTION_MODES = (
     PROJECTED_CLS_PREDICTION_MODE,
     RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
@@ -127,6 +149,7 @@ ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES = (
 DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES = (
     DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    *PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
 )
 SINGLE_CLS_PREDICTION_MODES = (
     *ADALN_CLS_PREDICTION_MODES,
@@ -151,7 +174,34 @@ def _balanced_routes(route_count: int, pattern_values: tuple[int, ...], device: 
 
 def joint_context_query_multiplier(cls_prediction_mode: CLSPredictionMode) -> int:
     """Return the number of predictor queries executed per spatial target query."""
-    return 2 if cls_prediction_mode == PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE else 1
+    packed_modes = (
+        PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+        *PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
+    )
+    return 2 if cls_prediction_mode in packed_modes else 1
+
+
+def create_packed_dual_route_mask(
+    batch_size: int,
+    target_tokens: int,
+    visual_context_tokens: int,
+    *,
+    device: torch.device,
+) -> Tensor:
+    """Describe packed visual-only then blind-CLS-only query routes for loss alignment."""
+    if batch_size <= 0 or target_tokens <= 0 or visual_context_tokens <= 0:
+        raise ValueError("packed dual-route mask dimensions must be positive")
+    visual_routes = torch.zeros(
+        batch_size,
+        target_tokens,
+        visual_context_tokens + 1,
+        dtype=torch.bool,
+        device=device,
+    )
+    visual_routes[..., :-1] = True
+    cls_routes = torch.zeros_like(visual_routes)
+    cls_routes[..., -1] = True
+    return torch.cat([visual_routes, cls_routes], dim=1)[:, None]
 
 
 def create_joint_context_attention_mask(
@@ -301,6 +351,35 @@ class PartitionedCLSProjection(nn.Module):
         return output + self.bias
 
 
+class BlindRouteAdapter(nn.Module):
+    """Small residual bottleneck used only by visually blind predictor queries."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        bottleneck_size = max(1, hidden_size // BLIND_ROUTE_ADAPTER_REDUCTION)
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.norm = nn.RMSNorm(hidden_size, **factory_kwargs)
+        self.down = nn.Linear(hidden_size, bottleneck_size, **factory_kwargs)
+        self.activation = nn.GELU()
+        self.up = nn.Linear(bottleneck_size, hidden_size, **factory_kwargs)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.trunc_normal_(self.down.weight, std=PREDICTOR_PROJ_INIT_STD)
+        nn.init.trunc_normal_(self.up.weight, std=PREDICTOR_PROJ_INIT_STD)
+        nn.init.zeros_(self.down.bias)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, query: Tensor) -> Tensor:
+        return self.up(self.activation(self.down(self.norm(query))))
+
+
 class CrossAttentionPredictor(nn.Module):
     r"""
     Predicts targets from context embeddings.
@@ -366,6 +445,35 @@ class CrossAttentionPredictor(nn.Module):
         self.blocks = nn.ModuleList(
             [self._create_block(backbone, device, attention_mode, cls_prediction_mode) for _ in range(depth)]
         )
+        self.blind_route_adapters = (
+            nn.ModuleList(
+                [
+                    BlindRouteAdapter(
+                        self.hidden_size,
+                        device=device,
+                        dtype=backbone.config.dtype,
+                    )
+                    for _ in range(depth)
+                ]
+            )
+            if cls_prediction_mode == PACKED_ADALN_HARD_BLIND_ADAPTER_CLS_PREDICTION_MODE
+            else None
+        )
+        self.blind_token_mixer = (
+            nn.ModuleList(
+                [
+                    backbone.create_encoder_layer(
+                        device=device,
+                        dtype=backbone.config.dtype,
+                    )
+                    for _ in range(BLIND_TOKEN_MIXER_DEPTH)
+                ]
+            )
+            if cls_prediction_mode == PACKED_ADALN_HARD_BLIND_MIXER_CLS_PREDICTION_MODE
+            else None
+        )
+        if cls_prediction_mode in PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES:
+            self._initialize_packed_adaln_modulation()
         if disable_predictor_regularizers:
             self._disable_predictor_regularizers()
 
@@ -427,7 +535,11 @@ class CrossAttentionPredictor(nn.Module):
                     device=device,
                     dtype=backbone.config.dtype,
                     conditioning_size=backbone.config.hidden_size,
-                    adaln_gate_init=0.0,
+                    adaln_gate_init=(
+                        PACKED_ADALN_GATE_INIT
+                        if cls_prediction_mode in PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES
+                        else 0.0
+                    ),
                 )
             return backbone.create_cross_attention_layer(device=device, dtype=backbone.config.dtype)
         if attention_mode == DECODER_PREDICTOR_MODE:
@@ -524,13 +636,23 @@ class CrossAttentionPredictor(nn.Module):
     def _disable_predictor_regularizers(self) -> None:
         # Force predictor regularizers to zero without changing the backbone configuration.
         no_regularization = 0.0
-        for block in self.blocks:
+        blocks = list(self.blocks)
+        if self.blind_token_mixer is not None:
+            blocks.extend(self.blind_token_mixer)
+        for block in blocks:
             typed_block = cast(Any, block)
             typed_block.drop_path_rate = no_regularization
             for attention in self._attention_modules(block):
                 attention.dropout.p = no_regularization
                 attention.attention_dropout.p = no_regularization
             typed_block.mlp.dropout.p = no_regularization
+
+    def _initialize_packed_adaln_modulation(self) -> None:
+        """Enable immediate, mild CLS dependence while retaining unit MLP residual gates."""
+        with torch.no_grad():
+            for block in self.blocks:
+                modulation = cast(Any, block).mlp.modulation
+                nn.init.trunc_normal_(modulation.weight, std=PACKED_ADALN_MODULATION_INIT_STD)
 
     @staticmethod
     def _attention_modules(block: nn.Module) -> tuple[Any, ...]:
@@ -612,6 +734,38 @@ class CrossAttentionPredictor(nn.Module):
                 query = cast(Any, block)(query, context, rope_q=rope_q, rope_k=rope_k)
         return query
 
+    def _forward_packed_adaln_hard_blind_blocks(
+        self,
+        query: Tensor,
+        context: Tensor,
+        rope_q: Tensor | None,
+        rope_k: Tensor | None,
+        conditioning: Tensor,
+    ) -> Tensor:
+        """Run visual and hard-blind query copies without exposing visual context to the blind route."""
+        visual_query = query
+        blind_query = query.clone()
+        null_conditioning = torch.zeros_like(conditioning)
+        for block_index, block in enumerate(self.blocks):
+            typed_block = cast(Any, block)
+            visual_query = typed_block(
+                visual_query,
+                context,
+                rope_q=rope_q,
+                rope_k=rope_k,
+                conditioning=null_conditioning,
+            )
+            blind_query = blind_query + typed_block.layer_scale_mlp(
+                typed_block.mlp(blind_query, conditioning=conditioning)
+            )
+            if self.blind_route_adapters is not None:
+                blind_query = blind_query + self.blind_route_adapters[block_index](blind_query)
+
+        if self.blind_token_mixer is not None:
+            for mixer_block in self.blind_token_mixer:
+                blind_query = cast(Any, mixer_block)(blind_query, rope=rope_q)
+        return torch.cat([visual_query, blind_query], dim=1)
+
     def _target_queries(self, tokenized_size: tuple[int, int], target_mask: Tensor) -> Tensor:
         batch_size, _ = target_mask.shape
         positions = self.pos_enc_target(tokenized_size).expand(batch_size, -1, -1)
@@ -661,6 +815,15 @@ class CrossAttentionPredictor(nn.Module):
                 rope_seed=rope_seed,
                 context_length=context.shape[1],
             )
+            if self.cls_prediction_mode in PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES:
+                assert conditioning is not None
+                return self._forward_packed_adaln_hard_blind_blocks(
+                    query,
+                    context,
+                    rope_q,
+                    rope_k,
+                    conditioning,
+                )
             if joint_context_query_multiplier(self.cls_prediction_mode) == 2:
                 query = torch.cat([query, query], dim=1)
                 if rope_q is not None:

@@ -19,6 +19,10 @@ from mjepa.jepa import (
     JOINT_CONTEXT_CLS_PREDICTION_MODE,
     LEGACY_CLS_PREDICTION_MODE,
     MSE_JEPA_LOSS_KIND,
+    PACKED_ADALN_HARD_BLIND_ADAPTER_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
+    PACKED_ADALN_HARD_BLIND_MIXER_CLS_PREDICTION_MODE,
     PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
     PARTITIONED_SHARED_CLS_PREDICTION_MODE,
@@ -218,7 +222,11 @@ class TestJEPAConfig:
 
     @pytest.mark.parametrize(
         "cls_prediction_mode",
-        [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
+        [
+            ADALN_BLIND_CLS_PREDICTION_MODE,
+            ADALN_SHARED_CLS_PREDICTION_MODE,
+            *PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
+        ],
     )
     def test_adaln_cls_prediction_requires_cross_attention(self, cls_prediction_mode):
         with pytest.raises(ValueError, match="requires predictor_attention_mode='cross_attention'"):
@@ -804,6 +812,110 @@ class TestCrossAttentionPredictor:
         output = predictor((8, 8), context, context_mask, target_mask, rope_seed=0)
 
         assert output.shape == (batch_size, 2 * target_tokens, 64)
+
+    @pytest.mark.parametrize("cls_prediction_mode", PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES)
+    def test_packed_adaln_hard_blind_routes_are_source_isolated(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        with torch.no_grad():
+            for block in predictor.blocks:
+                nn.init.normal_(cast(Any, block).cross_attention.out_proj.weight, std=0.01)
+        predictor.eval()
+        batch_size = 2
+        visual_context_tokens = 3
+        target_tokens = 2
+        visual_context = torch.randn(batch_size, visual_context_tokens, 64)
+        cls_conditioning = torch.randn(batch_size, 64)
+        context_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        context_mask[:, :visual_context_tokens] = True
+        target_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        target_mask[:, 8 : 8 + target_tokens] = True
+
+        baseline = predictor(
+            (8, 8),
+            visual_context,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            conditioning=cls_conditioning,
+        )
+        visual_perturbed = predictor(
+            (8, 8),
+            visual_context + 100.0,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            conditioning=cls_conditioning,
+        )
+        cls_perturbed = predictor(
+            (8, 8),
+            visual_context,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            conditioning=cls_conditioning + 100.0,
+        )
+
+        assert baseline.shape == (batch_size, 2 * target_tokens, 64)
+        assert not torch.equal(visual_perturbed[:, :target_tokens], baseline[:, :target_tokens])
+        assert torch.equal(visual_perturbed[:, target_tokens:], baseline[:, target_tokens:])
+        assert torch.equal(cls_perturbed[:, :target_tokens], baseline[:, :target_tokens])
+        assert not torch.equal(cls_perturbed[:, target_tokens:], baseline[:, target_tokens:])
+
+    def test_packed_adaln_hard_blind_backpropagates_through_cls_without_visual_leakage(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE,
+        )
+        visual_context = torch.randn(2, 3, 64, requires_grad=True)
+        cls_conditioning = torch.randn(2, 64, requires_grad=True)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :3] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 8:10] = True
+
+        output = predictor(
+            (8, 8),
+            visual_context,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            conditioning=cls_conditioning,
+        )
+        blind_output = output[:, 2:]
+        blind_output.square().mean().backward()
+
+        assert cls_conditioning.grad is not None
+        assert torch.count_nonzero(cls_conditioning.grad) > 0
+        assert visual_context.grad is not None
+        assert torch.count_nonzero(visual_context.grad) == 0
+
+    @pytest.mark.parametrize(
+        ("cls_prediction_mode", "has_adapter", "has_mixer"),
+        [
+            (PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE, False, False),
+            (PACKED_ADALN_HARD_BLIND_ADAPTER_CLS_PREDICTION_MODE, True, False),
+            (PACKED_ADALN_HARD_BLIND_MIXER_CLS_PREDICTION_MODE, False, True),
+        ],
+    )
+    def test_packed_adaln_hard_blind_allocates_only_selected_auxiliary(
+        self, cls_prediction_mode, has_adapter, has_mixer
+    ):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+
+        assert (predictor.blind_route_adapters is not None) is has_adapter
+        assert (predictor.blind_token_mixer is not None) is has_mixer
 
     @pytest.mark.parametrize(
         "cls_prediction_mode",
