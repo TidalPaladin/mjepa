@@ -32,7 +32,7 @@ dynamic = [
 ]
 
 [tool.uv.sources]
-vit = { git = "https://github.com/TidalPaladin/vit.git", rev = "bf15705454975f04912538cdc790d399eea69e67" }
+vit = { git = "https://github.com/TidalPaladin/vit.git", rev = "5884448b157ff13529fc49fb8e86283868540607" }
 
 [project.optional-dependencies]
 dicom = [
