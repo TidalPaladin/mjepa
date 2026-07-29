@@ -8,13 +8,34 @@ import yaml
 from vit import ViTConfig
 
 from mjepa.jepa import (
+    ADALN_BLIND_CLS_PREDICTION_MODE,
+    ADALN_SHARED_CLS_PREDICTION_MODE,
+    CLS_PREDICTION_MODES,
     COSINE_JEPA_LOSS_KIND,
     CROSS_ATTENTION_PREDICTOR_MODE,
     DECODER_PREDICTOR_MODE,
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     ENCODER_PREDICTOR_MODE,
+    JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    LEGACY_CLS_PREDICTION_MODE,
     MSE_JEPA_LOSS_KIND,
+    PACKED_ADALN_HARD_BLIND_ADAPTER_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE,
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
+    PACKED_ADALN_HARD_BLIND_MIXER_CLS_PREDICTION_MODE,
+    PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+    PARTITIONED_SHARED_CLS_PREDICTION_MODE,
     PREDICTOR_ATTENTION_MODES,
     PREDICTOR_PROJ_INIT_STD,
+    PROJECTED_CLS_CONTEXT_TOKENS,
+    PROJECTED_CLS_PREDICTION_MODE,
+    RESIDUAL_MLP_CLS_PREDICTION_MODE,
+    RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
+    SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    SLOT_BIAS_CLS_PREDICTION_MODE,
+    SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
     CrossAttentionPredictor,
     JEPAConfig,
     autocast_context,
@@ -22,6 +43,7 @@ from mjepa.jepa import (
     compute_jepa_prediction_loss,
     compute_sigreg_loss,
     config_constructor,
+    create_joint_context_attention_mask,
     generate_masks,
     get_momentum,
     is_gram_update_epoch,
@@ -138,9 +160,12 @@ class TestJEPAConfig:
         assert config.momentum == 0.99
         assert config.predictor_depth == 4
         assert config.predictor_attention_mode == CROSS_ATTENTION_PREDICTOR_MODE
+        assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
+        assert config.cls_context_tokens == PROJECTED_CLS_CONTEXT_TOKENS
         assert config.disable_predictor_regularizers is False
         assert config.teacher_dtype is None
         assert config.use_gram_anchoring is False
+        assert config.jepa_loss_weight == 1.0
         assert config.stem_jepa_loss_weight == 0.0
         assert config.jepa_loss_kind == MSE_JEPA_LOSS_KIND
 
@@ -153,8 +178,10 @@ class TestJEPAConfig:
             momentum=0.95,
             predictor_depth=6,
             predictor_attention_mode=DECODER_PREDICTOR_MODE,
+            cls_prediction_mode=LEGACY_CLS_PREDICTION_MODE,
             disable_predictor_regularizers=True,
             teacher_dtype=torch.bfloat16,
+            jepa_loss_weight=2.0,
             stem_jepa_loss_weight=0.5,
             jepa_loss_kind=COSINE_JEPA_LOSS_KIND,
         )
@@ -164,8 +191,10 @@ class TestJEPAConfig:
         assert config.momentum == 0.95
         assert config.predictor_depth == 6
         assert config.predictor_attention_mode == DECODER_PREDICTOR_MODE
+        assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
+        assert config.jepa_loss_weight == 2.0
         assert config.stem_jepa_loss_weight == 0.5
         assert config.jepa_loss_kind == COSINE_JEPA_LOSS_KIND
 
@@ -185,6 +214,83 @@ class TestJEPAConfig:
         with pytest.raises(ValueError):
             JEPAConfig(target_ratio=1.1)
 
+    @pytest.mark.parametrize("cls_prediction_mode", CLS_PREDICTION_MODES)
+    def test_valid_cls_prediction_modes(self, cls_prediction_mode):
+        config = JEPAConfig(cls_prediction_mode=cls_prediction_mode)
+
+        assert config.cls_prediction_mode == cls_prediction_mode
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [
+            ADALN_BLIND_CLS_PREDICTION_MODE,
+            ADALN_SHARED_CLS_PREDICTION_MODE,
+            *PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
+        ],
+    )
+    def test_adaln_cls_prediction_requires_cross_attention(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="requires predictor_attention_mode='cross_attention'"):
+            JEPAConfig(
+                predictor_attention_mode=DECODER_PREDICTOR_MODE,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [
+            PROJECTED_CLS_PREDICTION_MODE,
+            SLOT_BIAS_CLS_PREDICTION_MODE,
+            PARTITIONED_SHARED_CLS_PREDICTION_MODE,
+            PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+        ],
+    )
+    def test_expanded_cls_prediction_requires_cross_attention(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="requires predictor_attention_mode='cross_attention'"):
+            JEPAConfig(
+                predictor_attention_mode=DECODER_PREDICTOR_MODE,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    @pytest.mark.parametrize("cls_context_tokens", [2, 4, 8])
+    def test_partitioned_cls_prediction_accepts_configurable_context_count(self, cls_context_tokens):
+        config = JEPAConfig(
+            cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+            cls_context_tokens=cls_context_tokens,
+        )
+
+        assert config.cls_context_tokens == cls_context_tokens
+
+    @pytest.mark.parametrize("cls_context_tokens", [0, -1, True])
+    def test_cls_context_count_must_be_a_positive_integer(self, cls_context_tokens):
+        with pytest.raises(ValueError, match="cls_context_tokens must be a positive integer"):
+            JEPAConfig(
+                cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+                cls_context_tokens=cls_context_tokens,
+            )
+
+    def test_nonpartitioned_cls_prediction_rejects_nondefault_context_count(self):
+        with pytest.raises(ValueError, match="only configurable for partitioned CLS prediction"):
+            JEPAConfig(cls_context_tokens=2)
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [
+            JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+        ],
+    )
+    def test_joint_context_modes_require_cross_attention(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="requires predictor_attention_mode='cross_attention'"):
+            JEPAConfig(
+                predictor_attention_mode=DECODER_PREDICTOR_MODE,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    def test_invalid_jepa_loss_weight(self):
+        with pytest.raises(ValueError, match="jepa_loss_weight"):
+            JEPAConfig(jepa_loss_weight=-0.1)
+
 
 class TestYAMLConfig:
     def test_config_constructor(self, mocker):
@@ -201,6 +307,7 @@ class TestYAMLConfig:
             "momentum": 0.98,
             "predictor_depth": 8,
             "predictor_attention_mode": ENCODER_PREDICTOR_MODE,
+            "cls_prediction_mode": LEGACY_CLS_PREDICTION_MODE,
             "disable_predictor_regularizers": True,
             "teacher_dtype": "bfloat16",
             "use_gram_anchoring": True,
@@ -222,6 +329,7 @@ class TestYAMLConfig:
         assert config.momentum == 0.98
         assert config.predictor_depth == 8
         assert config.predictor_attention_mode == ENCODER_PREDICTOR_MODE
+        assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
         assert config.use_gram_anchoring is True
@@ -246,6 +354,7 @@ class TestYAMLConfig:
         momentum: 0.97
         predictor_depth: 5
         predictor_attention_mode: decoder
+        cls_prediction_mode: legacy_cross_attention
         disable_predictor_regularizers: true
         teacher_dtype: bfloat16
         use_gram_anchoring: true
@@ -266,6 +375,7 @@ class TestYAMLConfig:
         assert config.momentum == 0.97
         assert config.predictor_depth == 5
         assert config.predictor_attention_mode == DECODER_PREDICTOR_MODE
+        assert config.cls_prediction_mode == LEGACY_CLS_PREDICTION_MODE
         assert config.disable_predictor_regularizers is True
         assert config.teacher_dtype == torch.bfloat16
         assert config.use_gram_anchoring is True
@@ -381,6 +491,154 @@ class TestAutocastContext:
         autocast.assert_called_once_with(device_type="cuda", dtype=dtype, enabled=enabled)
 
 
+class TestJointContextRouting:
+    BATCH_SIZE = 8
+    TARGET_TOKENS = 4
+    VISUAL_CONTEXT_TOKENS = 3
+
+    @staticmethod
+    def _route_counts(attention_mask: torch.Tensor) -> tuple[int, int, int]:
+        flattened = attention_mask[:, 0].reshape(-1, attention_mask.shape[-1])
+        visual_visible = flattened[:, :-1].all(dim=-1)
+        cls_visible = flattened[:, -1]
+        joint = int(torch.count_nonzero(visual_visible & cls_visible).item())
+        cls_only = int(torch.count_nonzero(~visual_visible & cls_visible).item())
+        visual_only = int(torch.count_nonzero(visual_visible & ~cls_visible).item())
+        return joint, cls_only, visual_only
+
+    def test_unmasked_joint_context_does_not_allocate_attention_mask(self):
+        attention_mask = create_joint_context_attention_mask(
+            JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+        )
+
+        assert attention_mask is None
+
+    @pytest.mark.parametrize(
+        ("cls_prediction_mode", "expected_counts"),
+        [
+            (SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE, (16, 8, 8)),
+            (TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE, (16, 8, 8)),
+        ],
+    )
+    def test_routed_joint_context_balances_visibility(self, cls_prediction_mode, expected_counts):
+        attention_mask = create_joint_context_attention_mask(
+            cls_prediction_mode,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+        )
+
+        assert attention_mask is not None
+        assert attention_mask.shape == (
+            self.BATCH_SIZE,
+            1,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS + 1,
+        )
+        assert attention_mask.any(dim=-1).all()
+        assert self._route_counts(attention_mask) == expected_counts
+
+    def test_sample_routing_shares_one_visibility_pattern_across_queries(self):
+        attention_mask = create_joint_context_attention_mask(
+            SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+        )
+
+        assert attention_mask is not None
+        assert torch.equal(attention_mask, attention_mask[:, :, :1].expand_as(attention_mask))
+
+    def test_token_routing_assigns_multiple_visibility_patterns_within_examples(self):
+        torch.manual_seed(0)
+        attention_mask = create_joint_context_attention_mask(
+            TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+        )
+
+        assert attention_mask is not None
+        unique_patterns_per_example = [
+            torch.unique(example_mask, dim=0).shape[0] for example_mask in attention_mask[:, 0]
+        ]
+        assert unique_patterns_per_example == [3] * self.BATCH_SIZE
+        assert [self._route_counts(example_mask[None, None]) for example_mask in attention_mask[:, 0]] == [
+            (2, 1, 1)
+        ] * self.BATCH_SIZE
+
+    def test_dual_routing_balances_cls_and_visual_without_joint_queries(self):
+        attention_mask = create_joint_context_attention_mask(
+            DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+        )
+
+        assert attention_mask is not None
+        assert attention_mask.dtype == torch.bool
+        assert self._route_counts(attention_mask) == (0, 16, 16)
+        assert [self._route_counts(example_mask[None, None]) for example_mask in attention_mask[:, 0]] == [
+            (0, 2, 2)
+        ] * self.BATCH_SIZE
+
+    def test_packed_dual_routing_pairs_every_target_with_both_sources(self):
+        attention_mask = create_joint_context_attention_mask(
+            PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+        )
+
+        assert attention_mask is not None
+        assert attention_mask.shape == (
+            self.BATCH_SIZE,
+            1,
+            2 * self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS + 1,
+        )
+        assert self._route_counts(attention_mask) == (0, 32, 32)
+        assert attention_mask[:, :, : self.TARGET_TOKENS, :-1].all()
+        assert not attention_mask[:, :, : self.TARGET_TOKENS, -1].any()
+        assert not attention_mask[:, :, self.TARGET_TOKENS :, :-1].any()
+        assert attention_mask[:, :, self.TARGET_TOKENS :, -1].all()
+
+    def test_source_balanced_token_routing_corrects_joint_cls_cardinality(self):
+        torch.manual_seed(0)
+        attention_mask = create_joint_context_attention_mask(
+            SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            self.BATCH_SIZE,
+            self.TARGET_TOKENS,
+            self.VISUAL_CONTEXT_TOKENS,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+        assert attention_mask is not None
+        assert attention_mask.dtype == torch.float32
+        flat_mask = attention_mask[:, 0].reshape(-1, self.VISUAL_CONTEXT_TOKENS + 1)
+        joint = torch.isfinite(flat_mask).all(dim=-1) & (flat_mask[:, -1] > 0)
+        cls_only = torch.isneginf(flat_mask[:, :-1]).all(dim=-1) & (flat_mask[:, -1] == 0)
+        visual_only = (flat_mask[:, :-1] == 0).all(dim=-1) & torch.isneginf(flat_mask[:, -1])
+        assert int(joint.sum()) == 16
+        assert int(cls_only.sum()) == 8
+        assert int(visual_only.sum()) == 8
+        assert torch.equal(
+            flat_mask[joint, -1],
+            torch.full_like(flat_mask[joint, -1], math.log(self.VISUAL_CONTEXT_TOKENS)),
+        )
+        assert (flat_mask[joint, :-1] == 0).all()
+
+
 class TestCrossAttentionPredictor:
     """Test CrossAttentionPredictor initialization and device/dtype handling."""
 
@@ -446,6 +704,521 @@ class TestCrossAttentionPredictor:
         predictor = CrossAttentionPredictor(backbone, depth=2, attention_mode=attention_mode)
 
         assert predictor.attention_mode == attention_mode
+
+    def test_prepare_rope_appends_identity_for_unpositioned_context_suffix(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(backbone, depth=2)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :32] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+
+        _, rope_k = predictor.prepare_rope(
+            (8, 8),
+            context_mask,
+            target_mask,
+            context_length=33,
+            rope_seed=0,
+        )
+
+        assert rope_k is not None
+        sin, cos = rope_k
+        assert sin.shape[-2] == 33
+        assert torch.count_nonzero(sin[..., -1, :]) == 0
+        assert torch.equal(cos[..., -1, :], torch.ones_like(cos[..., -1, :]))
+
+    def test_routed_query_is_invariant_to_hidden_context_source(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+        )
+        with torch.no_grad():
+            for block in predictor.blocks:
+                nn.init.normal_(cast(Any, block).cross_attention.out_proj.weight, std=0.01)
+                nn.init.normal_(cast(Any, block).mlp.fc2.weight, std=0.01)
+        predictor.eval()
+
+        batch_size = 2
+        visual_context_tokens = 3
+        target_tokens = 2
+        context = torch.randn(batch_size, visual_context_tokens + 1, 64)
+        context_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        context_mask[:, :visual_context_tokens] = True
+        target_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        target_mask[:, 8 : 8 + target_tokens] = True
+        attention_mask = torch.zeros(
+            batch_size,
+            1,
+            target_tokens,
+            visual_context_tokens + 1,
+            dtype=torch.bool,
+        )
+        attention_mask[:, :, 0, -1] = True
+        attention_mask[:, :, 1, :-1] = True
+
+        baseline = predictor(
+            (8, 8),
+            context,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            context_attention_mask=attention_mask,
+        )
+        visual_perturbed = context.clone()
+        visual_perturbed[:, :-1].add_(100.0)
+        after_visual_perturbation = predictor(
+            (8, 8),
+            visual_perturbed,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            context_attention_mask=attention_mask,
+        )
+        cls_perturbed = context.clone()
+        cls_perturbed[:, -1].add_(100.0)
+        after_cls_perturbation = predictor(
+            (8, 8),
+            cls_perturbed,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            context_attention_mask=attention_mask,
+        )
+
+        assert torch.equal(after_visual_perturbation[:, 0], baseline[:, 0])
+        assert torch.equal(after_cls_perturbation[:, 1], baseline[:, 1])
+        assert not torch.equal(after_visual_perturbation[:, 1], baseline[:, 1])
+        assert not torch.equal(after_cls_perturbation[:, 0], baseline[:, 0])
+
+    def test_packed_dual_routing_duplicates_target_queries_in_one_forward(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+        )
+        predictor.eval()
+        batch_size = 2
+        visual_context_tokens = 3
+        target_tokens = 2
+        context = torch.randn(batch_size, visual_context_tokens + 1, 64)
+        context_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        context_mask[:, :visual_context_tokens] = True
+        target_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        target_mask[:, 8 : 8 + target_tokens] = True
+
+        output = predictor((8, 8), context, context_mask, target_mask, rope_seed=0)
+
+        assert output.shape == (batch_size, 2 * target_tokens, 64)
+
+    @pytest.mark.parametrize("cls_prediction_mode", PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES)
+    def test_packed_adaln_hard_blind_routes_are_source_isolated(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        with torch.no_grad():
+            for block in predictor.blocks:
+                nn.init.normal_(cast(Any, block).cross_attention.out_proj.weight, std=0.01)
+        predictor.eval()
+        batch_size = 2
+        visual_context_tokens = 3
+        target_tokens = 2
+        visual_context = torch.randn(batch_size, visual_context_tokens, 64)
+        cls_conditioning = torch.randn(batch_size, 64)
+        context_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        context_mask[:, :visual_context_tokens] = True
+        target_mask = torch.zeros(batch_size, 64, dtype=torch.bool)
+        target_mask[:, 8 : 8 + target_tokens] = True
+
+        baseline = predictor(
+            (8, 8),
+            visual_context,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            conditioning=cls_conditioning,
+        )
+        visual_perturbed = predictor(
+            (8, 8),
+            visual_context + 100.0,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            conditioning=cls_conditioning,
+        )
+        cls_perturbed = predictor(
+            (8, 8),
+            visual_context,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            conditioning=cls_conditioning + 100.0,
+        )
+
+        assert baseline.shape == (batch_size, 2 * target_tokens, 64)
+        assert not torch.equal(visual_perturbed[:, :target_tokens], baseline[:, :target_tokens])
+        assert torch.equal(visual_perturbed[:, target_tokens:], baseline[:, target_tokens:])
+        assert torch.equal(cls_perturbed[:, :target_tokens], baseline[:, :target_tokens])
+        assert not torch.equal(cls_perturbed[:, target_tokens:], baseline[:, target_tokens:])
+
+    def test_packed_adaln_hard_blind_backpropagates_through_cls_without_visual_leakage(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE,
+        )
+        visual_context = torch.randn(2, 3, 64, requires_grad=True)
+        cls_conditioning = torch.randn(2, 64, requires_grad=True)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :3] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 8:10] = True
+
+        output = predictor(
+            (8, 8),
+            visual_context,
+            context_mask,
+            target_mask,
+            rope_seed=0,
+            conditioning=cls_conditioning,
+        )
+        blind_output = output[:, 2:]
+        blind_output.square().mean().backward()
+
+        assert cls_conditioning.grad is not None
+        assert torch.count_nonzero(cls_conditioning.grad) > 0
+        assert visual_context.grad is not None
+        assert torch.count_nonzero(visual_context.grad) == 0
+
+    @pytest.mark.parametrize(
+        ("cls_prediction_mode", "has_adapter", "has_mixer"),
+        [
+            (PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODE, False, False),
+            (PACKED_ADALN_HARD_BLIND_ADAPTER_CLS_PREDICTION_MODE, True, False),
+            (PACKED_ADALN_HARD_BLIND_MIXER_CLS_PREDICTION_MODE, False, True),
+        ],
+    )
+    def test_packed_adaln_hard_blind_allocates_only_selected_auxiliary(
+        self, cls_prediction_mode, has_adapter, has_mixer
+    ):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+
+        assert (predictor.blind_route_adapters is not None) is has_adapter
+        assert (predictor.blind_token_mixer is not None) is has_mixer
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
+    )
+    def test_adaln_predictor_uses_zero_initialized_conditioned_mlps(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+
+        assert predictor.cls_prediction_mode == cls_prediction_mode
+        for block in predictor.blocks:
+            modulation = cast(Any, block).mlp.modulation
+            assert torch.count_nonzero(modulation.weight) == 0
+            assert torch.count_nonzero(modulation.bias) == 0
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [PROJECTED_CLS_PREDICTION_MODE, SLOT_BIAS_CLS_PREDICTION_MODE],
+    )
+    def test_expanded_cls_predictor_requires_cross_attention(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+
+        with pytest.raises(ValueError, match="requires attention_mode='cross_attention'"):
+            CrossAttentionPredictor(
+                backbone,
+                depth=2,
+                attention_mode=DECODER_PREDICTOR_MODE,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
+    )
+    def test_blind_forward_skips_attention_and_reuses_output_projection(self, mocker, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+        cls_conditioning = torch.randn(2, 64)
+        for block in predictor.blocks:
+            mocker.patch.object(
+                cast(Any, block).cross_attention, "forward", side_effect=AssertionError("attention used")
+            )
+        projection = mocker.spy(predictor.predictor_proj, "forward")
+
+        output = predictor.forward_blind((8, 8), cls_conditioning, target_mask)
+
+        assert output.shape == (2, 16, 64)
+        projection.assert_called_once()
+
+    def test_blind_forward_backpropagates_to_single_cls_conditioning(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=ADALN_BLIND_CLS_PREDICTION_MODE,
+        )
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+        cls_conditioning = torch.randn(2, 64, requires_grad=True)
+
+        predictor.forward_blind((8, 8), cls_conditioning, target_mask).square().mean().backward()
+
+        assert cls_conditioning.grad is not None
+
+    def test_projected_cls_context_expands_one_token_and_backpropagates(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+        )
+        cls_context = torch.randn(2, 1, 64, requires_grad=True)
+
+        projected_context = predictor.project_cls_context(cls_context)
+        projected_context.square().mean().backward()
+
+        assert projected_context.shape == (2, PROJECTED_CLS_CONTEXT_TOKENS, 64)
+        assert predictor.cls_context_projection is not None
+        assert predictor.cls_context_projection.weight.grad is not None
+        assert cls_context.grad is not None
+
+    def test_projected_cls_context_rejects_multiple_input_tokens(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+        )
+
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            predictor.project_cls_context(torch.randn(2, 2, 64))
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [RESIDUAL_PROJECTED_CLS_PREDICTION_MODE, RESIDUAL_MLP_CLS_PREDICTION_MODE],
+    )
+    def test_residual_cls_context_preserves_raw_embedding_at_zero_residual(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        cls_context = torch.randn(2, 1, 64, requires_grad=True)
+        residual_module: nn.Linear
+        if cls_prediction_mode == RESIDUAL_PROJECTED_CLS_PREDICTION_MODE:
+            assert isinstance(predictor.cls_context_projection, nn.Linear)
+            residual_module = predictor.cls_context_projection
+        else:
+            assert predictor.cls_context_mlp is not None
+            output_projection = predictor.cls_context_mlp[-1]
+            assert isinstance(output_projection, nn.Linear)
+            residual_module = output_projection
+        nn.init.zeros_(residual_module.weight)
+        nn.init.zeros_(residual_module.bias)
+
+        expanded_context = predictor.expand_cls_context(cls_context)
+        expanded_context.square().mean().backward()
+
+        assert torch.equal(
+            expanded_context,
+            cls_context.expand(-1, PROJECTED_CLS_CONTEXT_TOKENS, -1),
+        )
+        assert residual_module.weight.grad is not None
+        assert cls_context.grad is not None
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [RESIDUAL_PROJECTED_CLS_PREDICTION_MODE, RESIDUAL_MLP_CLS_PREDICTION_MODE],
+    )
+    def test_residual_cls_context_rejects_multiple_input_tokens(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            predictor.expand_cls_context(torch.randn(2, 2, 64))
+
+    @pytest.mark.parametrize("cls_context_tokens", [2, 4, 8])
+    @pytest.mark.parametrize(
+        ("cls_prediction_mode", "shared"),
+        [
+            (PARTITIONED_SHARED_CLS_PREDICTION_MODE, True),
+            (PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE, False),
+        ],
+    )
+    def test_partitioned_cls_context_isolates_input_chunks_and_backpropagates(
+        self,
+        cls_prediction_mode,
+        shared,
+        cls_context_tokens,
+    ):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+            cls_context_tokens=cls_context_tokens,
+        )
+        projection = predictor.cls_context_partition_projection
+        assert projection is not None
+        chunk_size = 64 // cls_context_tokens
+        projection_count = 1 if shared else cls_context_tokens
+        assert projection.weight.shape == (projection_count, 64, chunk_size)
+        assert projection.bias.shape == (cls_context_tokens, 64)
+        with torch.no_grad():
+            projection.weight.fill_(1.0)
+            projection.bias.zero_()
+
+        cls_context = torch.zeros(2, 1, 64, requires_grad=True)
+        changed_context = cls_context.detach().clone()
+        changed_context[:, :, :chunk_size] = 1.0
+        base_output = predictor.expand_cls_context(cls_context)
+        changed_output = predictor.expand_cls_context(changed_context)
+        delta = changed_output - base_output
+
+        assert base_output.shape == (2, cls_context_tokens, 64)
+        assert torch.count_nonzero(delta[:, 0]) > 0
+        assert torch.count_nonzero(delta[:, 1:]) == 0
+
+        base_output.square().mean().backward()
+        assert projection.weight.grad is not None
+        assert projection.bias.grad is not None
+        assert cls_context.grad is not None
+
+    @pytest.mark.parametrize("cls_context_tokens", [2, 4, 8])
+    def test_independent_partitioned_cls_context_has_constant_weight_capacity(self, cls_context_tokens):
+        hidden_size = 64
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+            cls_context_tokens=cls_context_tokens,
+        )
+        projection = predictor.cls_context_partition_projection
+        assert projection is not None
+
+        assert projection.weight.shape == (
+            cls_context_tokens,
+            hidden_size,
+            hidden_size // cls_context_tokens,
+        )
+        assert projection.bias.shape == (cls_context_tokens, hidden_size)
+        assert projection.weight.numel() == hidden_size**2
+        assert predictor.expand_cls_context(torch.randn(2, 1, hidden_size)).shape == (
+            2,
+            cls_context_tokens,
+            hidden_size,
+        )
+
+    def test_partitioned_cls_context_requires_divisible_hidden_size(self):
+        backbone = self._instantiate_backbone(torch.float32)
+
+        with pytest.raises(ValueError, match="hidden_size must be divisible by cls_context_tokens"):
+            CrossAttentionPredictor(
+                backbone,
+                depth=2,
+                cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+                cls_context_tokens=3,
+            )
+
+    def test_nonpartitioned_predictor_rejects_nondefault_context_count(self):
+        backbone = self._instantiate_backbone(torch.float32)
+
+        with pytest.raises(ValueError, match="only configurable for partitioned CLS prediction"):
+            CrossAttentionPredictor(backbone, depth=2, cls_context_tokens=2)
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [PARTITIONED_SHARED_CLS_PREDICTION_MODE, PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE],
+    )
+    def test_partitioned_cls_context_rejects_multiple_input_tokens(self, cls_prediction_mode):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            predictor.expand_cls_context(torch.randn(2, 2, 64))
+
+    def test_slot_bias_cls_context_adds_learned_slot_identities_and_backpropagates(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=SLOT_BIAS_CLS_PREDICTION_MODE,
+        )
+        cls_context = torch.randn(2, 1, 64, requires_grad=True)
+
+        expanded_context = predictor.expand_cls_context(cls_context)
+        expanded_context.square().mean().backward()
+
+        assert expanded_context.shape == (2, PROJECTED_CLS_CONTEXT_TOKENS, 64)
+        assert predictor.cls_context_slot_bias is not None
+        assert torch.equal(
+            expanded_context,
+            cls_context.expand(-1, PROJECTED_CLS_CONTEXT_TOKENS, -1) + predictor.cls_context_slot_bias,
+        )
+        assert predictor.cls_context_slot_bias.grad is not None
+        assert cls_context.grad is not None
+
+    def test_slot_bias_cls_context_rejects_multiple_input_tokens(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=SLOT_BIAS_CLS_PREDICTION_MODE,
+        )
+
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            predictor.expand_cls_context(torch.randn(2, 2, 64))
+
+    def test_adaln_main_forward_requires_conditioning(self):
+        backbone = self._instantiate_backbone(torch.float32)
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=2,
+            cls_prediction_mode=ADALN_SHARED_CLS_PREDICTION_MODE,
+        )
+        context = torch.randn(2, 32, 64)
+        context_mask = torch.zeros(2, 64, dtype=torch.bool)
+        context_mask[:, :32] = True
+        target_mask = torch.zeros(2, 64, dtype=torch.bool)
+        target_mask[:, 32:48] = True
+
+        with pytest.raises(ValueError, match="conditioning is required"):
+            predictor((8, 8), context, context_mask, target_mask)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
     def test_predictor_initialization_cpu_dtype(self, dtype):

@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,9 +23,12 @@ from vit import ViT
 from vit.pos_enc import LearnablePosition
 
 from .jepa import (
+    CLS_CONTEXT_TOKENS,
     CROSS_ATTENTION_PREDICTOR_MODE,
     DECODER_PREDICTOR_MODE,
     ENCODER_PREDICTOR_MODE,
+    LEGACY_CLS_PREDICTION_MODE,
+    CLSPredictionMode,
     CrossAttentionPredictor,
     PredictorAttentionMode,
 )
@@ -39,6 +43,19 @@ from .optimizer import (
 
 
 DataLoaderFn = Callable[[Sequence[int], int], DataLoader]
+
+
+@dataclass(frozen=True)
+class CheckpointMetadata:
+    """Small, stable checkpoint fields needed before model construction."""
+
+    step: int
+    epoch: int
+    img_size: tuple[int, int] | None
+    elapsed_seconds: float
+    wandb_run_id: str | None
+    cls_prediction_mode: CLSPredictionMode = LEGACY_CLS_PREDICTION_MODE
+    cls_context_tokens: int = CLS_CONTEXT_TOKENS
 
 
 def seed_everything(seed: int) -> None:
@@ -161,6 +178,8 @@ def save_checkpoint(
     scheduler: SchedulerLike,
     step: int,
     epoch: int,
+    elapsed_seconds: float = 0.0,
+    wandb_run_id: str | None = None,
 ) -> None:
     r"""Save a checkpoint.
 
@@ -175,7 +194,8 @@ def save_checkpoint(
         scheduler: Scheduler.
         step: Current step.
         epoch: Current epoch.
-        img_size: Image size used during training.
+        elapsed_seconds: Active training time accumulated across resume attempts.
+        wandb_run_id: W&B run identifier to continue when resuming.
     """
     path = Path(path)
     if not path.parent.is_dir():
@@ -191,8 +211,43 @@ def save_checkpoint(
         step=step,
         epoch=epoch,
         img_size=backbone.config.img_size if hasattr(backbone.config, "img_size") else None,
+        elapsed_seconds=elapsed_seconds,
+        wandb_run_id=wandb_run_id,
+        cls_prediction_mode=(predictor.cls_prediction_mode if predictor is not None else LEGACY_CLS_PREDICTION_MODE),
+        cls_context_tokens=(predictor.cls_context_tokens if predictor is not None else CLS_CONTEXT_TOKENS),
     )
-    torch.save(data, path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        torch.save(data, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def load_checkpoint_metadata(path: os.PathLike) -> CheckpointMetadata:
+    """Read the small checkpoint fields required to prepare a resume run."""
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint_img_size = data.get("img_size")
+    img_size = tuple(int(value) for value in checkpoint_img_size) if checkpoint_img_size is not None else None
+    if img_size is not None and len(img_size) != 2:
+        raise ValueError(f"checkpoint image size must contain two dimensions, got {img_size}")
+    return CheckpointMetadata(
+        step=int(data["step"]),
+        epoch=int(data["epoch"]),
+        img_size=img_size,
+        elapsed_seconds=float(data.get("elapsed_seconds", 0.0)),
+        wandb_run_id=data.get("wandb_run_id"),
+        cls_prediction_mode=data.get("cls_prediction_mode", LEGACY_CLS_PREDICTION_MODE),
+        cls_context_tokens=int(data.get("cls_context_tokens", CLS_CONTEXT_TOKENS)),
+    )
 
 
 def resize_learnable_pos_enc(model: nn.Module, tokenized_size: Sequence[int]) -> None:
@@ -283,6 +338,20 @@ def _predictor_attention_mode_mismatch(
     return checkpoint_mode is not None and predictor.attention_mode != checkpoint_mode
 
 
+def _predictor_cls_prediction_mode_mismatch(
+    predictor: CrossAttentionPredictor,
+    checkpoint_mode: CLSPredictionMode,
+) -> bool:
+    return predictor.cls_prediction_mode != checkpoint_mode
+
+
+def _predictor_cls_context_tokens_mismatch(
+    predictor: CrossAttentionPredictor,
+    checkpoint_tokens: int,
+) -> bool:
+    return predictor.cls_context_tokens != checkpoint_tokens
+
+
 def load_checkpoint(
     path: os.PathLike,
     backbone: ViT,
@@ -316,9 +385,11 @@ def load_checkpoint(
     if mode == "resume":
         _validate_checkpoint_optimizer_and_scheduler_kinds(data, optimizer, scheduler)
 
-    old_img_size = (256, 256)
+    checkpoint_img_size = data.get("img_size")
+    old_img_size = tuple(checkpoint_img_size) if checkpoint_img_size is not None else (256, 256)
     old_tokenized_size = backbone.stem.tokenized_size(old_img_size)
-    new_tokenized_size = backbone.stem.tokenized_size(backbone.config.img_size)
+    new_img_size = tuple(backbone.config.img_size)
+    new_tokenized_size = backbone.stem.tokenized_size(new_img_size)
     step = int(data["step"])
     epoch = int(data["epoch"])
     predictor_checkpoint_mode = (
@@ -326,6 +397,8 @@ def load_checkpoint(
         if predictor is not None and data["predictor"] is not None
         else None
     )
+    checkpoint_cls_prediction_mode = data.get("cls_prediction_mode", LEGACY_CLS_PREDICTION_MODE)
+    checkpoint_cls_context_tokens = int(data.get("cls_context_tokens", CLS_CONTEXT_TOKENS))
 
     if mode == "resume" and predictor and _predictor_shallow_head_mismatch(predictor, data["predictor"]):
         raise ValueError(
@@ -338,10 +411,30 @@ def load_checkpoint(
             f"checkpoint uses {predictor_checkpoint_mode!r} but current predictor uses {predictor.attention_mode!r}. "
             "Load with mode='fresh' or match predictor_attention_mode."
         )
+    if (
+        mode == "resume"
+        and predictor
+        and _predictor_cls_prediction_mode_mismatch(predictor, checkpoint_cls_prediction_mode)
+    ):
+        raise ValueError(
+            "Cannot resume across predictor CLS-prediction-mode changes; "
+            f"checkpoint uses {checkpoint_cls_prediction_mode!r} but current predictor uses "
+            f"{predictor.cls_prediction_mode!r}. Load with mode='fresh' or match cls_prediction_mode."
+        )
+    if (
+        mode == "resume"
+        and predictor
+        and _predictor_cls_context_tokens_mismatch(predictor, checkpoint_cls_context_tokens)
+    ):
+        raise ValueError(
+            "Cannot resume across predictor CLS-context-token count changes; "
+            f"checkpoint uses {checkpoint_cls_context_tokens} but current predictor uses "
+            f"{predictor.cls_context_tokens}. Load with mode='fresh' or match cls_context_tokens."
+        )
 
     # Validate image size
-    if mode == "resume" and old_img_size != backbone.config.img_size:
-        raise ValueError(f"Image size mismatch on resume: {old_img_size} != {backbone.config.img_size}")
+    if mode == "resume" and old_img_size != new_img_size:
+        raise ValueError(f"Image size mismatch on resume: {old_img_size} != {new_img_size}")
 
     # Load weights, resizing positional encodings if necessary.
     # Positional encodings are first resized to match the old checkpoint, then weights are loaded,

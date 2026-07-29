@@ -250,6 +250,7 @@ class OptimizerConfig:
     foreach: bool | None = None
     eps: float = 1e-8
     adamw_lr: float | None = None
+    adamw_weight_decay: float | None = None
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
@@ -336,10 +337,11 @@ class OptimizerConfig:
             )
         if adamw_parameter_groups:
             adamw_lr = self.adamw_lr if self.adamw_lr is not None else self.lr
+            adamw_weight_decay = self.adamw_weight_decay if self.adamw_weight_decay is not None else self.weight_decay
             optimizers[ADAMW_COMPONENT_NAME] = AdamW(
                 adamw_parameter_groups,
                 lr=adamw_lr,
-                weight_decay=self.weight_decay,
+                weight_decay=adamw_weight_decay,
                 betas=self.betas,
                 fused=self.fused,
                 foreach=self.foreach,

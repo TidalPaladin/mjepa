@@ -4,14 +4,32 @@ import torch.nn.functional as F
 from vit import ViT, ViTConfig, ViTFeatures
 
 from mjepa.jepa import (
+    ADALN_BLIND_CLS_PREDICTION_MODE,
+    ADALN_SHARED_CLS_PREDICTION_MODE,
     COSINE_JEPA_LOSS_KIND,
     CROSS_ATTENTION_PREDICTOR_MODE,
+    DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    JOINT_CONTEXT_CLS_PREDICTION_MODE,
     MSE_JEPA_LOSS_KIND,
+    PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES,
+    PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+    PARTITIONED_SHARED_CLS_PREDICTION_MODE,
     PREDICTOR_ATTENTION_MODES,
+    PROJECTED_CLS_CONTEXT_TOKENS,
+    PROJECTED_CLS_PREDICTION_MODE,
+    RESIDUAL_MLP_CLS_PREDICTION_MODE,
+    RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
+    SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    SLOT_BIAS_CLS_PREDICTION_MODE,
+    SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+    CLSPredictionMode,
     CrossAttentionPredictor,
     JEPAConfig,
     JEPALossKind,
     PredictorAttentionMode,
+    create_joint_context_attention_mask,
 )
 from mjepa.model import MJEPA, MJEPALosses, MJEPAPredictions
 
@@ -55,17 +73,22 @@ def _make_test_model(
     sigreg_loss_weight: float,
     jepa_loss_kind: JEPALossKind = MSE_JEPA_LOSS_KIND,
     predictor_attention_mode: PredictorAttentionMode = CROSS_ATTENTION_PREDICTOR_MODE,
+    cls_prediction_mode: CLSPredictionMode = "legacy_cross_attention",
+    jepa_loss_weight: float = 1.0,
 ) -> MJEPA:
     config = _make_jepa_config(
         sigreg_loss_weight=sigreg_loss_weight,
         jepa_loss_kind=jepa_loss_kind,
         predictor_attention_mode=predictor_attention_mode,
+        cls_prediction_mode=cls_prediction_mode,
+        jepa_loss_weight=jepa_loss_weight,
     )
     backbone = _make_test_vit_config(num_cls_tokens=num_cls_tokens).instantiate()
     predictor = CrossAttentionPredictor(
         backbone,
         depth=TEST_PREDICTOR_DEPTH,
         attention_mode=config.predictor_attention_mode,
+        cls_prediction_mode=config.cls_prediction_mode,
     )
     return MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
 
@@ -405,6 +428,23 @@ class TestMJEPAInitialization:
 
         with pytest.raises(ValueError, match="Predictor attention mode does not match JEPAConfig"):
             MJEPA(config, small_vit, predictor, autocast_dtype=torch.float32)
+
+    def test_initialization_rejects_cls_context_count_mismatch(self):
+        """Test that config and predictor partition counts must agree."""
+        config = JEPAConfig(
+            cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+            cls_context_tokens=2,
+        )
+        backbone = _make_test_vit_config(num_cls_tokens=1).instantiate()
+        predictor = CrossAttentionPredictor(
+            backbone,
+            depth=TEST_PREDICTOR_DEPTH,
+            cls_prediction_mode=PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+            cls_context_tokens=8,
+        )
+
+        with pytest.raises(ValueError, match="Predictor CLS context count does not match JEPAConfig"):
+            MJEPA(config, backbone, predictor, autocast_dtype=torch.float32)
 
     def test_teacher_frozen(self, mjepa_model):
         """Test that teacher parameters are frozen."""
@@ -850,6 +890,74 @@ class TestMJEPAComputeLosses:
         assert losses.stem_jepa_loss == 0.0
         assert losses.gram_loss == 0.0  # no gram teacher
 
+    def test_jepa_loss_weight_scales_single_prediction_objective(self):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            jepa_loss_weight=2.0,
+        )
+        predictions, pred, _, teacher_output = self._make_predictions_for_loss_tests()
+        predictions.pred_with_cls = None
+
+        losses = model.compute_losses(output=predictions, step=0, epoch=0)
+
+        target = _masked_teacher_target(teacher_output, predictions.target_mask)
+        expected = 2.0 * F.mse_loss(pred, target)
+        assert losses.jepa_loss_weight == 2.0
+        assert torch.isclose(losses.reduce(), expected)
+
+    @pytest.mark.parametrize(
+        ("cls_prediction_mode", "query_multiplier"),
+        [
+            (DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE, 1),
+            (PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE, 2),
+        ],
+    )
+    def test_dual_route_loss_normalizes_visual_and_cls_routes_separately(
+        self,
+        cls_prediction_mode,
+        query_multiplier,
+    ):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        predictions, _, _, teacher_output = self._make_predictions_for_loss_tests()
+        target = _masked_teacher_target(teacher_output, predictions.target_mask)
+        predictions.pred = torch.randn(
+            target.shape[0],
+            query_multiplier * target.shape[1],
+            target.shape[2],
+        )
+        predictions.pred_with_cls = None
+        predictions.context_attention_mask = create_joint_context_attention_mask(
+            cls_prediction_mode,
+            target.shape[0],
+            target.shape[1],
+            visual_context_tokens=3,
+            device=target.device,
+        )
+
+        losses = model.compute_losses(output=predictions, step=0, epoch=0)
+
+        assert predictions.context_attention_mask is not None
+        aligned_target = target.repeat(1, query_multiplier, 1)
+        flat_mask = predictions.context_attention_mask[:, 0]
+        visual_only = flat_mask[..., :-1].all(dim=-1) & ~flat_mask[..., -1]
+        cls_only = ~flat_mask[..., :-1].any(dim=-1) & flat_mask[..., -1]
+        assert torch.isclose(
+            losses.jepa_loss,
+            F.mse_loss(predictions.pred[visual_only], aligned_target[visual_only]),
+        )
+        assert isinstance(losses.jepa_loss_cls, torch.Tensor)
+        assert torch.isclose(
+            losses.jepa_loss_cls,
+            F.mse_loss(predictions.pred[cls_only], aligned_target[cls_only]),
+        )
+        assert torch.isclose(losses.reduce(), losses.jepa_loss + losses.jepa_loss_cls)
+
     def test_compute_losses_gram_flag_disabled_ignores_schedule(self, mjepa_model_gram_schedule_disabled: MJEPA):
         """Test that Gram loss stays disabled when the flag is off even if the schedule is present."""
         predictions, _, _, _ = self._make_predictions_for_loss_tests(gram_teacher_output=torch.randn(2, 64, 64))
@@ -1257,6 +1365,259 @@ class TestMJEPAForward:
         assert predictions.pred.dtype == torch.float32
         assert predictions.pred_with_cls is not None
         assert predictions.pred_with_cls.shape == predictions.pred.shape
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [ADALN_BLIND_CLS_PREDICTION_MODE, ADALN_SHARED_CLS_PREDICTION_MODE],
+    )
+    def test_adaln_cls_prediction_requires_exactly_one_cls_token(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            _make_test_model(
+                num_cls_tokens=TEST_NUM_CLS_TOKENS,
+                sigreg_loss_weight=0.0,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [
+            PROJECTED_CLS_PREDICTION_MODE,
+            SLOT_BIAS_CLS_PREDICTION_MODE,
+            RESIDUAL_PROJECTED_CLS_PREDICTION_MODE,
+            RESIDUAL_MLP_CLS_PREDICTION_MODE,
+            PARTITIONED_SHARED_CLS_PREDICTION_MODE,
+            PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE,
+        ],
+    )
+    def test_expanded_cls_prediction_requires_exactly_one_cls_token(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            _make_test_model(
+                num_cls_tokens=TEST_NUM_CLS_TOKENS,
+                sigreg_loss_weight=0.0,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [
+            JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+        ],
+    )
+    def test_joint_context_prediction_uses_one_predictor_forward(
+        self,
+        dummy_batch,
+        mocker,
+        cls_prediction_mode,
+    ):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=cls_prediction_mode,
+            jepa_loss_weight=2.0,
+        )
+        model.eval()
+        forward_heads = mocker.spy(model.predictor, "forward_heads")
+        first_block = mocker.spy(model.predictor.blocks[0], "forward")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        forward_heads.assert_called_once()
+        context = forward_heads.call_args.args[1]
+        assert context.shape[1] == predictions.student_output.visual_tokens.shape[1] + 1
+        assert torch.equal(context[:, -1:], predictions.student_output.cls_tokens)
+        assert predictions.pred_with_cls is None
+        context_attention_mask = first_block.call_args.kwargs["attn_mask"]
+        if cls_prediction_mode == JOINT_CONTEXT_CLS_PREDICTION_MODE:
+            assert context_attention_mask is None
+        else:
+            assert context_attention_mask is not None
+            expected_queries = predictions.target_mask.sum(dim=1)[0].item()
+            if cls_prediction_mode == PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE:
+                expected_queries *= 2
+            assert context_attention_mask.shape[-2:] == (expected_queries, context.shape[1])
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [
+            JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            SAMPLE_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            PACKED_DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+            SOURCE_BALANCED_TOKEN_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODE,
+        ],
+    )
+    def test_joint_context_prediction_requires_exactly_one_cls_token(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            _make_test_model(
+                num_cls_tokens=TEST_NUM_CLS_TOKENS,
+                sigreg_loss_weight=0.0,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    @pytest.mark.parametrize("cls_prediction_mode", PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES)
+    def test_packed_adaln_hard_blind_uses_one_visual_context_predictor_forward(
+        self,
+        dummy_batch,
+        mocker,
+        cls_prediction_mode,
+    ):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        model.eval()
+        forward_heads = mocker.spy(model.predictor, "forward_heads")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        forward_heads.assert_called_once()
+        context = forward_heads.call_args.args[1]
+        conditioning = forward_heads.call_args.kwargs["conditioning"]
+        assert torch.equal(context, predictions.student_output.visual_tokens)
+        assert torch.equal(conditioning, predictions.student_output.cls_tokens[:, 0])
+        assert predictions.pred.shape[1] == 2 * predictions.target_mask.sum(dim=1)[0].item()
+        assert predictions.pred_with_cls is None
+        assert predictions.context_attention_mask is not None
+
+    @pytest.mark.parametrize("cls_prediction_mode", PACKED_ADALN_HARD_BLIND_CLS_PREDICTION_MODES)
+    def test_packed_adaln_hard_blind_requires_exactly_one_cls_token(self, cls_prediction_mode):
+        with pytest.raises(ValueError, match="exactly one CLS token"):
+            _make_test_model(
+                num_cls_tokens=TEST_NUM_CLS_TOKENS,
+                sigreg_loss_weight=0.0,
+                cls_prediction_mode=cls_prediction_mode,
+            )
+
+    def test_projected_cls_prediction_uses_four_token_auxiliary_context(self, dummy_batch, mocker):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=PROJECTED_CLS_PREDICTION_MODE,
+        )
+        model.eval()
+        forward_predictor = mocker.spy(model, "forward_predictor")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        projected_context = forward_predictor.call_args.args[1]
+        expected_context = model.predictor.project_cls_context(predictions.student_output.cls_tokens)
+        assert projected_context.shape == (TEST_BATCH_SIZE, PROJECTED_CLS_CONTEXT_TOKENS, TEST_HIDDEN_SIZE)
+        assert torch.equal(projected_context, expected_context)
+        assert predictions.pred_with_cls is not None
+
+    def test_slot_bias_cls_prediction_uses_four_token_auxiliary_context(self, dummy_batch, mocker):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=SLOT_BIAS_CLS_PREDICTION_MODE,
+        )
+        model.eval()
+        forward_predictor = mocker.spy(model, "forward_predictor")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        expanded_context = forward_predictor.call_args.args[1]
+        expected_context = model.predictor.expand_cls_context(predictions.student_output.cls_tokens)
+        assert expanded_context.shape == (TEST_BATCH_SIZE, PROJECTED_CLS_CONTEXT_TOKENS, TEST_HIDDEN_SIZE)
+        assert torch.equal(expanded_context, expected_context)
+        assert predictions.pred_with_cls is not None
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [RESIDUAL_PROJECTED_CLS_PREDICTION_MODE, RESIDUAL_MLP_CLS_PREDICTION_MODE],
+    )
+    def test_residual_cls_prediction_uses_four_token_auxiliary_context(
+        self,
+        dummy_batch,
+        mocker,
+        cls_prediction_mode,
+    ):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        model.eval()
+        forward_predictor = mocker.spy(model, "forward_predictor")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        expanded_context = forward_predictor.call_args.args[1]
+        expected_context = model.predictor.expand_cls_context(predictions.student_output.cls_tokens)
+        assert expanded_context.shape == (TEST_BATCH_SIZE, PROJECTED_CLS_CONTEXT_TOKENS, TEST_HIDDEN_SIZE)
+        assert torch.equal(expanded_context, expected_context)
+        assert predictions.pred_with_cls is not None
+
+    @pytest.mark.parametrize(
+        "cls_prediction_mode",
+        [PARTITIONED_SHARED_CLS_PREDICTION_MODE, PARTITIONED_INDEPENDENT_CLS_PREDICTION_MODE],
+    )
+    def test_partitioned_cls_prediction_uses_four_token_auxiliary_context(
+        self,
+        dummy_batch,
+        mocker,
+        cls_prediction_mode,
+    ):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=cls_prediction_mode,
+        )
+        model.eval()
+        forward_predictor = mocker.spy(model, "forward_predictor")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        expanded_context = forward_predictor.call_args.args[1]
+        expected_context = model.predictor.expand_cls_context(predictions.student_output.cls_tokens)
+        assert expanded_context.shape == (TEST_BATCH_SIZE, PROJECTED_CLS_CONTEXT_TOKENS, TEST_HIDDEN_SIZE)
+        assert torch.equal(expanded_context, expected_context)
+        assert predictions.pred_with_cls is not None
+
+    def test_adaln_blind_uses_null_main_conditioning(self, dummy_batch, mocker):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=ADALN_BLIND_CLS_PREDICTION_MODE,
+        )
+        model.eval()
+        forward_heads = mocker.spy(model.predictor, "forward_heads")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        conditioning = forward_heads.call_args.kwargs["conditioning"]
+        assert torch.count_nonzero(conditioning) == 0
+        assert predictions.pred_with_cls is not None
+
+    def test_adaln_shared_uses_student_cls_as_main_conditioning(self, dummy_batch, mocker):
+        model = _make_test_model(
+            num_cls_tokens=1,
+            sigreg_loss_weight=0.0,
+            cls_prediction_mode=ADALN_SHARED_CLS_PREDICTION_MODE,
+        )
+        model.eval()
+        forward_heads = mocker.spy(model.predictor, "forward_heads")
+
+        with torch.no_grad():
+            predictions = model(dummy_batch, jepa_scale=2, epoch=0)
+
+        conditioning = forward_heads.call_args.kwargs["conditioning"]
+        assert torch.equal(conditioning, predictions.student_output.cls_tokens[:, 0])
+        assert predictions.pred_with_cls is not None
 
     def test_get_probe_tokens_falls_back_to_visual_tokens_without_cls(
         self, mjepa_model_no_gram: MJEPA, dummy_vit_features: ViTFeatures
