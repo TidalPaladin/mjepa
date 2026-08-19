@@ -1026,6 +1026,41 @@ class CrossAttentionPredictor(nn.Module):
 
 
 @torch.no_grad()
+def _sample_selected_blocks(
+    eligible_mask: Tensor,
+    count: int,
+    tokenized_size: tuple[int, ...],
+    scale: int,
+    roll: bool,
+) -> Tensor:
+    """Select an exact token count while preferring contiguous coarse blocks."""
+    if scale < 1:
+        raise ValueError(f"Invalid `scale` {scale}")
+    if count < 0 or count > int(eligible_mask.sum(dim=1).min().item()):
+        raise ValueError(f"Cannot select {count} tokens from the eligible mask")
+    selected = torch.zeros_like(eligible_mask)
+    if count == 0:
+        return selected
+
+    coarse_size = tuple((dimension + scale - 1) // scale for dimension in tokenized_size)
+    block_scores = torch.rand(
+        (eligible_mask.shape[0], 1, *coarse_size),
+        device=eligible_mask.device,
+    )
+    block_scores = F.interpolate(block_scores, scale_factor=scale, mode="nearest")
+    spatial_slices = tuple(slice(dimension) for dimension in tokenized_size)
+    block_scores = block_scores[(slice(None), slice(None), *spatial_slices)].flatten(1)
+    if roll and scale > 1:
+        should_roll = torch.rand(eligible_mask.shape[0], device=eligible_mask.device) < 0.5
+        rolled_scores = block_scores.roll(scale // 2, dims=1)
+        block_scores = torch.where(should_roll[:, None], rolled_scores, block_scores)
+
+    ranked_indices = block_scores.masked_fill(~eligible_mask, torch.inf).argsort(dim=1, stable=True)
+    selected.scatter_(1, ranked_indices[:, :count], True)
+    return selected
+
+
+@torch.no_grad()
 def generate_masks(
     backbone: ViT,
     x: Tensor,
@@ -1033,6 +1068,7 @@ def generate_masks(
     target_ratio: float,
     scale: int,
     roll: bool = True,
+    eligible_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     r"""Generate context masks and the corresponding prediction target masks.
 
@@ -1042,11 +1078,48 @@ def generate_masks(
         context_ratio: Ratio of the input to sample as context.
         target_ratio: Ratio of the input to sample as a prediction target.
         scale: Integer scale at which to mask contiguous blocks of tokens.
+        eligible_mask: Optional full-grid mask restricting both context and target sampling.
 
     Returns:
         Tuple of context and target masks.
     """
-    # generate context mask - will always be non-ragged
+    if eligible_mask is not None:
+        tokenized_size = tuple(backbone.stem.tokenized_size(x.shape[2:]))
+        expected_shape = (x.shape[0], math.prod(tokenized_size))
+        if eligible_mask.dtype != torch.bool or tuple(eligible_mask.shape) != expected_shape:
+            raise ValueError(f"eligible_mask must be boolean with shape {expected_shape}")
+        if eligible_mask.device != x.device:
+            raise ValueError("eligible_mask and input must be on the same device")
+        selected_counts = eligible_mask.sum(dim=1)
+        if not torch.equal(selected_counts, selected_counts[:1].expand_as(selected_counts)):
+            raise ValueError("eligible_mask must select the same token count in every example")
+        selected_count = int(selected_counts[0].item())
+        if selected_count == 0:
+            raise ValueError("eligible_mask must select at least one token")
+
+        context_count = int(round(selected_count * context_ratio))
+        target_count = int(round(selected_count * target_ratio))
+        if target_ratio != 1.0 and context_count + target_count > selected_count:
+            raise ValueError("context and target counts exceed the eligible token count")
+        context_mask = _sample_selected_blocks(
+            eligible_mask,
+            context_count,
+            tokenized_size,
+            scale,
+            roll,
+        )
+        if target_ratio == 1.0:
+            return context_mask, eligible_mask.clone()
+        target_mask = _sample_selected_blocks(
+            eligible_mask & ~context_mask,
+            target_count,
+            tokenized_size,
+            scale,
+            roll,
+        )
+        return context_mask, target_mask
+
+    # Generate a context mask. This retains the original dense-mode behavior.
     context_mask = backbone.create_mask(x, context_ratio, scale, roll=roll)
 
     if target_ratio == 1.0:

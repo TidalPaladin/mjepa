@@ -508,6 +508,20 @@ class TestMJEPAForwardPasses:
         assert isinstance(output, ViTFeatures)
         assert output.dense_features.shape[0] == dummy_batch.shape[0]
 
+    def test_forward_limits_teacher_context_and_targets_to_compute_mask(self, mjepa_model: MJEPA, dummy_batch):
+        compute_mask = torch.zeros((dummy_batch.shape[0], TEST_NUM_VISUAL_TOKENS), dtype=torch.bool)
+        compute_mask[:, ::2] = True
+
+        output = mjepa_model(dummy_batch, jepa_scale=2, epoch=0, compute_mask=compute_mask)
+
+        assert output.teacher_output.visual_mask is not None
+        assert torch.equal(output.teacher_output.visual_mask, compute_mask)
+        assert torch.equal(output.context_mask.sum(dim=1), torch.tensor([16, 16]))
+        assert torch.equal(output.target_mask.sum(dim=1), torch.tensor([8, 8]))
+        assert not (output.context_mask & ~compute_mask).any()
+        assert not (output.target_mask & ~compute_mask).any()
+        assert output.teacher_output.restored_visual_tokens.shape[1] == TEST_NUM_VISUAL_TOKENS
+
     def test_forward_predictor(self, mjepa_model: MJEPA):
         """Test forward pass through predictor."""
         tokenized_size = (8, 8)

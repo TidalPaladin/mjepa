@@ -119,12 +119,16 @@ class MJEPA(nn.Module):
     def img_size(self) -> tuple[int, int]:
         return cast(tuple[int, int], self.student.config.img_size)
 
-    def forward_teacher(self, x: Tensor) -> ViTFeatures:
+    def forward_teacher(self, x: Tensor, mask: Tensor | None = None) -> ViTFeatures:
         self.teacher.eval()
         with autocast_context(x.device.type, self.autocast_dtype), torch.inference_mode():
-            output = self.teacher(x)
+            output = self.teacher(x, mask=mask)
         return ViTFeatures(
-            output.dense_features.clone(), output.num_register_tokens, output.num_cls_tokens, output.tokenized_size
+            output.dense_features.clone(),
+            output.num_register_tokens,
+            output.num_cls_tokens,
+            output.tokenized_size,
+            output.visual_mask.clone() if output.visual_mask is not None else None,
         )
 
     def forward_teacher_stem(self, x: Tensor) -> Tensor:
@@ -323,7 +327,7 @@ class MJEPA(nn.Module):
 
     def compute_losses(self, output: MJEPAPredictions, step: int, epoch: int) -> MJEPALosses:
         student_output = output.student_output
-        target = self._masked_target(output.target_mask, output.teacher_output.visual_tokens)
+        target = self._masked_target(output.target_mask, output.teacher_output.restored_visual_tokens)
         if self.config.cls_prediction_mode in DUAL_ROUTED_JOINT_CONTEXT_CLS_PREDICTION_MODES:
             jepa_loss, jepa_loss_cls = self._compute_dual_route_losses(
                 output.pred,
@@ -416,15 +420,26 @@ class MJEPA(nn.Module):
             ),
         )
 
-    def forward(self, x: Tensor, jepa_scale: int, epoch: int) -> MJEPAPredictions:
+    def forward(
+        self,
+        x: Tensor,
+        jepa_scale: int,
+        epoch: int,
+        compute_mask: Tensor | None = None,
+    ) -> MJEPAPredictions:
         # NOTE: For DDP to work, all components must execute in the forward pass when training
         context_mask, target_mask = generate_masks(
-            self.student, x, self.config.context_ratio, self.config.target_ratio, jepa_scale
+            self.student,
+            x,
+            self.config.context_ratio,
+            self.config.target_ratio,
+            jepa_scale,
+            eligible_mask=compute_mask,
         )
 
         rope_seed = int(torch.randint(0, 1000000, (1,)).item())
         # Teacher / Gram teacher forward pass
-        teacher_output = self.forward_teacher(x)
+        teacher_output = self.forward_teacher(x, mask=compute_mask)
         teacher_stem_output = self.forward_teacher_stem(x) if self._use_stem_targets() else None
         gram_teacher_output = (
             self.forward_gram_teacher(x, context_mask, rope_seed) if self._is_gram_enabled_for_epoch(epoch) else None
@@ -540,5 +555,11 @@ class MJEPA(nn.Module):
 
     if TYPE_CHECKING:
 
-        def __call__(self, x: Tensor, jepa_scale: int, epoch: int) -> MJEPAPredictions:
-            return self.forward(x, jepa_scale, epoch)
+        def __call__(
+            self,
+            x: Tensor,
+            jepa_scale: int,
+            epoch: int,
+            compute_mask: Tensor | None = None,
+        ) -> MJEPAPredictions:
+            return self.forward(x, jepa_scale, epoch, compute_mask)

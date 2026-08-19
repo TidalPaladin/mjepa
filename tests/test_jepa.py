@@ -1534,6 +1534,42 @@ class TestGenerateMasks:
             # Masks should still have correct shapes
             assert context_mask.shape == target_mask.shape
 
+    def test_selected_token_masks_have_exact_counts_and_no_overlap(self, backbone):
+        x = torch.randn(2, 3, 32, 32)
+        eligible_mask = torch.zeros((2, 64), dtype=torch.bool)
+        eligible_mask[:, ::2] = True
+
+        context_mask, target_mask = generate_masks(
+            backbone,
+            x,
+            context_ratio=0.5,
+            target_ratio=0.25,
+            scale=2,
+            eligible_mask=eligible_mask,
+        )
+
+        assert torch.equal(context_mask.sum(dim=1), torch.tensor([16, 16]))
+        assert torch.equal(target_mask.sum(dim=1), torch.tensor([8, 8]))
+        assert not (context_mask & target_mask).any()
+        assert not (context_mask & ~eligible_mask).any()
+        assert not (target_mask & ~eligible_mask).any()
+
+    def test_selected_token_full_target_covers_only_eligible_tokens(self, backbone):
+        x = torch.randn(2, 3, 32, 32)
+        eligible_mask = torch.zeros((2, 64), dtype=torch.bool)
+        eligible_mask[:, 8:40] = True
+
+        _, target_mask = generate_masks(
+            backbone,
+            x,
+            context_ratio=0.5,
+            target_ratio=1.0,
+            scale=2,
+            eligible_mask=eligible_mask,
+        )
+
+        assert torch.equal(target_mask, eligible_mask)
+
 
 class TestComputeGramLoss:
     """Test compute_gram_loss function."""
