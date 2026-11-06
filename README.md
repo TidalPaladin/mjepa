@@ -5,11 +5,12 @@ transformers.
 
 ## Requirements
 
-- CPython 3.11 through 3.14.
+- CPython 3.11 through 3.15.
 - `uv>=0.11.28,<0.12`.
-- CUDA is optional; CUDA-marked tests run only when a compatible device is available.
+- PyTorch 2.15.0, torchvision 0.29.2, and the pinned ViT revision in `pyproject.toml`.
+- CUDA is optional. CUDA-marked tests run only when a compatible device is available.
 
-The package supports Python 3.11–3.14, while CircleCI validates Python 3.14.6.
+The package supports Python 3.11–3.15, while CircleCI validates Python 3.15.2.
 
 ## Installation
 
@@ -45,5 +46,5 @@ It defines the trainer, ViT backbone and heads, JEPA behavior, and optimizer set
 - `make test-<pattern>` runs tests matching a pytest expression, such as `make test-model`.
 - `make test-pdb-<pattern>` runs a matching subset with PDB fallback.
 
-CircleCI runs quality checks and the CPU test/type gates on Python 3.14.6. CUDA-marked tests should also be run
+CircleCI runs quality checks and the CPU test/type gates on Python 3.15.2. CUDA-marked tests should also be run
 locally before changes that affect model execution or device/dtype behavior.

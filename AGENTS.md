@@ -20,7 +20,7 @@ This guide summarizes how to work effectively in this repository: where code liv
 - `make test-ci` forces CPU execution, runs CI tests, and writes coverage XML.
 
 ## Coding Style & Naming Conventions
-- Python 3.11–3.14 compatible; CircleCI validates Python 3.14.6.
+- Python 3.11–3.15 compatible; CircleCI validates Python 3.15.2.
 - Use 4-space indentation and a 120-character line length; Ruff is enforced via `make style` and `make quality`.
 - Use `snake_case` for modules/functions/variables and `CapWords` for classes.
 

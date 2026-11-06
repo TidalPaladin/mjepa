@@ -1,57 +1,54 @@
 [build-system]
 requires = [
-    "hatchling>=1.31,<2",
-    "hatch-vcs>=0.5,<0.6",
+    "hatchling==1.33.0",
+    "hatch-vcs==0.5.0",
 ]
 build-backend = "hatchling.build"
 
 [project]
 name = "mjepa"
 description = ""
-requires-python = ">=3.11,<3.15"
+requires-python = ">=3.11,<3.16"
 authors = [
     { name = "Scott Chase Waggener", email = "chase.waggener@icloud.com" },
 ]
 dependencies = [
-    "torch>=2.13,<2.14",
-    "torchvision>=0.28,<0.29",
-    "einops>=0.8.2,<0.9",
-    "ninja>=1.13,<2",
-    "pyyaml>=6.0.3,<7",
-    "torchmetrics>=1.9,<2",
-    "pandas>=3.0.3,<4",
-    "pyarrow>=25,<26",
-    "safetensors>=0.8,<0.9",
-    "tqdm>=4.68.4,<5",
-    "vit",
-    "wandb>=0.28.1,<0.29",
+    "torch==2.15.0",
+    "torchvision==0.29.2",
+    "einops==0.8.2",
+    "ninja==1.13.2",
+    "pyyaml==6.0.3",
+    "torchmetrics==1.9.0",
+    "pandas==3.1.1",
+    "pyarrow==26.0.1",
+    "safetensors==0.8.0",
+    "tqdm==4.70.1",
+    "vit @ git+https://github.com/TidalPaladin/vit.git@ffc2b588c14f0d41dd0d270bd9dc467a6da48d35",
+    "wandb==0.31.0",
 ]
 readme = "README.md"
 dynamic = [
     "version",
 ]
 
-[tool.uv.sources]
-vit = { git = "https://github.com/TidalPaladin/vit.git", rev = "5884448b157ff13529fc49fb8e86283868540607" }
-
 [project.optional-dependencies]
 dicom = [
-    "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git",
+    "dicom-preprocessing @ git+https://github.com/medcognetics/dicom-preprocessing.git@a06f33a206bcb8eec740fddce9085d476837d429",
 ]
 visualization = [
-    "matplotlib>=3.11,<3.12",
+    "matplotlib==3.11.2",
 ]
 
 [dependency-groups]
 dev = [
-    "basedpyright>=1.39.9,<1.40",
-    "coverage>=7.15.2,<8",
-    "pdbpp>=0.12.1,<0.13",
-    "pytest>=9.1.1,<10",
-    "pytest-cov>=7.1,<8",
-    "pytest-env>=1.6,<2",
-    "pytest-mock>=3.15.1,<4",
-    "ruff>=0.15.22,<0.16",
+    "basedpyright==1.40.2",
+    "coverage==7.17.2",
+    "pdbpp==0.12.1",
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "pytest-env==1.8.5",
+    "pytest-mock==3.17.0",
+    "ruff==0.17.4",
 ]
 
 [project.license]
@@ -78,7 +75,7 @@ force-single-line = false
 combine-as-imports = true
 
 [tool.basedpyright]
-pythonVersion = "3.14"
+pythonVersion = "3.15"
 pythonPlatform = "Linux"
 include = ["mjepa", "tests", "trainers"]
 exclude = ["**/node_modules", "**/__pycache__", "**/.pytest_cache", "**/_version.py"]
