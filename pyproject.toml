@@ -23,7 +23,7 @@ dependencies = [
     "pyarrow==26.0.1",
     "safetensors==0.8.0",
     "tqdm==4.70.1",
-    "vit @ git+https://github.com/TidalPaladin/vit.git@ffc2b588c14f0d41dd0d270bd9dc467a6da48d35",
+    "vit @ git+https://github.com/TidalPaladin/vit.git@9116145b8c7186b1d1278ae5d289806f0075413f",
     "wandb==0.31.0",
 ]
 readme = "README.md"

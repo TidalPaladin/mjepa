@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11, <3.16"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -1227,7 +1227,7 @@ requires-dist = [
     { name = "torchmetrics", specifier = "==1.9.0" },
     { name = "torchvision", specifier = "==0.29.2" },
     { name = "tqdm", specifier = "==4.70.1" },
-    { name = "vit", git = "https://github.com/TidalPaladin/vit.git?rev=ffc2b588c14f0d41dd0d270bd9dc467a6da48d35" },
+    { name = "vit", git = "https://github.com/TidalPaladin/vit.git?rev=9116145b8c7186b1d1278ae5d289806f0075413f" },
     { name = "wandb", specifier = "==0.31.0" },
 ]
 provides-extras = ["dicom", "visualization"]
@@ -2605,8 +2605,8 @@ wheels = [
 
 [[package]]
 name = "vit"
-version = "0.1.2.dev18+gffc2b588c"
-source = { git = "https://github.com/TidalPaladin/vit.git?rev=ffc2b588c14f0d41dd0d270bd9dc467a6da48d35#ffc2b588c14f0d41dd0d270bd9dc467a6da48d35" }
+version = "0.1.2.dev19+g9116145b8"
+source = { git = "https://github.com/TidalPaladin/vit.git?rev=9116145b8c7186b1d1278ae5d289806f0075413f#9116145b8c7186b1d1278ae5d289806f0075413f" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
