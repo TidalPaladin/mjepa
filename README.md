@@ -6,7 +6,7 @@ transformers.
 ## Requirements
 
 - CPython 3.11 through 3.15.
-- `uv>=0.11.28,<0.12`.
+- `uv==0.13.7`. Make recipes run this pinned version through `uvx`.
 - PyTorch 2.15.0, torchvision 0.29.2, and the pinned ViT revision in `pyproject.toml`.
 - CUDA is optional. CUDA-marked tests run only when a compatible device is available.
 
