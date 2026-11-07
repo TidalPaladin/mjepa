@@ -3,7 +3,8 @@
 PROJECT=mjepa
 QUALITY_DIRS=$(PROJECT) tests
 CLEAN_DIRS=$(PROJECT) tests
-PYTHON=uv run python
+UV?=uvx --from uv==0.13.7 uv
+PYTHON=$(UV) run python
 
 check: ## run quality checks and unit tests
 	$(MAKE) style
@@ -24,7 +25,7 @@ clean-env: ## remove the virtual environment directory
 
 init: ## pulls submodules and initializes virtual environment
 	git submodule update --init --recursive
-	uv sync --all-groups --all-extras
+	$(UV) sync --locked --all-groups --all-extras
 
 quality:
 	$(MAKE) clean
@@ -49,7 +50,7 @@ test-pdb-%: ## run unit tests matching a pattern with PDB fallback
 	$(PYTHON) -m pytest -rs --pdb -k $* -v ./tests/ 
 
 test-ci: ## runs CI-only tests
-	export "CUDA_VISIBLE_DEVICES=''" && \
+	export CUDA_VISIBLE_DEVICES='' && \
 	$(PYTHON) -m pytest \
 		-rs \
 		-m "not ci_skip" \

@@ -9,6 +9,7 @@ __pycache__/
 .pdm-python
 **/_version.py
 .coverage
+coverage.xml
 
 # Node
 node_modules/
